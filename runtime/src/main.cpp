@@ -234,6 +234,20 @@ Java_com_policenauts_recomp_PolicenautsActivity_nativeMouseButton(
     (void)SDL_PushEvent(&event);
 }
 
+/* The same two calls from the shared pad (PadOverlay's trackpad mode, used when
+ * game.toml [controller] mouse = true), for games on the shared Android layer. */
+extern "C" JNIEXPORT void JNICALL
+Java_com_psxrecomp_android_PsxInput_nativeMouseMotion(JNIEnv *env, jclass cls, jint dx, jint dy)
+{
+    Java_com_policenauts_recomp_PolicenautsActivity_nativeMouseMotion(env, cls, dx, dy);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_psxrecomp_android_PsxInput_nativeMouseButton(JNIEnv *env, jclass cls, jint button, jboolean down)
+{
+    Java_com_policenauts_recomp_PolicenautsActivity_nativeMouseButton(env, cls, button, down);
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_policenauts_recomp_PolicenautsActivity_nativePadDirection(
     JNIEnv *, jclass, jint direction, jboolean down)
@@ -921,6 +935,40 @@ static void fps_telemetry_toggle(void) {
     s_fps_base_title.clear();
     host_osd_push(enabled ? "FPS readout on" : "FPS readout off", 1500);
 }
+
+#if defined(__ANDROID__)
+/* FPS counter from the on-screen pad's menu ("FPS"), remembered per game by the
+ * app. The UI thread posts 1 (off) or 2 (on); the emulator thread applies it
+ * between frames (android_apply_fps_request). The runtime only measures (the
+ * telemetry block in the vblank path stores game fps x100 in
+ * g_android_game_fps_x100); the pad overlay draws it as a movable control and
+ * polls nativeGameFps, so nothing is drawn into the game picture. */
+static std::atomic<int> g_android_fps_request{0};
+static std::atomic<int> g_android_game_fps_x100{0};
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_psxrecomp_android_PsxInput_nativeSetFpsCounter(JNIEnv *, jclass, jboolean on)
+{
+    g_android_fps_request.store(on ? 2 : 1);
+}
+
+/* Game frames per second over the last second; 0 = not measured yet / off. */
+extern "C" JNIEXPORT jfloat JNICALL
+Java_com_psxrecomp_android_PsxInput_nativeGameFps(JNIEnv *, jclass)
+{
+    return (jfloat)g_android_game_fps_x100.load() / 100.0f;
+}
+
+static void android_apply_fps_request(void)
+{
+    const int req = g_android_fps_request.exchange(0);
+    if (!req) return;
+    s_fps_telemetry_enabled = (req == 2) ? 1 : 0;
+    s_fps_last_time = 0;
+    s_fps_last_frame = 0;
+    g_android_game_fps_x100.store(0);
+}
+#endif
 
 /* Hold-to-act host hotkeys must not fire while the game window does not hold
  * keyboard focus.
@@ -6908,7 +6956,13 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                     snprintf(osd, sizeof(osd), "Game %.0f FPS  %.2fx",
                              fps, speed);
                 }
+#if defined(__ANDROID__)
+                /* Android: the pad overlay draws it (movable), not the picture. */
+                (void)osd;
+                g_android_game_fps_x100.store((int)(fps * 100.0 + 0.5));
+#else
                 host_osd_set_status(osd);
+#endif
             }
             if (netplay_timing_on() && s_np_timing_frames > 0) {
                 const double invf = 1000.0 / (double)frequency;
@@ -6977,6 +7031,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     if (g_port1_mouse) android_dpad_drive_mouse();
     android_apply_disc_swap();
     android_apply_state_request();
+    android_apply_fps_request();
 #endif
     memcard_flush_settled();
     if (!g_headless) {

@@ -121,6 +121,14 @@ public class LauncherActivity extends Activity {
     protected void onResume() {
         super.onResume();
         refresh();
+        /* "Restart game" in the pad's menu ends the game process after leaving this
+         * flag; start the game again (it loads the state the restart saved). */
+        File restart = new File(getFilesDir(), PsxMenu.RESTART_FLAG);
+        if (restart.isFile()) {
+            //noinspection ResultOfMethodCallIgnored
+            restart.delete();
+            startGame();
+        }
     }
 
     private static LinearLayout.LayoutParams wrap() {

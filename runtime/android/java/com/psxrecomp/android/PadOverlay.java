@@ -13,6 +13,7 @@ import android.view.HapticFeedbackConstants;
 import android.view.InputDevice;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewConfiguration;
 import android.widget.EditText;
 
 import org.json.JSONException;
@@ -41,7 +42,8 @@ import java.util.List;
  */
 public final class PadOverlay extends View {
     private static final int KIND_BUTTON = 0, KIND_SHOULDER = 1, KIND_DPAD = 2,
-            KIND_STICK = 3, KIND_EDIT = 4;
+            KIND_STICK = 3, KIND_EDIT = 4, KIND_FPS = 5,
+            KIND_MOUSE = 6;   /* PS1 Mouse button (mouse games); Control.stick = 0 left, 1 right */
     private static final int ANCHOR_LEFT = -1, ANCHOR_CENTER = 0, ANCHOR_RIGHT = 1;
     /* Hit areas are larger than the drawn control: thumbs land off-centre. */
     private static final float HIT_GROW = 1.3f;
@@ -121,9 +123,37 @@ public final class PadOverlay extends View {
     private int dragPointer = -1;
     private float dragDx, dragDy;
     private static final String[] TOOLS = { "Smaller", "Bigger", "Rename", "Hide/Show",
-            "Opacity", "Reset all", "Save state", "Load state", "Change disc", "Done" };
-    /* TOOLS index where the second toolbar row (game actions) starts. */
+            "Opacity", "Reset all", "Done" };
+    /* FPS counter (runtime status line, top left), remembered per game. */
+    private static final String PREFS_FPS = "fps_counter";
+    private boolean fpsOn;
+
+    /* Mouse games (game.toml [controller] mouse = true, e.g. Policenauts): the PS1
+     * Mouse is in port 1 and the game never reads the pad, so the pad's buttons are
+     * replaced: the D-pad steers the cursor (the runtime turns its directions into
+     * mouse motion: a tap is one step, holding glides), ACT / MOVE are the left /
+     * right mouse buttons (held while touched, so drags work), and the rest of the
+     * screen is a trackpad: drag moves the cursor (slow drags are precise, fast
+     * flicks travel further), a quick tap clicks ACT, a two-finger tap MOVE. */
+    private final boolean mouseMode;
+    /* Mouse counts per dp of finger travel: SLOW for careful drags, rising to FAST. */
+    private static final float MOUSE_SLOW = 0.45f, MOUSE_FAST = 1.6f;
+    /* Finger speed (dp per ms) at which the gain reaches MOUSE_FAST. */
+    private static final float MOUSE_FAST_SPEED = 1.5f;
+    private static final long TAP_MAX_MS = 250;
+    /* Long enough for the game to poll the press at a reduced frame rate. */
+    private static final long CLICK_HOLD_MS = 80;
+    private int padPointer = -1;
+    private float padLastX, padLastY, padDownX, padDownY, fracX, fracY;
+    private long padDownTime, padLastTime;
+    private boolean padMoved;
+    private int padFingers;
+    private final float touchSlop;
+    private int mouseHeld;   /* bit 0 left, bit 1 right, from the ACT / MOVE controls */
+    /* TOOLS index where the second toolbar row (Done) starts. Game actions and
+     * display options live in the menu panel (PsxMenu). */
     private static final int GAME_TOOLS_FROM = 6;
+    private final PsxMenu menu;
     /* Whole-pad opacity steps offered by the editor. */
     private static final float[] OPACITY = { 1.0f, 0.75f, 0.5f, 0.3f };
     private int opacityStep = 0;
@@ -143,6 +173,8 @@ public final class PadOverlay extends View {
         setWillNotDraw(false);
         density = getResources().getDisplayMetrics().density;
         prefs = activity.getSharedPreferences(PREFS, Activity.MODE_PRIVATE);
+        mouseMode = readMouseFlag(activity);
+        touchSlop = ViewConfiguration.get(activity).getScaledTouchSlop();
         for (int i = 0; i < toolRects.length; i++) toolRects[i] = new RectF();
 
         final int L = ANCHOR_LEFT, R = ANCHOR_RIGHT, C = ANCHOR_CENTER;
@@ -161,10 +193,60 @@ public final class PadOverlay extends View {
         add(new Control("lstick", KIND_STICK, 0, 0, "", L, 0.52f, 0.80f, 0.13f, 1, analogSticks));
         add(new Control("rstick", KIND_STICK, 0, 1, "", R, 0.52f, 0.80f, 0.13f, 1, analogSticks));
         add(new Control("edit", KIND_EDIT, 0, 0, "", C, 0.0f, 0.045f, 0.032f, 1, true));
+        /* FPS readout (pad menu "FPS"): a label, not a button; movable and resizable in
+         * the editor. Default: the black bar left of the picture, between L1 and the D-pad. */
+        add(new Control("fps", KIND_FPS, 0, 0, "", L, 0.13f, 0.24f, 0.028f, 2.3f, true));
+        /* Mouse games only: the PS1 Mouse's two buttons, named as Policenauts names them. */
+        add(new Control("mouse_left", KIND_MOUSE, 0, 0, "ACT", R, 0.22f, 0.58f, 0.075f, 1.5f, true));
+        add(new Control("mouse_right", KIND_MOUSE, 0, 1, "MOVE", R, 0.22f, 0.82f, 0.065f, 1.5f, true));
         loadLayout();
+        menu = new PsxMenu(activity, this);
+        PsxMenu.autoloadAfterRestart(activity, this);
+        fpsOn = prefs.getBoolean(PREFS_FPS, false);
+        if (fpsOn) {
+            try { PsxInput.nativeSetFpsCounter(true); }
+            catch (UnsatisfiedLinkError e) { /* game library failed to load; SDL reports it */ }
+        }
+    }
+
+    /** game.toml [controller] mouse = true in this app's config (assets/game.toml.in). */
+    private static boolean readMouseFlag(Activity activity) {
+        try (java.io.InputStream in = activity.getAssets().open("game.toml.in")) {
+            java.util.Scanner s = new java.util.Scanner(in, "UTF-8").useDelimiter("\\A");
+            String toml = s.hasNext() ? s.next() : "";
+            return java.util.regex.Pattern.compile("(?m)^\\s*mouse\\s*=\\s*true\\b").matcher(toml).find();
+        } catch (java.io.IOException e) {
+            return false;
+        }
+    }
+
+    private String toolLabel(int i) { return TOOLS[i]; }
+
+    /* ---- used by the menu panel (PsxMenu) ------------------------------- */
+
+    boolean isFpsOn() { return fpsOn; }
+
+    void setFpsOn(boolean on) { if (on != fpsOn) toggleFps(); }
+
+    void startEditing() { setEditing(true); }
+
+    int opacityPercent() { return Math.round(OPACITY[opacityStep] * 100); }
+
+    void cycleOpacity() {
+        opacityStep = (opacityStep + 1) % OPACITY.length;
+        applyAlpha();
+        saveLayout();
     }
 
     private void add(Control c) { controls.add(c); }
+
+    /** Mouse games show the D-pad, ACT / MOVE, the menu button and the FPS readout;
+     *  pad games everything but ACT / MOVE. */
+    private boolean inMode(Control c) {
+        if (c.kind == KIND_MOUSE) return mouseMode;
+        if (!mouseMode) return true;
+        return c.kind == KIND_EDIT || c.kind == KIND_FPS || c.kind == KIND_DPAD;
+    }
 
     /* ---- geometry ---------------------------------------------------- */
 
@@ -185,6 +267,8 @@ public final class PadOverlay extends View {
         float dx = x - cx(c), dy = y - cy(c), r = radius(c);
         switch (c.kind) {
             case KIND_SHOULDER:
+            case KIND_FPS:
+            case KIND_MOUSE:
                 return Math.abs(dx) <= r * c.aspect * HIT_GROW && Math.abs(dy) <= r * HIT_GROW * 1.2f;
             case KIND_DPAD:
                 return Math.hypot(dx, dy) <= r * 1.15f;
@@ -201,6 +285,9 @@ public final class PadOverlay extends View {
         double bestDist = Double.MAX_VALUE;
         for (Control c : controls) {
             if (!c.visible && !includeHidden) continue;
+            /* The FPS readout never takes a touch while playing; the editor can move it. */
+            if (c.kind == KIND_FPS && !editing) continue;
+            if (!inMode(c)) continue;
             if (!hit(c, x, y)) continue;
             double d = Math.hypot(x - cx(c), y - cy(c)) / Math.max(1.0f, radius(c));
             if (d < bestDist) {
@@ -220,8 +307,13 @@ public final class PadOverlay extends View {
         for (Control c : controls) {
             if (!c.visible && !editing) continue;
             if (editing && c.kind == KIND_EDIT) continue;
+            if (!inMode(c)) continue;
+            if (c.kind == KIND_FPS && !fpsOn && !editing) continue;
             int alpha = c.visible ? 255 : 90;
+            if (c.kind == KIND_FPS) alpha = fpsOn ? 255 : 90;
             switch (c.kind) {
+                case KIND_FPS: drawFps(canvas, c, alpha); break;
+                case KIND_MOUSE: drawShoulder(canvas, c, alpha); break;
                 case KIND_DPAD: drawDpad(canvas, c, alpha); break;
                 case KIND_STICK: drawStick(canvas, c, alpha); break;
                 case KIND_SHOULDER: drawShoulder(canvas, c, alpha); break;
@@ -240,10 +332,36 @@ public final class PadOverlay extends View {
             }
         }
         if (editing) drawToolbar(canvas);
+        /* The runtime measures once a second; redraw the readout twice a second. */
+        if (fpsOn && !editing) postInvalidateDelayed(500);
+    }
+
+    private void drawFps(Canvas canvas, Control c, int alpha) {
+        float x = cx(c), y = cy(c), hh = radius(c), hw = hh * c.aspect;
+        float fps = 0;
+        if (fpsOn) {
+            try { fps = PsxInput.nativeGameFps(); } catch (UnsatisfiedLinkError e) { fps = 0; }
+        }
+        String text = fps > 0 ? Math.round(fps) + " FPS" : "-- FPS";
+        rect.set(x - hw, y - hh, x + hw, y + hh);
+        paint.setStyle(Paint.Style.FILL);
+        paint.setColor(0x99000000);
+        paint.setAlpha(Math.min(0x99, alpha));
+        canvas.drawRoundRect(rect, hh * 0.5f, hh * 0.5f, paint);
+        paint.setColor(0xFFFFFFFF);
+        paint.setAlpha(alpha);
+        paint.setTextAlign(Paint.Align.CENTER);
+        paint.setFakeBoldText(true);
+        paint.setTextSize(hh * 1.1f);
+        float w = paint.measureText(text);
+        if (w > hw * 1.8f) paint.setTextSize(hh * 1.1f * hw * 1.8f / w);
+        canvas.drawText(text, x, y + paint.getTextSize() * 0.36f, paint);
+        paint.setFakeBoldText(false);
     }
 
     private boolean held(Control c) {
         if (c.kind == KIND_DPAD) return false;
+        if (c.kind == KIND_MOUSE) return (mouseHeld & (1 << c.stick)) != 0;
         return c.bits != 0 && (heldBits & c.bits) != 0;
     }
 
@@ -437,9 +555,9 @@ public final class PadOverlay extends View {
         paint.setTextSize(bh * 0.4f);
         paint.setFakeBoldText(true);
         float[] widths = new float[TOOLS.length];
-        for (int i = 0; i < TOOLS.length; i++) widths[i] = paint.measureText(TOOLS[i]) + bh * 0.8f;
+        for (int i = 0; i < TOOLS.length; i++) widths[i] = paint.measureText(toolLabel(i)) + bh * 0.8f;
         /* Two rows, each centred: the layout tools, then the game actions
-         * (from GAME_TOOLS_FROM on: save/load state, change disc, done). */
+         * (from GAME_TOOLS_FROM on: save/load state, change disc, FPS, done). */
         float y = h * 0.42f;
         for (int row = 0; row < 2; row++) {
             int from = row == 0 ? 0 : GAME_TOOLS_FROM, to = row == 0 ? GAME_TOOLS_FROM : TOOLS.length;
@@ -454,7 +572,7 @@ public final class PadOverlay extends View {
                 canvas.drawRoundRect(toolRects[i], bh * 0.25f, bh * 0.25f, paint);
                 paint.setColor(needsSelection && selected == null ? 0x80FFFFFF : 0xFFFFFFFF);
                 paint.setTextAlign(Paint.Align.CENTER);
-                canvas.drawText(TOOLS[i], toolRects[i].centerX(), ry + bh * 0.64f, paint);
+                canvas.drawText(toolLabel(i), toolRects[i].centerX(), ry + bh * 0.64f, paint);
                 x += widths[i] + gap;
             }
         }
@@ -476,6 +594,9 @@ public final class PadOverlay extends View {
             case "circle": return "Circle";
             case "cross": return "Cross";
             case "square": return "Square";
+            case "fps": return "FPS counter (on/off in the menu)";
+            case "mouse_left": return "ACT (left mouse button)";
+            case "mouse_right": return "MOVE (right mouse button)";
             default: return c.defaultLabel;
         }
     }
@@ -494,6 +615,7 @@ public final class PadOverlay extends View {
             }
             return true;
         }
+        if (mouseMode && !editing) return mouseTouch(event, action);
         switch (action) {
             case MotionEvent.ACTION_DOWN:
             case MotionEvent.ACTION_POINTER_DOWN: {
@@ -529,10 +651,122 @@ public final class PadOverlay extends View {
         return true;
     }
 
+    /* ---- trackpad (mouse games) ---------------------------------------- */
+
+    private boolean mouseTouch(MotionEvent event, int action) {
+        int i = event.getActionIndex();
+        switch (action) {
+            case MotionEvent.ACTION_DOWN:
+            case MotionEvent.ACTION_POINTER_DOWN: {
+                int id = event.getPointerId(i);
+                float x = event.getX(i), y = event.getY(i);
+                Control c = controlAt(x, y, false);
+                if (c != null && c.kind == KIND_EDIT) {
+                    releaseAll();
+                    menu.open();
+                    return true;
+                }
+                if (c != null) {
+                    pointerDown(id, x, y);   /* D-pad, ACT, MOVE: ordinary pad controls */
+                } else if (padPointer < 0) {
+                    padPointer = id;
+                    padDownX = padLastX = x;
+                    padDownY = padLastY = y;
+                    padDownTime = padLastTime = event.getEventTime();
+                    fracX = fracY = 0.0f;
+                    padMoved = false;
+                    padFingers = 1;
+                } else {
+                    padFingers++;            /* a second trackpad finger: two-finger tap */
+                }
+                break;
+            }
+            case MotionEvent.ACTION_MOVE: {
+                for (int k = 0; k < event.getPointerCount(); k++) {
+                    int id = event.getPointerId(k);
+                    if (touches.get(id) != null) pointerMove(id, event.getX(k), event.getY(k));
+                }
+                int p = event.findPointerIndex(padPointer);
+                if (p < 0) break;
+                float x = event.getX(p), y = event.getY(p);
+                long t = event.getEventTime();
+                if (!padMoved) {
+                    /* A two-finger tap never moves the cursor; one finger starts
+                     * moving it only past the touch slop, so taps click in place. */
+                    if (padFingers > 1 || Math.hypot(x - padDownX, y - padDownY) <= touchSlop) break;
+                    padMoved = true;
+                } else {
+                    float ddx = (x - padLastX) / density, ddy = (y - padLastY) / density;
+                    float speed = (float) Math.hypot(ddx, ddy) / Math.max(1L, t - padLastTime);
+                    float gain = MOUSE_SLOW + (MOUSE_FAST - MOUSE_SLOW) * Math.min(1.0f, speed / MOUSE_FAST_SPEED);
+                    fracX += ddx * gain;
+                    fracY += ddy * gain;
+                    int dx = (int) fracX, dy = (int) fracY;
+                    fracX -= dx;
+                    fracY -= dy;
+                    if (dx != 0 || dy != 0) PsxInput.nativeMouseMotion(dx, dy);
+                }
+                padLastX = x;
+                padLastY = y;
+                padLastTime = t;
+                break;
+            }
+            case MotionEvent.ACTION_POINTER_UP:
+            case MotionEvent.ACTION_UP: {
+                int id = event.getPointerId(i);
+                if (touches.get(id) != null) {
+                    touches.remove(id);
+                    update();
+                } else if (id == padPointer) {
+                    /* Another trackpad finger still down takes the cursor over, without a jump. */
+                    int next = -1;
+                    for (int k = 0; k < event.getPointerCount(); k++)
+                        if (k != i && touches.get(event.getPointerId(k)) == null) { next = k; break; }
+                    if (next >= 0) {
+                        padPointer = event.getPointerId(next);
+                        padLastX = event.getX(next);
+                        padLastY = event.getY(next);
+                        padLastTime = event.getEventTime();
+                    } else {
+                        if (!padMoved && event.getEventTime() - padDownTime <= TAP_MAX_MS)
+                            mouseClick(padFingers >= 2 ? 1 : 0);
+                        padPointer = -1;
+                    }
+                }
+                break;
+            }
+            case MotionEvent.ACTION_CANCEL:
+                releaseAll();
+                break;
+            default:
+                break;
+        }
+        return true;
+    }
+
+    /** A short press of a mouse button (0 = left, 1 = right). */
+    private void mouseClick(final int button) {
+        PsxInput.nativeMouseButton(button, true);
+        performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
+        postDelayed(() -> {
+            /* Keep it down if a finger is holding that button's control. */
+            if ((mouseHeld & (1 << button)) == 0) PsxInput.nativeMouseButton(button, false);
+        }, CLICK_HOLD_MS);
+    }
+
+    private void toggleFps() {
+        fpsOn = !fpsOn;
+        prefs.edit().putBoolean(PREFS_FPS, fpsOn).apply();
+        PsxInput.nativeSetFpsCounter(fpsOn);
+        invalidate();
+    }
+
+
     private void pointerDown(int id, float x, float y) {
         Control c = controlAt(x, y, false);
         if (c != null && c.kind == KIND_EDIT) {
-            setEditing(true);
+            releaseAll();
+            menu.open();
             return;
         }
         Touch t = new Touch();
@@ -600,13 +834,14 @@ public final class PadOverlay extends View {
 
     /** Recompute the held set and sticks from every finger; send changes. */
     private void update() {
-        int bits = 0;
+        int bits = 0, mouse = 0;
         int s0 = 0x8080, s1 = 0x8080;
         for (int i = 0; i < touches.size(); i++) {
             Touch t = touches.valueAt(i);
             Control c = t.control;
             if (c == null) continue;
             bits |= c.bits | t.dpadMask;
+            if (c.kind == KIND_MOUSE) mouse |= 1 << c.stick;
             if (c.kind == KIND_STICK) {
                 float r = radius(c);
                 int v = axisByte(t.stickX, r) | (axisByte(t.stickY, r) << 8);
@@ -619,6 +854,14 @@ public final class PadOverlay extends View {
                 performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
             heldBits = bits;
             PsxInput.nativeSetButtons(bits);
+        }
+        if (mouse != mouseHeld) {
+            if ((mouse & ~mouseHeld) != 0)
+                performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
+            for (int b = 0; b < 2; b++)
+                if (((mouse ^ mouseHeld) & (1 << b)) != 0)
+                    PsxInput.nativeMouseButton(b, (mouse & (1 << b)) != 0);
+            mouseHeld = mouse;
         }
         if (s0 != stickBytes0) {
             stickBytes0 = s0;
@@ -634,6 +877,7 @@ public final class PadOverlay extends View {
     /** Let go of everything (focus lost, cancel, editor opened). */
     public void releaseAll() {
         touches.clear();
+        padPointer = -1;
         update();
     }
 
@@ -701,7 +945,8 @@ public final class PadOverlay extends View {
                 if (selected != null) rename(selected);
                 break;
             case "Hide/Show":
-                if (selected != null) selected.visible = !selected.visible;
+                if (selected != null && selected.kind == KIND_FPS) toggleFps();
+                else if (selected != null) selected.visible = !selected.visible;
                 break;
             case "Opacity":
                 opacityStep = (opacityStep + 1) % OPACITY.length;
@@ -713,18 +958,6 @@ public final class PadOverlay extends View {
                 applyAlpha();
                 selected = null;
                 break;
-            case "Save state":
-                setEditing(false);
-                stateSlots(false);
-                return;
-            case "Load state":
-                setEditing(false);
-                stateSlots(true);
-                return;
-            case "Change disc":
-                setEditing(false);
-                changeDisc();
-                return;
             case "Done":
                 setEditing(false);
                 return;
@@ -740,7 +973,7 @@ public final class PadOverlay extends View {
      * (which replaces the current progress) both ask first. The game's own
      * memory-card saves are separate and unaffected.
      */
-    private void stateSlots(final boolean load) {
+    void stateSlots(final boolean load) {
         int slots = PsxInput.nativeStateSlots();
         final String[] items = new String[slots];
         final boolean[] used = new boolean[slots];
@@ -776,7 +1009,7 @@ public final class PadOverlay extends View {
      * (cdrom_swap_disc); the game sees the tray open and close and reads the
      * new disc itself, so swap when the game asks for it.
      */
-    private void changeDisc() {
+    void changeDisc() {
         int count = PsxInput.nativeDiscCount();
         int current = PsxInput.nativeCurrentDisc();
         if (count <= 1) {
@@ -861,7 +1094,7 @@ public final class PadOverlay extends View {
         }
         /* The editor button can never be hidden, or the layout could not be
          * edited again. */
-        for (Control c : controls) if (c.kind == KIND_EDIT) c.visible = true;
+        for (Control c : controls) if (c.kind == KIND_EDIT || c.kind == KIND_FPS) c.visible = true;
         applyAlpha();
     }
 
@@ -883,6 +1116,10 @@ public final class PadOverlay extends View {
 
     /** Back closes the editor first. @return true if it was open. */
     public boolean closeEditor() {
+        if (menu.isOpen()) {
+            menu.close();
+            return true;
+        }
         if (!editing) return false;
         setEditing(false);
         return true;

@@ -49,4 +49,16 @@ public final class PsxInput {
 
     /** Save (load = false) or load a state at the next safe point. */
     public static native void nativeRequestState(int slot, boolean load);
+
+    /** FPS counter (game frames per second, top left of the screen) on or off. */
+    public static native void nativeSetFpsCounter(boolean on);
+
+    /** Game frames per second over the last second (0 while off or not measured yet). */
+    public static native float nativeGameFps();
+
+    /** PS1 Mouse (games with game.toml [controller] mouse = true): relative motion in mouse counts. */
+    public static native void nativeMouseMotion(int dx, int dy);
+
+    /** PS1 Mouse button: 0 = left, 1 = right. */
+    public static native void nativeMouseButton(int button, boolean down);
 }

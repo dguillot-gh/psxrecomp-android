@@ -11,7 +11,9 @@
 #include <stdio.h>
 #include <string.h>
 
-#if defined(RECOMP_LAUNCHER)
+/* Android has no recomp-ui, but draws these toasts and the FPS status line
+ * itself (gl_swap_with_osd), e.g. "Disc 2 inserted", the pad menu's FPS counter. */
+#if defined(RECOMP_LAUNCHER) || defined(__ANDROID__)
 #define HOST_OSD_VISUAL 1
 #else
 #define HOST_OSD_VISUAL 0
