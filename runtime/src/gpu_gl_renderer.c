@@ -120,6 +120,32 @@
 #define PSXGL_CONSTANT_ALPHA        0x8003
 #define PSXGL_UNPACK_ROW_LENGTH     0x0CF2
 #define PSXGL_SRC1_ALPHA            0x8589
+/* OpenGL ES (Android): BGRA is not an upload/readback format there. Upload the
+ * same bytes as RGBA and swap red/blue with the texture's swizzle (ES 3.0 core);
+ * read back as RGBA and swap on the CPU. */
+#define PSXGL_TEXTURE_SWIZZLE_R     0x8E42
+#define PSXGL_TEXTURE_SWIZZLE_B     0x8E44
+#define PSXGL_RED                   0x1903
+#define PSXGL_BLUE                  0x1905
+static int s_gles = 0;          /* context is OpenGL ES (set at context creation) */
+static int s_dual_src_ok = 1;   /* dual-source blending usable (desktop GL 3.3) */
+#define PSXGL_BGRA_FMT (s_gles ? GL_RGBA : GL_BGRA)
+/* After uploading BGRA bytes as RGBA on ES, make the bound texture sample right. */
+static void psxgl_bgra_swizzle(void) {
+    if (!s_gles) return;
+    glTexParameteri(GL_TEXTURE_2D, PSXGL_TEXTURE_SWIZZLE_R, PSXGL_BLUE);
+    glTexParameteri(GL_TEXTURE_2D, PSXGL_TEXTURE_SWIZZLE_B, PSXGL_RED);
+}
+/* glReadPixels in BGRA byte order on both APIs. */
+static void psxgl_read_bgra(GLint x, GLint y, GLsizei w, GLsizei h, void *dst) {
+    glReadPixels(x, y, w, h, PSXGL_BGRA_FMT, GL_UNSIGNED_BYTE, dst);
+    if (s_gles) {
+        uint8_t *p = (uint8_t *)dst;
+        for (size_t i = 0, n = (size_t)w * (size_t)h; i < n; i++, p += 4) {
+            uint8_t t = p[0]; p[0] = p[2]; p[2] = t;
+        }
+    }
+}
 
 #ifndef APIENTRY
 #define APIENTRY
@@ -275,7 +301,11 @@ static int load_modern_gl(void) {
     LOAD(p_glBindBuffer, "glBindBuffer");        LOAD(p_glBufferData, "glBufferData");
     LOAD(p_glVertexAttribPointer, "glVertexAttribPointer");
     LOAD(p_glEnableVertexAttribArray, "glEnableVertexAttribArray");
-    LOAD(p_glBindFragDataLocationIndexed, "glBindFragDataLocationIndexed");
+    /* Dual-source blending: desktop GL 3.3 core; ES needs an extension and
+     * different shader syntax, so ES uses the renderer's two-pass blend path. */
+    p_glBindFragDataLocationIndexed = (void *)SDL_GL_GetProcAddress("glBindFragDataLocationIndexed");
+    s_dual_src_ok = !s_gles && p_glBindFragDataLocationIndexed != NULL;
+    if (!s_gles && !p_glBindFragDataLocationIndexed) ok = 0;
     LOAD(p_glGenFramebuffers, "glGenFramebuffers"); LOAD(p_glBindFramebuffer, "glBindFramebuffer");
     LOAD(p_glDeleteFramebuffers, "glDeleteFramebuffers");
     LOAD(p_glFramebufferTexture2D, "glFramebufferTexture2D");
@@ -1229,7 +1259,61 @@ static const char *STENCIL_FS =
     "void main(){ vec4 c=texelFetch(u_src,ivec2(gl_FragCoord.xy),0);\n"
     "  if(c.a<0.5) discard; frag=vec4(0.0); }\n";
 
+/* Copy of s with every `from` replaced by `to` (malloc'd). */
+static char *psxgl_replace_all(const char *s, const char *from, const char *to) {
+    size_t fl = strlen(from), tl = strlen(to), n = 0;
+    for (const char *p = strstr(s, from); p; p = strstr(p + fl, from)) n++;
+    char *out = (char *)malloc(strlen(s) + n * (tl > fl ? tl - fl : 0) + 1);
+    if (!out) return NULL;
+    char *o = out;
+    for (;;) {
+        const char *p = strstr(s, from);
+        if (!p) { strcpy(o, s); break; }
+        memcpy(o, s, (size_t)(p - s)); o += p - s;
+        memcpy(o, to, tl); o += tl;
+        s = p + fl;
+    }
+    return out;
+}
+
+/* OpenGL ES 3.0: the shaders are desktop GLSL 3.30. Rewrite the few desktop-only
+ * parts: the version line (plus default precisions ES requires); "noperspective"
+ * (no such qualifier in ES; PS1 vertices are 2D with w = 1, so ordinary
+ * interpolation is identical); and the dual-source second output, which ES 3.0
+ * cannot declare (s_dual_src_ok = 0 keeps it unused). Returns malloc'd source. */
+static char *psxgl_gles_source(const char *src) {
+    static const char *hdr =
+        "#version 300 es\n"
+        "precision highp float;\nprecision highp int;\n"
+        "precision highp sampler2D;\nprecision highp usampler2D;\nprecision highp isampler2D;\n";
+    const char *body = src;
+    if (strncmp(body, "#version 330", 12) == 0) {
+        body = strchr(body, '\n');
+        body = body ? body + 1 : "";
+    }
+    char *a = psxgl_replace_all(body, "noperspective ", "");
+    if (!a) return NULL;
+    char *b = psxgl_replace_all(a, "out vec4 frag; out vec4 blend_factor;",
+                                "layout(location=0) out vec4 frag; vec4 blend_factor;");
+    free(a);
+    if (!b) return NULL;
+    char *out = (char *)malloc(strlen(hdr) + strlen(b) + 1);
+    if (out) { strcpy(out, hdr); strcat(out, b); }
+    free(b);
+    return out;
+}
+
+static GLuint compile_shader_raw(GLenum type, const char *src);
 static GLuint compile_shader(GLenum type, const char *src) {
+    if (!s_gles) return compile_shader_raw(type, src);
+    char *es = psxgl_gles_source(src);
+    if (!es) return 0;
+    GLuint s = compile_shader_raw(type, es);
+    free(es);
+    return s;
+}
+
+static GLuint compile_shader_raw(GLenum type, const char *src) {
     GLuint s = p_glCreateShader(type);
     p_glShaderSource(s, 1, &src, NULL);
     p_glCompileShader(s);
@@ -1244,7 +1328,7 @@ static GLuint build_program_ex(const char *vs, const char *fs, int dual_source) 
     if (!v || !f) return 0;
     GLuint p = p_glCreateProgram();
     p_glAttachShader(p, v); p_glAttachShader(p, f);
-    if (dual_source) {
+    if (dual_source && s_dual_src_ok) {
         p_glBindFragDataLocationIndexed(p, 0, 0, "frag");
         p_glBindFragDataLocationIndexed(p, 0, 1, "blend_factor");
     }
@@ -1766,7 +1850,7 @@ static void tex_batch_draw_passes(int nverts, int semi) {
              * until a later GP0(E6h) actually enables destination masking. */
             s_stencil_valid = 0;
         }
-    } else if (!s_mask_check && semi == 4) {
+    } else if (!s_mask_check && semi == 4 && s_dual_src_ok) {
         /* Modes 0/1/3 can select opaque-vs-semi behavior per fragment with
          * dual-source factors, so the whole painter-ordered batch is one draw.
          * Mode 2 needs a different blend equation and stays on the conservative
@@ -2607,10 +2691,11 @@ static void upload_present_tex(const uint32_t *pixels, int w, int h, int linear)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     if (w != s_present_w || h != s_present_h) {
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_BGRA, GL_UNSIGNED_BYTE, pixels);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, PSXGL_BGRA_FMT, GL_UNSIGNED_BYTE, pixels);
         s_present_w = w; s_present_h = h;
+        psxgl_bgra_swizzle();
     } else {
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_BGRA, GL_UNSIGNED_BYTE, pixels);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, PSXGL_BGRA_FMT, GL_UNSIGNED_BYTE, pixels);
     }
 }
 
@@ -2941,6 +3026,13 @@ int gl_renderer_init_context(SDL_Window *win) {
     glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE);
     const char *ver = (const char *)glGetString(GL_VERSION);
     fprintf(stdout, "psxrecomp: OpenGL context created (%s)\n", ver ? ver : "?");
+    s_gles = ver && strncmp(ver, "OpenGL ES", 9) == 0;
+    if (s_gles) {
+        const char *rnd = (const char *)glGetString(GL_RENDERER);
+        const char *ext = (const char *)glGetString(GL_EXTENSIONS);
+        fprintf(stdout, "psxrecomp: GLES renderer: %s\n", rnd ? rnd : "?");
+        fprintf(stdout, "psxrecomp: GLES extensions: %.3000s\n", ext ? ext : "?");
+    }
 
     /* All-or-nothing: any missing entry point / failed shader / bad FBO means
      * the whole GL renderer is unavailable and the runtime stays on the pure
@@ -3519,7 +3611,7 @@ static int glb_render_wide_display(uint32_t *out, int pitch, int base_x,
     if (!tmp) return 0;
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, fbo);
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
-    glReadPixels(0, ry0, W, out_h, GL_BGRA, GL_UNSIGNED_BYTE, tmp);
+    psxgl_read_bgra(0, ry0, W, out_h, tmp);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
 
     /* Orientation: the wide FBO stores PS1 y inverted (geo shader maps vram_y=0
@@ -3563,7 +3655,7 @@ static int glb_wide_dump_full(uint32_t *out, int cap_pixels, int *ow, int *oh,
     if (!tmp) return 0;
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, fbo);
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
-    glReadPixels(0, 0, W, H, GL_BGRA, GL_UNSIGNED_BYTE, tmp);
+    psxgl_read_bgra(0, 0, W, H, tmp);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
     /* Same orientation reasoning as glb_render_wide_display: glReadPixels row 0 =
      * PS1 top scanline, so copy straight (top-down). */
@@ -4041,12 +4133,13 @@ static void gl_draw_osd_image(const uint32_t *px, int ow, int oh,
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     if (s_osd_tw != ow || s_osd_th != oh) {
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, ow, oh, 0,
-                     GL_BGRA, GL_UNSIGNED_BYTE, px);
+                     PSXGL_BGRA_FMT, GL_UNSIGNED_BYTE, px);
+        psxgl_bgra_swizzle();
         s_osd_tw = ow;
         s_osd_th = oh;
     } else {
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, ow, oh,
-                        GL_BGRA, GL_UNSIGNED_BYTE, px);
+                        PSXGL_BGRA_FMT, GL_UNSIGNED_BYTE, px);
     }
     if (vx + dw > ww) dw = ww - vx;
     if (vy + dh > wh) dh = wh - vy;

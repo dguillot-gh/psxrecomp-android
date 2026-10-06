@@ -44,13 +44,25 @@ public class PsxGameActivity extends SDLActivity {
 
     @Override
     protected String[] getArguments() {
-        // Pass the imported app-private config path explicitly and pin Android
-        // to its working software renderer. A saved desktop renderer setting
-        // must not switch this build to an unavailable SDL GLES window path.
+        // Pass the imported app-private config path explicitly. The renderer is
+        // always given on the command line, so a saved desktop setting can never
+        // pick it: software unless the menu's Renderer choice wrote
+        // [video] renderer = "opengl" into files/game.toml (OpenGL ES, experimental).
+        File toml = new File(getFilesDir(), "game.toml");
         return new String[] {
-                "--game", new File(getFilesDir(), "game.toml").getAbsolutePath(),
-                "--renderer", "software"
+                "--game", toml.getAbsolutePath(),
+                "--renderer", wantsGpu(toml) ? "opengl" : "software"
         };
+    }
+
+    private static boolean wantsGpu(File toml) {
+        try {
+            String s = new String(java.nio.file.Files.readAllBytes(toml.toPath()),
+                    java.nio.charset.StandardCharsets.UTF_8);
+            return java.util.regex.Pattern.compile("(?m)^\\s*renderer\\s*=\\s*\"opengl\"").matcher(s).find();
+        } catch (java.io.IOException e) {
+            return false;
+        }
     }
 
     @Override
