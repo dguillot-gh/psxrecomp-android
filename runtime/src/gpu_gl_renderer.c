@@ -505,6 +505,31 @@ static int runtime_upload_diag_enabled(void) {
     return enabled;
 }
 
+/* Tile-GPU pass counters (PSX_RUNTIME_PERF_DIAG): on a tiler every switch of
+ * the bound framebuffer, and every sample of the hr colour texture, can force
+ * the whole hr surface (VRAM at internal scale) to be stored and reloaded. */
+enum { TC_HR_BIND, TC_HR_END, TC_PACK, TC_STENCIL, TC_UPLOAD, TC_BLIT, TC_PRESENT, TC_N };
+static uint64_t s_tc[TC_N];
+static uint64_t s_tc_swap_ticks;
+static Uint32   s_tc_last_ms;
+#define TC(i) ((void)s_tc[(i)]++)
+static void tc_report(void) {
+    if (!runtime_upload_diag_enabled()) return;
+    Uint32 now = SDL_GetTicks();
+    if (!s_tc_last_ms) { s_tc_last_ms = now; return; }
+    Uint32 dt = now - s_tc_last_ms;
+    if (dt < 2000) return;
+    double sec = dt / 1000.0, f = (double)SDL_GetPerformanceFrequency();
+    fprintf(stdout, "psxrecomp: gl passes/s: hr_bind=%.0f hr_end=%.0f pack=%.0f stencil_rebuild=%.0f "
+            "upload_flush=%.0f blit=%.0f present=%.0f | swap=%.1f ms/s (scale %dx)\n",
+            s_tc[TC_HR_BIND] / sec, s_tc[TC_HR_END] / sec, s_tc[TC_PACK] / sec,
+            s_tc[TC_STENCIL] / sec, s_tc[TC_UPLOAD] / sec, s_tc[TC_BLIT] / sec,
+            s_tc[TC_PRESENT] / sec, (double)s_tc_swap_ticks * 1000.0 / f / sec, s_scale);
+    for (int i = 0; i < TC_N; i++) s_tc[i] = 0;
+    s_tc_swap_ticks = 0;
+    s_tc_last_ms = now;
+}
+
 void gl_renderer_runtime_diag(uint64_t out[6]) {
     for (int i = 0; i < 6; i++) out[i] = s_rt_up_diag[i];
 }
@@ -784,7 +809,7 @@ static void hold_capture_native_fbo(GLuint src_fbo, int dx, int dy, int dw, int 
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, src_fbo);
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_hold_fbo);
     glDisable(GL_SCISSOR_TEST);
-    p_glBlitFramebuffer(dx * S, dy * S, (dx + dw) * S, (dy + dh) * S,
+    (TC(TC_BLIT), p_glBlitFramebuffer)(dx * S, dy * S, (dx + dw) * S, (dy + dh) * S,
                         0, 0, dw * S, dh * S,
                         GL_COLOR_BUFFER_BIT, GL_NEAREST);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
@@ -1402,6 +1427,7 @@ static void apply_psx_blend(int mode) {
 
 /* ---- hr FBO render-state bracket ---------------------------------------- */
 static void hr_begin(int clip_to_draw_area) {
+    TC(TC_HR_BIND);
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);
     glViewport(0, 0, VRAM_W * s_scale, VRAM_H * s_scale);
     glEnable(GL_SCISSOR_TEST);
@@ -1413,6 +1439,7 @@ static void hr_begin(int clip_to_draw_area) {
     }
 }
 static void hr_end(void) {
+    TC(TC_HR_END);
     glDisable(GL_BLEND);
     /* apply_psx_blend mode 2 leaves REVERSE_SUBTRACT armed; reset so later
      * host draws (OSD) that re-enable blend do not inherit B-F math. */
@@ -1429,7 +1456,12 @@ static void hr_end(void) {
 /* CPU-side VRAM writes (GP0 A0 transfers, DMA, single pixel pokes) land in
  * the CPU array immediately and accumulate s_up_rects. Flushing before the
  * next GPU op (or readback/present) preserves PS1 command order. */
+static void flush_cpu_upload_impl(void);
 static void flush_cpu_upload(void) {
+    if (s_up_nrects) TC(TC_UPLOAD);
+    flush_cpu_upload_impl();
+}
+static void flush_cpu_upload_impl(void) {
     if (!s_raster_ok || s_up_nrects == 0) return;
     const int diag = runtime_upload_diag_enabled();
     if (diag) { s_rt_up_diag[0]++; s_rt_up_diag[1] += (uint64_t)s_up_nrects; }
@@ -1512,9 +1544,10 @@ static void flush_cpu_upload(void) {
  * Sampling an attached render target is undefined, so copy color to the shared
  * scratch texture first. Wide targets never exceed the 1024-pixel VRAM width. */
 static void rebuild_target_stencil(GLuint target_fbo, int target_w, int target_h) {
+    TC(TC_STENCIL);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, target_fbo);
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_scratch_fbo);
-    p_glBlitFramebuffer(0, 0, target_w, target_h, 0, 0, target_w, target_h,
+    (TC(TC_BLIT), p_glBlitFramebuffer)(0, 0, target_w, target_h, 0, 0, target_w, target_h,
                         GL_COLOR_BUFFER_BIT, GL_NEAREST);
 
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, target_fbo);
@@ -1560,6 +1593,7 @@ static void pack_flush(void) {
     int h = s_pack_dirty.y1 - s_pack_dirty.y0 + 1;
     rect_clear(&s_pack_dirty);
     coh_record(GL_COH_PACK, x, y, x + w - 1, y + h - 1);
+    TC(TC_PACK);
 
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_raw_fbo);
     glViewport(0, 0, VRAM_W, VRAM_H);
@@ -2342,7 +2376,7 @@ static void gpu_copy_rect(int sx,int sy,int dx,int dy,int w,int h) {
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_scratch_fbo);
     glDisable(GL_SCISSOR_TEST);
-    p_glBlitFramebuffer(sx*S, sy*S, (sx+w)*S, (sy+h)*S,
+    (TC(TC_BLIT), p_glBlitFramebuffer)(sx*S, sy*S, (sx+w)*S, (sy+h)*S,
                         sx*S, sy*S, (sx+w)*S, (sy+h)*S,
                         GL_COLOR_BUFFER_BIT, GL_NEAREST);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
@@ -4244,7 +4278,11 @@ static void gl_swap_with_osd(void) {
             present_shot_done(wrote);
         }
     }
+    TC(TC_PRESENT);
+    Uint64 tc_t0 = SDL_GetPerformanceCounter();
     SDL_GL_SwapWindow(s_win);
+    s_tc_swap_ticks += SDL_GetPerformanceCounter() - tc_t0;
+    tc_report();
 }
 
 static void present_target_quad(GLuint tex, int tex_w, int tex_h,
@@ -4488,7 +4526,7 @@ static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, wide_fbo);
     glDisable(GL_SCISSOR_TEST);
-    p_glBlitFramebuffer(base_x * S, 0,
+    (TC(TC_BLIT), p_glBlitFramebuffer)(base_x * S, 0,
                         (base_x + native_w) * S, VRAM_H * S,
                         g_wide_off * S, 0,
                         (g_wide_off + native_w) * S, VRAM_H * S,
