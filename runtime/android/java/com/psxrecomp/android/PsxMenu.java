@@ -130,20 +130,25 @@ final class PsxMenu {
             scales.addView(b, lp);
         }
         list.addView(scales);
-        boolean wide = "\"16:9\"".equals(video.get("aspect_ratio"));
-        list.addView(label("Aspect ratio", "16:9 widens the 3D camera (you see more, nothing is stretched). "
-                + "2D backgrounds and some edges may not fill it; switch back if a game looks wrong."));
-        LinearLayout aspects = new LinearLayout(activity);
-        String[][] choices = { { "4:3", "\"4:3\"" }, { "16:9", "\"16:9\"" } };
-        for (int i = 0; i < choices.length; i++) {
-            final String value = choices[i][1];
-            TextView b = chip(choices[i][0], (i == 1) == wide);
-            b.setOnClickListener(v -> setVideo("aspect_ratio", value));
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, px(44), 1);
-            lp.setMargins(i == 0 ? 0 : px(6), px(6), 0, px(4));
-            aspects.addView(b, lp);
+        /* Aspect ratio: hidden. On PSX this framework only engages widescreen from a
+         * per-game widescreen mod package (main.cpp: "widescreen is mod-owned"), and
+         * none of our games ships one yet, so a plain [video] aspect_ratio is ignored. */
+        if (false) {
+            boolean wide = "\"16:9\"".equals(video.get("aspect_ratio"));
+            list.addView(label("Aspect ratio", "16:9 widens the 3D camera (you see more, nothing is stretched). "
+                    + "2D backgrounds and some edges may not fill it; switch back if a game looks wrong."));
+            LinearLayout aspects = new LinearLayout(activity);
+            String[][] choices = { { "4:3", "\"4:3\"" }, { "16:9", "\"16:9\"" } };
+            for (int i = 0; i < choices.length; i++) {
+                final String value = choices[i][1];
+                TextView b = chip(choices[i][0], (i == 1) == wide);
+                b.setOnClickListener(v -> setVideo("aspect_ratio", value));
+                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, px(44), 1);
+                lp.setMargins(i == 0 ? 0 : px(6), px(6), 0, px(4));
+                aspects.addView(b, lp);
+            }
+            list.addView(aspects);
         }
-        list.addView(aspects);
         toggle(list, "Anti-aliased (smooth edges)",
                 "On: draw big, shrink back (soft). Off: keep the full size (sharp, like DuckStation's upscale).",
                 smooth, on -> setVideo("antialiasing", on ? "true" : "false"));
