@@ -3488,3 +3488,41 @@ void debug_force_cd_reinsert(void) {
     trace_cdrom('O', 0, (uint32_t)CDROM_LID_CLOSE_DELAY_CYCLES,
                 (uint32_t)(CDROM_LID_CLOSE_DELAY_CYCLES >> 32));
 }
+
+/* Change discs the way a player does on real hardware: the tray opens, the
+ * old disc comes out, the new one goes in, the tray closes. The guest sees
+ * exactly the physical event a multi-disc game waits for at "insert disc 2":
+ * the shell-open error IRQ, then (after CDROM_LID_CLOSE_DELAY_CYCLES) a closed
+ * shell with new media, whose TOC/ID the game re-reads itself. Nothing about
+ * the new disc is announced to the game any other way.
+ *
+ * The new image is opened BEFORE the old one is released, so a bad path
+ * leaves the current disc in the drive (returns 0, guest sees nothing).
+ * Everything derived from the old disc's data is dropped with it: the read
+ * stream, CD-DA/XA playback, the sector ring and last sector, the warm-route
+ * read prediction and the SubQ replacement table. Call on the emulator
+ * thread, between frames. Returns 1 when the new disc is in. */
+int cdrom_swap_disc(const char *cue_path) {
+    void *next = cue_path ? iso_open(cue_path) : NULL;
+    if (!next) return 0;
+
+    stop_read_stream();
+    stop_cdda_playback();
+    if (iso_handle) iso_close(iso_handle);
+    iso_handle = next;
+
+    memset(s_sector_ring, 0, sizeof(s_sector_ring));
+    s_ring_read = 0;
+    s_ring_write = 0;
+    memset(last_sector_buffer, 0, sizeof(last_sector_buffer));
+    s_warm_route_active_index = -1;
+    s_warm_route_next = 0;
+    s_warm_route_last_lba = -1;
+    cdrom_debug_clear_sector_history();
+    last_valid_subq_available = 0;
+    subq_replacements_active = iso_has_subq_replacements(iso_handle);
+    if (subq_replacements_active) update_last_valid_subq(0);
+
+    debug_force_cd_reinsert();   /* the tray open/close the guest observes */
+    return 1;
+}

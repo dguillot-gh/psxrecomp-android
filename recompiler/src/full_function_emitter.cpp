@@ -1858,6 +1858,25 @@ void FullFunctionEmitter::emit_dispatch(
     }
     out += "};\n\n";
 
+    // Key-page map for psx_dispatch_impl's game fast route: which 4 KB pages
+    // of normalized RAM (< 2 MiB) hold at least one dispatch_table key. An
+    // address whose normalized page is clear can never hit the static search,
+    // so the dispatcher may skip straight to its miss outcome.
+    {
+        uint32_t key_pages[16] = {};
+        auto mark = [&](uint32_t key) {
+            if (key < 0x00200000u) key_pages[key >> 17] |= 1u << ((key >> 12) & 31u);
+        };
+        for (const auto& vh : vec_handlers) mark(vh.ram_addr);
+        for (uint32_t norm : emitted_normalized) mark(norm);
+        out += "/* 4 KB pages of normalized RAM (< 2 MiB) holding at least one\n";
+        out += " * dispatch_table key; see the game fast route in psx_dispatch_impl. */\n";
+        out += "static const uint32_t psx_bios_key_pages[16] = {";
+        for (int i = 0; i < 16; ++i)
+            out += fmt::format("{}0x{:08X}u", i ? ", " : " ", key_pages[i]);
+        out += " };\n\n";
+    }
+
     // --- Kernel body-extent table (runtime kernel-image bless) ---
     // The BIOS copies Kernel Part 2 from ROM [0x1FC10000,0x1FC18000) to RAM
     // [0x500,0x8500) at boot; the functions above with keys in that window
@@ -2047,6 +2066,26 @@ void FullFunctionEmitter::emit_dispatch(
         out += "        if (!found && psx_bios_try_native_call_stub(cpu, addr))\n";
         out += "            found = 1;\n";
     out += "#ifdef PSX_HAS_GAME_DISPATCH\n";
+    out += "        /* Game fast route. Every transfer into game code used to run the\n";
+    out += "         * shell-window checks and a static search that cannot succeed\n";
+    out += "         * before reaching the dirty_ram_dispatch() it always ends in. When\n";
+    out += "         * the target normalizes to plain RAM (so it is outside the shell\n";
+    out += "         * window, which normalizes to ROM), its page holds no dispatch key\n";
+    out += "         * (so the static search must miss), and the page is not dirty (so\n";
+    out += "         * the early dirty route below is not taken), every remaining step\n";
+    out += "         * is decided: take the miss outcome directly. Same calls, same\n";
+    out += "         * order, same results; the HLE hook and call stubs above still run\n";
+    out += "         * first. */\n";
+    out += "        if (!found) {\n";
+    out += "            uint32_t fr_norm = normalize(addr);\n";
+    out += "            if (fr_norm < 0x00200000u &&\n";
+    out += "                !(psx_bios_key_pages[fr_norm >> 17] & (1u << ((fr_norm >> 12) & 31u))) &&\n";
+    out += "                !dirty_ram_is_dirty(addr & 0x1FFFFFFFu)) {\n";
+    out += "                if (!dirty_ram_dispatch(cpu, addr, stop_addr))\n";
+    out += "                    psx_unknown_dispatch(cpu, addr, fr_norm);\n";
+    out += "                found = 1;\n";
+    out += "            }\n";
+    out += "        }\n";
     out += "        /* Game EXEs can overlap the BIOS shell copy window at\n";
     out += "         * physical 0x30000-0x5AFFF. If the target belongs to the\n";
     out += "         * active game text range, route it through the game/dirty-RAM\n";

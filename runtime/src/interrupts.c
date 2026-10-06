@@ -1089,7 +1089,15 @@ int psx_interrupt_delivery_needed(const CPUState* cpu) {
     return 1;
 }
 
-void psx_check_interrupts(CPUState* cpu) {
+/* Full IRQ-edge evaluation. Entered through psx_check_interrupts() below,
+ * which answers the dominant "nothing to deliver" edge without paying this
+ * function's prologue (it is >1000 lines with large locals). */
+#if defined(_MSC_VER)
+__declspec(noinline)
+#else
+__attribute__((noinline))
+#endif
+static void psx_check_interrupts_full(CPUState* cpu) {
     psx_cyc_batch_flush();
     extern int g_ls_suppress_record;
     extern int psx_netplay_active(void);
@@ -2163,6 +2171,40 @@ irq_deliver_eval:
     if (np_present_after_irq && !s_defer_switch_pending)
         gpu_vblank_flush_present();
 #undef PSX_CHECK_INTERRUPTS_RETURN
+}
+
+/* Generated code calls this at every basic-block edge — millions of times a
+ * second — and almost every call is the "genuine entry fast path" inside
+ * psx_check_interrupts_full: offline, not in an exception, no deferred thread
+ * switch, idle-skip off, and no unmasked hardware or COP0 software interrupt.
+ * Answer that case here with exactly the same effects (batch flush, path
+ * counters, periodic host maintenance, ls-suppress decrement) and take the
+ * full evaluation for everything else. Guest-visible behaviour is unchanged. */
+void psx_check_interrupts(CPUState* cpu) {
+    extern int g_ls_suppress_record;
+    extern int psx_netplay_active(void);
+    psx_cyc_batch_flush();  /* may advance devices and raise I_STAT: read after */
+    if (!in_exception && !s_defer_switch_pending && g_idle_skip_enabled == 0 &&
+        (i_stat & i_mask) == 0 &&
+        (cpu->cop0[COP0_CAUSE] & cpu->cop0[COP0_SR] & 0x0300u) == 0 &&
+        !psx_netplay_active()) {
+        s_irq_path_entry++;
+        s_irq_path_fast_none++;
+        if ((++s_fast_maintenance & 0x3FFFu) == 0) {
+            extern void savestate_poll(CPUState* cpu, uint32_t resume_pc);
+            extern void psx_netplay_poll_snap(CPUState* cpu, uint32_t resume_pc);
+            extern void psx_selfcheck_poll(CPUState* cpu, uint32_t resume_pc);
+            extern void psx_rewind_poll(CPUState* cpu, uint32_t resume_pc);
+            savestate_poll(cpu, s_compiled_interrupt_resume_pc);
+            psx_netplay_poll_snap(cpu, s_compiled_interrupt_resume_pc);
+            psx_selfcheck_poll(cpu, s_compiled_interrupt_resume_pc);
+            psx_rewind_poll(cpu, s_compiled_interrupt_resume_pc);
+            debug_server_poll();
+        }
+        if (g_ls_suppress_record > 0) g_ls_suppress_record--;
+        return;
+    }
+    psx_check_interrupts_full(cpu);
 }
 
 /* Compatibility shim: the ape-flavored generated code calls

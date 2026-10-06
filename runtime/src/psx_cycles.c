@@ -772,3 +772,9 @@ void psx_gte_stall(CPUState* cpu) {
         psx_advance_cycles((uint32_t)(cpu->gte_ts_done - psx_cycle_count));
     }
 }
+
+/* Out-of-line instance of the full charge path; the inlined psx_cyc_charge
+ * fast path (psx_cyc.h) defers here for every case it does not handle. */
+void psx_cyc_charge_slow(uint32_t cycles) {
+    psx_cyc_charge_full(cycles);
+}

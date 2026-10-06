@@ -108,6 +108,20 @@ void psx_icache_fetch_miss(CPUState* cpu, uint32_t addr) {
 }
 
 void psx_icache_fetch(CPUState* cpu, uint32_t addr) {
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+    /* Generated code calls this on every instruction fetch, and almost every
+     * call is a tag hit. Answer the two no-op outcomes here exactly as
+     * psx_icache_fetch_miss would (not replaying, cache enabled: hit -> +0;
+     * cache disabled -> nothing) so LTO can inline them into the compiled
+     * callers; everything else, including lockstep replay and the lazy enable
+     * probe, takes the full path unchanged. */
+    if (!g_ls_replay_active) {
+        if (g_psx_icache_active > 0 && g_psx_icache_tv[(addr & 0xFFCu) >> 2] == addr)
+            return;
+        if (g_psx_icache_active == 0)
+            return;
+    }
+#endif
     psx_icache_fetch_miss(cpu, addr);
 }
 

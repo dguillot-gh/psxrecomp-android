@@ -1610,18 +1610,65 @@ int main(int argc, char** argv) {
         ds << " * the search collapsed and returned no entry, silently routing all game\n";
         ds << " * code to the interpreter. Compare the 29-bit physical address instead;\n";
         ds << " * the table is sorted by the same masked key. */\n";
-        ds << "static const PsxGameDispatchEntry* psx_game_find_entry(uint32_t addr) {\n";
-        ds << "    const uint32_t want = addr & 0x1FFFFFFFu;\n";
-        ds << "    uint32_t lo = 0, hi = PSX_GAME_DISPATCH_COUNT;\n";
-        ds << "    while (lo < hi) {\n";
-        ds << "        uint32_t mid = lo + (hi - lo) / 2;\n";
-        ds << "        uint32_t key = k_psx_game_dispatch[mid].addr & 0x1FFFFFFFu;\n";
-        ds << "        if (want < key) hi = mid;\n";
-        ds << "        else if (want > key) lo = mid + 1;\n";
-        ds << "        else return &k_psx_game_dispatch[mid];\n";
-        ds << "    }\n";
-        ds << "    return 0;\n";
-        ds << "}\n\n";
+        // Dense O(1) lookup. Every guest control transfer resolves its entry
+        // here (often twice), so the binary search was the single hottest
+        // function on device. When the keys are word-aligned, unique, and span
+        // a bounded window, emit a direct slot table (entry index + 1, 0 = no
+        // entry) that returns exactly what the search would; otherwise keep it.
+        std::vector<uint32_t> dense_index;
+        uint32_t dense_lo = 0;
+        bool dense = !records.empty() && records.size() < 0xFFFFu;
+        if (dense) {
+            uint32_t kmin = 0xFFFFFFFFu, kmax = 0;
+            for (const auto& rec : records) {
+                const uint32_t k = rec.addr & 0x1FFFFFFFu;
+                if (k & 3u) { dense = false; break; }
+                kmin = std::min(kmin, k);
+                kmax = std::max(kmax, k);
+            }
+            const uint64_t slots = dense ? ((uint64_t)(kmax - kmin) >> 2) + 1u : 0u;
+            if (dense && slots <= (1u << 20)) {
+                dense_lo = kmin;
+                dense_index.assign((size_t)slots, 0u);
+                for (size_t i = 0; i < records.size(); ++i) {
+                    uint32_t& slot = dense_index[((records[i].addr & 0x1FFFFFFFu) - kmin) >> 2];
+                    if (slot) { dense = false; break; }  // duplicate key: keep the search
+                    slot = (uint32_t)i + 1u;
+                }
+            } else {
+                dense = false;
+            }
+        }
+        if (dense) {
+            ds << fmt::format("#define PSX_GAME_DENSE_LO 0x{:08X}u\n", dense_lo);
+            ds << fmt::format("#define PSX_GAME_DENSE_SLOTS {}u\n", dense_index.size());
+            ds << "/* Entry index + 1 per word of [PSX_GAME_DENSE_LO, +4*SLOTS); 0 = none. */\n";
+            ds << "static const uint16_t k_psx_game_dense_index[PSX_GAME_DENSE_SLOTS] = {";
+            for (size_t i = 0; i < dense_index.size(); ++i)
+                ds << fmt::format("{}{}", i == 0 ? "\n    " : (i % 24) ? "," : ",\n    ",
+                                  dense_index[i]);
+            ds << "\n};\n\n";
+            ds << "static const PsxGameDispatchEntry* psx_game_find_entry(uint32_t addr) {\n";
+            ds << "    const uint32_t off = (addr & 0x1FFFFFFFu) - PSX_GAME_DENSE_LO;\n";
+            ds << "    if (off & 3u) return 0;  /* keys are word-aligned */\n";
+            ds << "    if ((off >> 2) >= PSX_GAME_DENSE_SLOTS) return 0;  /* also below LO (wraps) */\n";
+            ds << "    const uint32_t i = k_psx_game_dense_index[off >> 2];\n";
+            ds << "    return i ? &k_psx_game_dispatch[i - 1u] : 0;\n";
+            ds << "}\n\n";
+        } else {
+            ds << "static const PsxGameDispatchEntry* psx_game_find_entry(uint32_t addr) {\n";
+            ds << "    const uint32_t want = addr & 0x1FFFFFFFu;\n";
+            ds << "    uint32_t lo = 0, hi = PSX_GAME_DISPATCH_COUNT;\n";
+            ds << "    while (lo < hi) {\n";
+            ds << "        uint32_t mid = lo + (hi - lo) / 2;\n";
+            ds << "        uint32_t key = k_psx_game_dispatch[mid].addr & 0x1FFFFFFFu;\n";
+            ds << "        if (want < key) hi = mid;\n";
+            ds << "        else if (want > key) lo = mid + 1;\n";
+            ds << "        else return &k_psx_game_dispatch[mid];\n";
+            ds << "    }\n";
+            ds << "    return 0;\n";
+            ds << "}\n\n";
+        }
 
         ds << "/* Exact static-code validity for this entry's emitted CFG ranges. */\n";
         ds << "int psx_game_text_native_ok(uint32_t addr) {\n";

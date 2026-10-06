@@ -764,9 +764,15 @@ int psx_hle_scheduler_enabled(void)
 {
     static int s_mode = -1;
     if (s_mode < 0) {
+#if defined(__ANDROID__)
+        /* Android bionic has no ucontext fiber backend; always use the
+         * deterministic scheduler rather than the legacy host-fiber bridge. */
+        s_mode = 1;
+#else
         const char* e = getenv("PSX_HLE_SCHEDULER");
         if (e && e[0]) s_mode = (e[0] == '0') ? 0 : 1;
         else           s_mode = s_hle_sched_default;
+#endif
     }
     return s_mode;
 }

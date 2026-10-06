@@ -828,7 +828,9 @@ static void pres_record(int path, int dx, int dy, int w, int h,
      * we pass in are already bottom-origin GL window coords). */
     uint8_t px[3] = { 0, 0, 0 };
     if (probe_pixels && lw > 0 && lh > 0) {
+#if !defined(__ANDROID__)
         glReadBuffer(GL_BACK);
+#endif
         glPixelStorei(GL_PACK_ALIGNMENT, 1);
         glReadPixels(lx + lw / 2, ly + lh / 2, 1, 1, GL_RGB, GL_UNSIGNED_BYTE, px);
         glPixelStorei(GL_PACK_ALIGNMENT, 4);

@@ -401,6 +401,10 @@ static uint8_t *text_ref_image = NULL;
 static uint32_t text_ref_lo = 0, text_ref_hi = 0;
 static uint32_t text_modified_bitmap[DIRTY_RAM_BITMAP_WORDS];
 static uint32_t text_diverged_bitmap[DIRTY_RAM_BITMAP_WORDS];
+/* Pages whose modified bit text_guard_try_reclean_page() already re-checked
+ * since their last differing write (see that function). */
+static uint32_t text_reclean_tried_bitmap[DIRTY_RAM_BITMAP_WORDS];
+static uint64_t g_text_recleaned_pages = 0;
 static uint64_t g_text_native_blocked = 0;
 static uint32_t g_text_diverged_pages = 0;
 static uint64_t g_text_exact_mismatches = 0;
@@ -419,6 +423,8 @@ void dirty_ram_register_text_image(uint32_t phys_lo, const uint8_t *bytes,
     text_ref_hi = phys_lo + len;
     memset(text_modified_bitmap, 0, sizeof(text_modified_bitmap));
     memset(text_diverged_bitmap, 0, sizeof(text_diverged_bitmap));
+    memset(text_reclean_tried_bitmap, 0, sizeof(text_reclean_tried_bitmap));
+    g_text_recleaned_pages = 0;
     g_text_native_blocked = 0;
     g_text_diverged_pages = 0;
     g_text_exact_mismatches = 0;
@@ -440,6 +446,33 @@ static inline void text_guard_note_write(uint32_t phys, uint32_t val, int size) 
     if (memcmp(ref, buf, (size_t)size) != 0) {
         uint32_t page = phys >> DIRTY_RAM_PAGE_SHIFT;
         text_modified_bitmap[page >> 5] |= (1u << (page & 31u));
+        text_reclean_tried_bitmap[page >> 5] &= ~(1u << (page & 31u));
+    }
+}
+
+/* A guard-modified page whose bytes have since returned to the reference
+ * image (e.g. RAM cleared or staged before the EXE load lands on it) would
+ * otherwise stay flagged forever and pay a byte compare on every native
+ * dispatch into it. After a range on such a page validates, re-check the WHOLE
+ * page once; if it is byte-identical to the reference, clear the modified bit
+ * so later dispatches take the page-clean fast path. This stays exact: every
+ * CPU store into the image goes through text_guard_note_write, which re-flags
+ * the page on the next differing write (and re-arms this check). Runtime-dirty
+ * pages are left alone — that bitmap has its own owners. */
+static void text_guard_try_reclean_page(uint32_t page) {
+    const uint32_t word = page >> 5, bit = 1u << (page & 31u);
+    if (!(text_modified_bitmap[word] & bit) || (text_reclean_tried_bitmap[word] & bit))
+        return;
+    text_reclean_tried_bitmap[word] |= bit;
+    if (dirty_ram_is_dirty(page << DIRTY_RAM_PAGE_SHIFT)) return;
+    uint32_t lo = page << DIRTY_RAM_PAGE_SHIFT;
+    uint32_t hi = lo + (1u << DIRTY_RAM_PAGE_SHIFT);
+    if (lo < text_ref_lo) lo = text_ref_lo;
+    if (hi > text_ref_hi) hi = text_ref_hi;
+    if (lo >= hi) return;
+    if (memcmp(ram + lo, text_ref_image + (lo - text_ref_lo), hi - lo) == 0) {
+        text_modified_bitmap[word] &= ~bit;
+        g_text_recleaned_pages++;
     }
 }
 
@@ -467,8 +500,10 @@ int dirty_ram_text_native_ok(uint32_t phys) {
      * route it to psx_unknown_dispatch. A genuine code overwrite still diverges. */
     uint32_t n = 256;
     if (n > text_ref_hi - phys) n = text_ref_hi - phys;
-    if (memcmp(ram + phys, text_ref_image + (phys - text_ref_lo), n) == 0)
+    if (memcmp(ram + phys, text_ref_image + (phys - text_ref_lo), n) == 0) {
+        text_guard_try_reclean_page(page);
         return 1;
+    }
 
     text_diverged_bitmap[page >> 5] |= bit;
     g_text_diverged_pages++;
@@ -540,6 +575,9 @@ int dirty_ram_text_native_ok_ranges_from(const uint32_t *lo_len_pairs,
             g_text_native_blocked++;
             return 0;
         }
+        for (uint32_t p = phys >> DIRTY_RAM_PAGE_SHIFT;
+             p <= (phys + len - 1u) >> DIRTY_RAM_PAGE_SHIFT; p++)
+            text_guard_try_reclean_page(p);
     }
     if (!any) {
         g_text_native_blocked++;
@@ -708,6 +746,7 @@ static uint32_t overlay_page_gen[DIRTY_RAM_PAGE_COUNT];
 void dirty_ram_reset_for_boot(void) {
     memset(dirty_ram_bitmap, 0, sizeof(dirty_ram_bitmap));
     memset(text_modified_bitmap, 0, sizeof(text_modified_bitmap));
+    memset(text_reclean_tried_bitmap, 0, sizeof(text_reclean_tried_bitmap));
     memset(text_diverged_bitmap, 0, sizeof(text_diverged_bitmap));
     g_text_diverged_pages = 0;
     memset(overlay_watch_bitmap, 0, sizeof(overlay_watch_bitmap));
@@ -768,6 +807,7 @@ void dirty_ram_text_guard_resync_after_restore(void) {
      * host-only text-guard bitmaps; live writes re-arm modified, and the
      * next native_ok compare re-decides diverge against restored bytes. */
     memset(text_modified_bitmap, 0, sizeof(text_modified_bitmap));
+    memset(text_reclean_tried_bitmap, 0, sizeof(text_reclean_tried_bitmap));
     memset(text_diverged_bitmap, 0, sizeof(text_diverged_bitmap));
     g_text_diverged_pages = 0;
 }

@@ -89,7 +89,59 @@ static inline void psx_cyc_local_cleanup(uint32_t **guard) {
 }
 #endif
 
-static inline void psx_cyc_charge(uint32_t cycles) {
+/* Per-instruction helpers are forced inline: every recompiled instruction calls
+ * psx_cyc_step with a compile-time-constant dependency mask, and only inlining
+ * lets that mask fold the GPR_DEPRES loop into a few constant-index stores.
+ * Left to its heuristics the compiler outlined these (an out-of-line call plus
+ * a runtime bit loop per guest instruction, ~25% of host time on Android). */
+#if defined(_MSC_VER)
+#define PSX_CYC_INLINE static __forceinline
+#elif defined(__GNUC__) || defined(__clang__)
+#define PSX_CYC_INLINE static inline __attribute__((always_inline))
+#else
+#define PSX_CYC_INLINE static inline
+#endif
+
+/* Full charge path (psx_cycles.c): replay / conservative stepping, device-
+ * service re-entry, function-local VLC sinks, and batch publication at the
+ * deadline. Kept out of line so the inlined fast path below stays small. */
+void psx_cyc_charge_slow(uint32_t cycles);
+
+PSX_CYC_INLINE void psx_cyc_charge(uint32_t cycles) {
+#if defined(PSX_OVERLAY_DLL_BUILD)
+    if (cycles == 0u) return;
+    psx_advance_cycles(cycles);
+#elif defined(PSX_COSIM)
+    psx_cyc_charge_slow(cycles);
+#else
+    /* Fast path: inside a generated block (bb-defer), with no replay,
+     * conservative stepping, device-service re-entry or local sink active,
+     * psx_cyc_charge_slow does exactly this -- add to the deferred batch with
+     * no deadline probe -- so taking it here changes no guest-visible timing.
+     * sum >= cycles <=> the add did not wrap (same test as slow's sum >= prior). */
+#if defined(__GNUC__) || defined(__clang__)
+    if (__builtin_expect(g_psx_cyc_bb_defer > 0 &&
+                         !(g_ls_replay_active | g_event_step_conservative |
+                           psx_in_device_service) &&
+                         !g_psx_cyc_local_acc, 1)) {
+#else
+    if (g_psx_cyc_bb_defer > 0 &&
+        !(g_ls_replay_active | g_event_step_conservative | psx_in_device_service) &&
+        !g_psx_cyc_local_acc) {
+#endif
+        uint32_t sum = g_psx_cyc_batch + cycles;
+        if (sum >= cycles) {
+            g_psx_cyc_batch = sum;
+            return;
+        }
+    }
+    psx_cyc_charge_slow(cycles);
+#endif
+}
+
+/* The original psx_cyc_charge, verbatim; psx_cycles.c instantiates it as the
+ * out-of-line psx_cyc_charge_slow. */
+static inline void psx_cyc_charge_full(uint32_t cycles) {
     if (cycles == 0u) return;
 #if defined(PSX_OVERLAY_DLL_BUILD)
     psx_advance_cycles(cycles);
@@ -152,7 +204,7 @@ static inline void psx_cyc_charge(uint32_t cycles) {
 }
 
 /* §1 base (Beetle cpu.cpp:795-798). */
-static inline void psx_cyc_base(CPUState* cpu) {
+PSX_CYC_INLINE void psx_cyc_base(CPUState* cpu) {
     uint8_t w = cpu->read_absorb_which;
     if (cpu->read_absorb[w]) cpu->read_absorb[w]--;
     else                     psx_cyc_charge(1u);
@@ -161,7 +213,7 @@ static inline void psx_cyc_base(CPUState* cpu) {
 /* GPR_DEPRES (Beetle cpu.cpp:702-705): zero ReadAbsorb[n] for every source/dest
  * GPR of this instruction, preserving ReadAbsorb[0] (skipping bit 0 == Beetle's
  * save/restore of ReadAbsorb[0]). */
-static inline void psx_cyc_deps(CPUState* cpu, uint32_t reg_mask) {
+PSX_CYC_INLINE void psx_cyc_deps(CPUState* cpu, uint32_t reg_mask) {
     reg_mask &= 0xFFFFFFFEu;   /* never touch ReadAbsorb[0] */
     if (reg_mask && (reg_mask & (reg_mask - 1u)) == 0u) {
 #if defined(_MSC_VER)
@@ -188,7 +240,7 @@ static inline void psx_cyc_deps(CPUState* cpu, uint32_t reg_mask) {
 
 /* DO_LDS timing-commit (Beetle cpu.cpp:800). LDWhich==0x20 (no pending) writes the
  * dummy slot read_absorb[32] and sets read_fudge=0x20 (=> next load gets +2 fudge). */
-static inline void psx_cyc_lds(CPUState* cpu) {
+PSX_CYC_INLINE void psx_cyc_lds(CPUState* cpu) {
     uint8_t lw = cpu->ld_which_t;
     cpu->read_absorb[lw]    = (uint8_t)cpu->ld_absorb;
     cpu->read_fudge         = lw;
@@ -200,7 +252,7 @@ static inline void psx_cyc_lds(CPUState* cpu) {
  * branch, jump, store, COP control, LWC2/SWC2 pre-step, mult/div, mfhi/mflo, ...).
  * reg_mask from psx_cyc_dep_res_mask(). MUST be emitted BEFORE the instruction
  * body so §1 precedes any muldiv/GTE deadline stall in the body (Beetle order). */
-static inline void psx_cyc_step(CPUState* cpu, uint32_t reg_mask) {
+PSX_CYC_INLINE void psx_cyc_step(CPUState* cpu, uint32_t reg_mask) {
     psx_cyc_base(cpu);
     psx_cyc_deps(cpu, reg_mask);
     psx_cyc_lds(cpu);

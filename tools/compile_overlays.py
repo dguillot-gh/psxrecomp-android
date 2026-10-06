@@ -196,15 +196,20 @@ def overlay_config_hash(recompiler: str, game_toml: str) -> int:
 
 
 _TARGET_OS = None
+_TARGET_ARCH = None
+_ANDROID_SYSROOT = None
 
-def set_target_os(target_os: str | None) -> None:
-    global _TARGET_OS
+def set_target_os(target_os: str | None, target_arch: str | None = None,
+                 android_sysroot: str | None = None) -> None:
+    global _TARGET_OS, _TARGET_ARCH, _ANDROID_SYSROOT
     _TARGET_OS = target_os
+    _TARGET_ARCH = target_arch
+    _ANDROID_SYSROOT = android_sysroot
 
 def is_windows() -> bool:
     if _TARGET_OS == 'win':
         return True
-    if _TARGET_OS in ('linux', 'macos'):
+    if _TARGET_OS in ('linux', 'macos', 'android'):
         return False
     return (os.name == 'nt'
             or platform.system() == 'Windows'
@@ -241,13 +246,13 @@ def cache_arch_abi() -> str:
     gcc DLLs are namespaced under <game_id>/gcc/<arch-abi>/ so same-OS
     different-arch caches never comingle. Keep this
     mapping in lockstep with overlay_loader.c."""
-    if _TARGET_OS in ('win', 'linux', 'macos'):
-        os_tag = _TARGET_OS
+    if _TARGET_OS in ('win', 'linux', 'macos', 'android'):
+        os_tag = 'linux' if _TARGET_OS == 'android' else _TARGET_OS
     elif is_windows():
         os_tag = 'win'
     else:
         os_tag = {'Darwin': 'macos'}.get(platform.system(), 'linux')
-    m = platform.machine().lower()
+    m = (_TARGET_ARCH or platform.machine()).lower()
     if m in ('amd64', 'x86_64', 'x64'):
         arch = 'x64'
     elif m in ('arm64', 'aarch64'):
@@ -4501,8 +4506,12 @@ def _compile_dll_direct(c_path: str, out_dll: str, include_dirs: list[str],
     # On Windows, DLLs use PE relocations — -fPIC triggers GCC CRT init
     # that conflicts with the host process. Use -shared without -fPIC.
     pic_flag = [] if is_windows() else ['-fPIC']
+    target_flags = []
+    if _TARGET_OS == 'android':
+        target_flags = ['--target=aarch64-linux-android21',
+                        '--sysroot=' + native_path(_ANDROID_SYSROOT)]
     cmd = [
-        gcc, '-shared', *pic_flag, '-O2',
+        gcc, *target_flags, '-shared', *pic_flag, '-O2',
         '-DPSX_OVERLAY_DLL_BUILD',
         # Overlays mirror the runtime's no-debug-tools build: the emitter guards
         # debug_server_cyc_observe (and friends) behind PSX_NO_DEBUG_TOOLS, and the
@@ -5923,8 +5932,12 @@ def main():
                          'independent recompile+audit, run in a process pool '
                          'and merged in capture order (byte-identical output '
                          'to the sequential path).')
-    ap.add_argument('--target-os', choices=['auto', 'win', 'linux', 'macos'], default='auto',
+    ap.add_argument('--target-os', choices=['auto', 'win', 'linux', 'macos', 'android'], default='auto',
                     help='target operating system for compiled overlay shards (default: auto)')
+    ap.add_argument('--target-arch', choices=['auto', 'x64', 'arm64', 'x86'], default='auto',
+                    help='target CPU architecture for cache namespace (default: host)')
+    ap.add_argument('--android-sysroot', default=None,
+                    help='Android NDK sysroot; enables ARM64 Android cross-compilation')
     args = ap.parse_args()
     target_os = args.target_os
     if target_os == 'auto':
@@ -5932,7 +5945,14 @@ def main():
             target_os = 'win'
         else:
             target_os = None
-    set_target_os(target_os)
+    target_arch = None if args.target_arch == 'auto' else args.target_arch
+    if target_os == 'android':
+        if target_arch not in (None, 'arm64'):
+            raise SystemExit('FATAL: Android overlay builds currently require --target-arch arm64')
+        if not args.android_sysroot:
+            raise SystemExit('FATAL: --target-os android requires --android-sysroot')
+        target_arch = 'arm64'
+    set_target_os(target_os, target_arch, args.android_sysroot)
     forced_interiors = {
         (int(v, 0) & 0x1FFFFFFF) | 0x80000000
         for v in args.force_interior

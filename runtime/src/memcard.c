@@ -28,7 +28,14 @@ typedef struct {
     char filepath[512];
     int present;
     int dirty;
+    int settle_frames;  /* frames since the last sector write (write-back) */
 } MemCard;
+
+/* A save is a burst of sector writes spread over several frames. Once a card
+ * has seen no write for this many frames the burst is over and the image is
+ * written back, so a save survives the process being killed (Android ends
+ * background apps without warning) rather than only a clean shutdown. */
+#define MEMCARD_SETTLE_FRAMES 30
 
 static MemCard cards[MAX_CARDS];
 
@@ -237,6 +244,7 @@ int memcard_write_sector(int card, int sector, const uint8_t* buf) {
 
     memcpy(cards[card].data + sector * MEMCARD_SECTOR_SIZE, buf, MEMCARD_SECTOR_SIZE);
     cards[card].dirty = 1;
+    cards[card].settle_frames = 0;
     return 0;
 }
 
@@ -245,14 +253,35 @@ void memcard_flush(int card) {
     if (!cards[card].dirty) return;
     if (cards[card].filepath[0] == '\0') return;
 
-    FILE* f = fopen(cards[card].filepath, "wb");
+    /* Write a sibling temp file and rename it over the card, so an
+     * interrupted write leaves the previous image intact instead of a
+     * truncated card. */
+    char tmp[sizeof(cards[card].filepath) + 8];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", cards[card].filepath);
+    FILE* f = fopen(tmp, "wb");
     if (f) {
         size_t n = fwrite(cards[card].data, 1, MEMCARD_SIZE, f);
         int flush_ok = (fflush(f) == 0);
         int close_ok = (fclose(f) == 0);
         if (n == MEMCARD_SIZE && flush_ok && close_ok) {
-            cards[card].dirty = 0;
+#ifdef _WIN32
+            /* Windows rename() does not replace an existing file. */
+            remove(cards[card].filepath);
+#endif
+            if (rename(tmp, cards[card].filepath) == 0) {
+                cards[card].dirty = 0;
+                return;
+            }
         }
+        remove(tmp);
+    }
+}
+
+void memcard_flush_settled(void) {
+    for (int i = 0; i < MAX_CARDS; i++) {
+        if (!cards[i].dirty) continue;
+        if (++cards[i].settle_frames >= MEMCARD_SETTLE_FRAMES)
+            memcard_flush(i);
     }
 }
 

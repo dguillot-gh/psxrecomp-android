@@ -71,6 +71,11 @@ int cdrom_timing_record(uint64_t seq, CdTimingPub* out);
  * active transfers, reports an open shell, waits two emulated seconds, then
  * makes the mounted media readable. This call does not mount a different image. */
 void debug_force_cd_reinsert(void);
+/* Multi-disc change: open the tray, mount the image at cue_path in place of the
+ * current disc, close the tray (the same guest-visible sequence as above). The
+ * new image is opened first; on failure the old disc stays in and 0 is returned.
+ * Emulator thread only. */
+int cdrom_swap_disc(const char *cue_path);
 /* FMV auto-skip detection: cdrom_xa_stream_active() lets the frontend detect
  * that streaming XA (FMV/CDDA) is in progress. The skip itself is done by the
  * frontend via uncapped pacing (it does NOT alter CD timing — flooding XA

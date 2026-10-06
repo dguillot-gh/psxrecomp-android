@@ -407,6 +407,66 @@ static void idct_block(int16_t *block)
 {
     idct_block_sse2(block);
 }
+#elif defined(MDEC_HAVE_NEON)
+static int s_mdec_neon_ok = 1;
+
+/* ARM NEON equivalent of the SSE2 eight-term dot product. PS1 MDEC blocks
+ * have already been Mask9-clamped, so the four 32-bit partial sums stay in
+ * range and the horizontal sum is bit-identical to the scalar reference. */
+static int idct_neon_dot8(const int16_t *src8, const int16_t *scale8)
+{
+    int16x8_t src = vld1q_s16(src8);
+    int16x8_t scale = vld1q_s16(scale8);
+    int32x4_t lo = vmull_s16(vget_low_s16(src), vget_low_s16(scale));
+    int32x4_t hi = vmull_s16(vget_high_s16(src), vget_high_s16(scale));
+    return vaddvq_s32(vaddq_s32(lo, hi));
+}
+
+static void idct_block_neon(int16_t *block)
+{
+    int ac = 0;
+    int i, col, x;
+    int16_t tmp[64];
+
+    for (i = 1; i < 64; i++) ac |= block[i];
+    if (!ac) {
+        idct_block_dc_only(block);
+        return;
+    }
+    for (col = 0; col < 8; col++) {
+        const int16_t *src = block + col * 8;
+        int col_or = 0;
+        for (i = 0; i < 8; i++) col_or |= src[i];
+        if (!col_or) {
+            for (x = 0; x < 8; x++) tmp[x * 8 + col] = 0;
+            continue;
+        }
+        for (x = 0; x < 8; x++) {
+            int sum = idct_neon_dot8(src, mdec.scale + x * 8);
+            tmp[x * 8 + col] = (int16_t)((sum + 0x4000) >> 15);
+        }
+    }
+    for (col = 0; col < 8; col++) {
+        const int16_t *src = tmp + col * 8;
+        int col_or = 0;
+        for (i = 0; i < 8; i++) col_or |= src[i];
+        if (!col_or) {
+            for (x = 0; x < 8; x++) block[col * 8 + x] = 0;
+            continue;
+        }
+        for (x = 0; x < 8; x++) {
+            int sum = idct_neon_dot8(src, mdec.scale + x * 8);
+            block[col * 8 + x] =
+                (int16_t)mask9_clamp_s8((sum + 0x4000) >> 15);
+        }
+    }
+}
+
+static void idct_block(int16_t *block)
+{
+    if (s_mdec_neon_ok) idct_block_neon(block);
+    else idct_block_scalar(block);
+}
 #else
 static void idct_block(int16_t *block)
 {
@@ -600,6 +660,102 @@ static void mdec_encode_row24_sse2(const int16_t *by, const int16_t *cb4,
 #undef MDEC_M9
 #endif /* MDEC_HAVE_SSE2 */
 
+#if defined(MDEC_HAVE_NEON)
+static void mdec_encode_row24_neon(const int16_t *by, const int16_t *cb4,
+                                  const int16_t *cr4, uint8_t rgb_xor,
+                                  uint8_t *out)
+{
+    for (int base = 0; base < 8; base += 4) {
+        int32_t yv[4], cbv[4], crv[4];
+        int32_t rv[4], gv[4], bv[4];
+        for (int lane = 0; lane < 4; lane++) {
+            int i = base + lane;
+            yv[lane] = by[i];
+            cbv[lane] = cb4[i >> 1];
+            crv[lane] = cr4[i >> 1];
+        }
+        int32x4_t y = vld1q_s32(yv);
+        int32x4_t cb = vld1q_s32(cbv);
+        int32x4_t cr = vld1q_s32(crv);
+        int32x4_t round = vdupq_n_s32(0x80);
+        int32x4_t r = vaddq_s32(y, vshrq_n_s32(
+            vaddq_s32(vmulq_n_s32(cr, 359), round), 8));
+        int32x4_t b = vaddq_s32(y, vshrq_n_s32(
+            vaddq_s32(vmulq_n_s32(cb, 454), round), 8));
+        int32x4_t g_cb = vandq_s32(vmulq_n_s32(cb, -88),
+                                   vdupq_n_s32(~0x1F));
+        int32x4_t g_cr = vandq_s32(vmulq_n_s32(cr, -183),
+                                   vdupq_n_s32(~0x07));
+        int32x4_t g = vaddq_s32(y, vshrq_n_s32(
+            vaddq_s32(vaddq_s32(g_cb, g_cr), round), 8));
+        vst1q_s32(rv, r);
+        vst1q_s32(gv, g);
+        vst1q_s32(bv, b);
+        for (int lane = 0; lane < 4; lane++) {
+            int i = base + lane;
+            int ru = mask9_clamp_s8(rv[lane]) ^ 0x80;
+            int gu = mask9_clamp_s8(gv[lane]) ^ 0x80;
+            int bu = mask9_clamp_s8(bv[lane]) ^ 0x80;
+            out[i * 3 + 0] = (uint8_t)(ru ^ rgb_xor);
+            out[i * 3 + 1] = (uint8_t)(gu ^ rgb_xor);
+            out[i * 3 + 2] = (uint8_t)(bu ^ rgb_xor);
+        }
+    }
+}
+
+static void mdec_neon_selfcheck(void)
+{
+    uint32_t seed = 0xA715C0DEu;
+    int16_t saved_scale[64];
+    int16_t saved_depth = (int16_t)mdec.output_depth;
+    uint8_t saved_signed = mdec.output_signed;
+    memcpy(saved_scale, mdec.scale, sizeof(saved_scale));
+    s_mdec_neon_ok = 1;
+    for (int n = 0; n < 64; n++)
+        mdec.scale[n] = (int16_t)(((n % 9) - 4) * 256);
+    for (int n = 0; n < 512 && s_mdec_neon_ok; n++) {
+        int16_t scalar[64], neon[64];
+        for (int i = 0; i < 64; i++) {
+            seed = seed * 1664525u + 1013904223u;
+            scalar[i] = (int16_t)((int)(seed % 511u) - 255);
+            if (n < 8) scalar[i] = (i == 0) ? (int16_t)(n * 20) : 0;
+        }
+        memcpy(neon, scalar, sizeof(neon));
+        idct_block_scalar(scalar);
+        idct_block_neon(neon);
+        if (memcmp(scalar, neon, sizeof(neon)) != 0) s_mdec_neon_ok = 0;
+    }
+    mdec.output_depth = 2;
+    for (int signed_mode = 0; signed_mode < 2 && s_mdec_neon_ok; signed_mode++) {
+        uint8_t flip = signed_mode ? 0x80u : 0u;
+        mdec.output_signed = (uint8_t)signed_mode;
+        for (int n = 0; n < 256 && s_mdec_neon_ok; n++) {
+            int16_t by[8], cb4[4], cr4[4];
+            uint8_t neon[24], reference[24];
+            uint8_t *p = reference;
+            for (int i = 0; i < 8; i++) {
+                seed = seed * 1664525u + 1013904223u;
+                by[i] = (int16_t)((int)(seed % 255u) - 128);
+            }
+            for (int i = 0; i < 4; i++) {
+                seed = seed * 1664525u + 1013904223u;
+                cb4[i] = (int16_t)((int)(seed % 255u) - 128);
+                seed = seed * 1664525u + 1013904223u;
+                cr4[i] = (int16_t)((int)(seed % 255u) - 128);
+            }
+            mdec_encode_row24_neon(by, cb4, cr4, flip, neon);
+            for (int i = 0; i < 8; i++)
+                p = emit_rgb_pixel(p, by[i], cr4[i >> 1], cb4[i >> 1]);
+            if (memcmp(neon, reference, sizeof(neon)) != 0)
+                s_mdec_neon_ok = 0;
+        }
+    }
+    memcpy(mdec.scale, saved_scale, sizeof(saved_scale));
+    mdec.output_depth = (uint8_t)saved_depth;
+    mdec.output_signed = saved_signed;
+}
+#endif /* MDEC_HAVE_NEON */
+
 static void append_color_macroblock(const int16_t *crblk, const int16_t *cbblk,
                                     const int16_t yblk[4][64]) {
     /* 16×16: 512 bytes @15bpp, 768 @24bpp — reserve once per MB. */
@@ -621,6 +777,27 @@ static void append_color_macroblock(const int16_t *crblk, const int16_t *cbblk,
                                    &crblk[crow], rgb_xor, p);
             p += 24;
             mdec_encode_row24_sse2(&yblk[y_right][ly * 8], &cbblk[crow + 4],
+                                   &crblk[crow + 4], rgb_xor, p);
+            p += 24;
+        }
+        mdec.output_size += need;
+        return;
+    }
+#elif defined(MDEC_HAVE_NEON)
+    /* MDEC 24bpp color conversion is the other large scalar FMV cost on ARM.
+     * Vectorize its multiply/add channels in groups of four, keeping the
+     * reference mask/clamp and output-byte rules unchanged. */
+    if (mdec.output_depth != 3 && s_mdec_neon_ok) {
+        uint8_t rgb_xor = mdec.output_signed ? 0x80u : 0x00u;
+        for (int py = 0; py < 16; py++) {
+            int y_left = (py >= 8 ? 2 : 0);
+            int y_right = y_left + 1;
+            int ly = py & 7;
+            int crow = (py >> 1) * 8;
+            mdec_encode_row24_neon(&yblk[y_left][ly * 8], &cbblk[crow],
+                                   &crblk[crow], rgb_xor, p);
+            p += 24;
+            mdec_encode_row24_neon(&yblk[y_right][ly * 8], &cbblk[crow + 4],
                                    &crblk[crow + 4], rgb_xor, p);
             p += 24;
         }
@@ -859,6 +1036,11 @@ void mdec_init(void) {
         mdec.output_signed = 0;
         mdec.output_depth = 3;
     }
+#elif defined(MDEC_HAVE_NEON)
+    mdec_neon_selfcheck();
+    memset(mdec.scale, 0, sizeof(mdec.scale));
+    mdec.output_depth = 3;
+    mdec.output_signed = 0;
 #endif
 }
 

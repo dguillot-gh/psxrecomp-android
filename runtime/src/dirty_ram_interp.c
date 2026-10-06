@@ -1352,7 +1352,9 @@ static int interp_enter_compiled(CPUState *cpu, uint32_t target) {
     if (target == 0x8001A954u) site_note(&g_site_interp);
     /* Decline when the target page no longer matches the static game image.
      * Returning 0 lets the JAL/JALR handler fall through to local-flow interp
-     * of the live RAM bytes instead of running stale compiled code. */
+     * of the live RAM bytes instead of running stale compiled code. Kept as a
+     * full check (not an entry-exists test): this path must decline BEFORE the
+     * stack-watermark bail below, which would otherwise surface a stale target. */
     if (!psx_game_text_native_ok(target)) return 0;
     if (psx_mixed_owner_enabled()
         && interp_host_stack_used() > psx_mixed_stack_watermark()) {
@@ -2759,8 +2761,12 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
 #endif
     /* Run the statically-compiled game function only while the target is still
      * native-safe. Dirty overlay pages and pages whose text bytes diverged from
-     * the original EXE image fall through to interpret the live RAM bytes. */
-    if (psx_game_text_native_ok(addr)) {
+     * the original EXE image fall through to interpret the live RAM bytes.
+     * psx_dispatch_game_compiled itself validates the entry's live ranges and
+     * returns 0 when they no longer match, so only test that an entry exists
+     * here — validating twice per dispatch doubled the range walk on the
+     * hottest path. A declined dispatch takes the same miss path as before. */
+    if (psx_game_is_function_entry(addr)) {
         g_mixed_depth++;
         {
             ls_func_enter(addr, cpu);

@@ -3178,6 +3178,33 @@ uint32_t gpu_display_pixel_argb(const GpuDisplayInfo* di, uint32_t x, uint32_t y
     return 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
 }
 
+/* Batch 15-bit scanline -> ARGB, the 16-bit counterpart of
+ * gpu_depth24_present_row below. Same output as calling
+ * gpu_display_pixel_argb(di, x, y) for each x (horizontal VRAM wrap and the
+ * opt-in screen LUT included), but the row/LUT invariants are resolved once
+ * per scanline instead of through a three-call chain per pixel, which
+ * profiled at ~3% of the frame on a 320-wide software present. */
+void gpu_rgb555_present_row(const GpuDisplayInfo* di, uint32_t y, uint32_t* out,
+                            uint32_t count) {
+    const uint16_t* row = vram + (size_t)((di->display_y + y) & 511u) * 1024u;
+    const uint32_t x0 = di->display_x;
+    uint32_t x;
+    screen_lut_ensure();
+    if (s_screen_lut) {
+        for (x = 0; x < count; x++) {
+            uint8_t r, g, b;
+            color_lut_map555(s_screen_lut, row[(x0 + x) & 1023u], &r, &g, &b);
+            out[x] = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+        }
+        return;
+    }
+    for (x = 0; x < count; x++) {
+        const uint32_t c = row[(x0 + x) & 1023u];
+        out[x] = 0xFF000000u | ((c & 0x1Fu) << 19) | (((c >> 5) & 0x1Fu) << 11) |
+                 (((c >> 10) & 0x1Fu) << 3);
+    }
+}
+
 /* Batch depth24 (FMV) scanline → ARGB. Same semantics as calling
  * gpu_display_pixel_argb(di, x, y) for x in [0, count) (byte-identical
  * output, including the black-fill past the 2048-byte VRAM row), but hoists

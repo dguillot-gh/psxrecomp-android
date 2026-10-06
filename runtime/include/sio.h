@@ -136,6 +136,12 @@ int  sio_get_multitap_analog(void);
 void sio_set_pad_state(uint16_t buttons);
 void sio_set_pad_state_slot(int slot, uint16_t buttons);
 
+/* Sony PlayStation Mouse on physical controller port 1. Motion is accumulated
+ * until the game polls it, then returned as signed 8-bit relative deltas. */
+void sio_set_mouse_enabled(int enabled);
+void sio_set_mouse_motion(int dx, int dy);
+void sio_set_mouse_buttons(int left_pressed, int right_pressed);
+
 /* Set the analog stick state + pad type for a logical pad. enabled selects the
  * emulated pad: 0 = digital (poll id 0x41), 1 = DualShock/analog (poll id
  * 0x73, with the four 0..255 stick axes appended; 0x80 = centred). */
