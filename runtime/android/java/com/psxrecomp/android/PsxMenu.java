@@ -117,6 +117,20 @@ final class PsxMenu {
                 on -> pad.setFpsOn(on));
 
         Map<String, String> video = readVideo();
+        boolean gpu = "\"opengl\"".equals(video.get("renderer"));
+        list.addView(label("Renderer", "GPU draws on the phone's graphics chip: higher resolutions cost "
+                + "much less. Experimental; switch back to Software if anything looks wrong."));
+        LinearLayout renderers = new LinearLayout(activity);
+        String[][] rchoices = { { "Software", "\"software\"" }, { "GPU (experimental)", "\"opengl\"" } };
+        for (int i = 0; i < rchoices.length; i++) {
+            final String value = rchoices[i][1];
+            TextView b = chip(rchoices[i][0], (i == 1) == gpu);
+            b.setOnClickListener(v -> setVideo("renderer", value));
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, px(44), 1);
+            lp.setMargins(i == 0 ? 0 : px(6), px(6), 0, px(4));
+            renderers.addView(b, lp);
+        }
+        list.addView(renderers);
         int scale = parseInt(video.get("supersampling"), 1);
         boolean smooth = !"false".equals(video.get("antialiasing"));
         list.addView(label("Internal resolution", "How big the game's picture is drawn before it reaches the screen. 1× = original PS1."));

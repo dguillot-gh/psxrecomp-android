@@ -120,6 +120,32 @@
 #define PSXGL_CONSTANT_ALPHA        0x8003
 #define PSXGL_UNPACK_ROW_LENGTH     0x0CF2
 #define PSXGL_SRC1_ALPHA            0x8589
+/* OpenGL ES (Android): BGRA is not an upload/readback format there. Upload the
+ * same bytes as RGBA and swap red/blue with the texture's swizzle (ES 3.0 core);
+ * read back as RGBA and swap on the CPU. */
+#define PSXGL_TEXTURE_SWIZZLE_R     0x8E42
+#define PSXGL_TEXTURE_SWIZZLE_B     0x8E44
+#define PSXGL_RED                   0x1903
+#define PSXGL_BLUE                  0x1905
+static int s_gles = 0;          /* context is OpenGL ES (set at context creation) */
+static int s_dual_src_ok = 1;   /* dual-source blending usable (desktop GL 3.3) */
+#define PSXGL_BGRA_FMT (s_gles ? GL_RGBA : GL_BGRA)
+/* After uploading BGRA bytes as RGBA on ES, make the bound texture sample right. */
+static void psxgl_bgra_swizzle(void) {
+    if (!s_gles) return;
+    glTexParameteri(GL_TEXTURE_2D, PSXGL_TEXTURE_SWIZZLE_R, PSXGL_BLUE);
+    glTexParameteri(GL_TEXTURE_2D, PSXGL_TEXTURE_SWIZZLE_B, PSXGL_RED);
+}
+/* glReadPixels in BGRA byte order on both APIs. */
+static void psxgl_read_bgra(GLint x, GLint y, GLsizei w, GLsizei h, void *dst) {
+    glReadPixels(x, y, w, h, PSXGL_BGRA_FMT, GL_UNSIGNED_BYTE, dst);
+    if (s_gles) {
+        uint8_t *p = (uint8_t *)dst;
+        for (size_t i = 0, n = (size_t)w * (size_t)h; i < n; i++, p += 4) {
+            uint8_t t = p[0]; p[0] = p[2]; p[2] = t;
+        }
+    }
+}
 
 #ifndef APIENTRY
 #define APIENTRY
@@ -275,7 +301,11 @@ static int load_modern_gl(void) {
     LOAD(p_glBindBuffer, "glBindBuffer");        LOAD(p_glBufferData, "glBufferData");
     LOAD(p_glVertexAttribPointer, "glVertexAttribPointer");
     LOAD(p_glEnableVertexAttribArray, "glEnableVertexAttribArray");
-    LOAD(p_glBindFragDataLocationIndexed, "glBindFragDataLocationIndexed");
+    /* Dual-source blending: desktop GL 3.3 core; ES needs an extension and
+     * different shader syntax, so ES uses the renderer's two-pass blend path. */
+    p_glBindFragDataLocationIndexed = (void *)SDL_GL_GetProcAddress("glBindFragDataLocationIndexed");
+    s_dual_src_ok = !s_gles && p_glBindFragDataLocationIndexed != NULL;
+    if (!s_gles && !p_glBindFragDataLocationIndexed) ok = 0;
     LOAD(p_glGenFramebuffers, "glGenFramebuffers"); LOAD(p_glBindFramebuffer, "glBindFramebuffer");
     LOAD(p_glDeleteFramebuffers, "glDeleteFramebuffers");
     LOAD(p_glFramebufferTexture2D, "glFramebufferTexture2D");
@@ -473,6 +503,31 @@ static int runtime_upload_diag_enabled(void) {
         enabled = e && e[0] && e[0] != '0';
     }
     return enabled;
+}
+
+/* Tile-GPU pass counters (PSX_RUNTIME_PERF_DIAG): on a tiler every switch of
+ * the bound framebuffer, and every sample of the hr colour texture, can force
+ * the whole hr surface (VRAM at internal scale) to be stored and reloaded. */
+enum { TC_HR_BIND, TC_HR_END, TC_PACK, TC_STENCIL, TC_UPLOAD, TC_BLIT, TC_PRESENT, TC_N };
+static uint64_t s_tc[TC_N];
+static uint64_t s_tc_swap_ticks;
+static Uint32   s_tc_last_ms;
+#define TC(i) ((void)s_tc[(i)]++)
+static void tc_report(void) {
+    if (!runtime_upload_diag_enabled()) return;
+    Uint32 now = SDL_GetTicks();
+    if (!s_tc_last_ms) { s_tc_last_ms = now; return; }
+    Uint32 dt = now - s_tc_last_ms;
+    if (dt < 2000) return;
+    double sec = dt / 1000.0, f = (double)SDL_GetPerformanceFrequency();
+    fprintf(stdout, "psxrecomp: gl passes/s: hr_bind=%.0f hr_end=%.0f pack=%.0f stencil_rebuild=%.0f "
+            "upload_flush=%.0f blit=%.0f present=%.0f | swap=%.1f ms/s (scale %dx)\n",
+            s_tc[TC_HR_BIND] / sec, s_tc[TC_HR_END] / sec, s_tc[TC_PACK] / sec,
+            s_tc[TC_STENCIL] / sec, s_tc[TC_UPLOAD] / sec, s_tc[TC_BLIT] / sec,
+            s_tc[TC_PRESENT] / sec, (double)s_tc_swap_ticks * 1000.0 / f / sec, s_scale);
+    for (int i = 0; i < TC_N; i++) s_tc[i] = 0;
+    s_tc_swap_ticks = 0;
+    s_tc_last_ms = now;
 }
 
 void gl_renderer_runtime_diag(uint64_t out[6]) {
@@ -754,7 +809,7 @@ static void hold_capture_native_fbo(GLuint src_fbo, int dx, int dy, int dw, int 
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, src_fbo);
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_hold_fbo);
     glDisable(GL_SCISSOR_TEST);
-    p_glBlitFramebuffer(dx * S, dy * S, (dx + dw) * S, (dy + dh) * S,
+    (TC(TC_BLIT), p_glBlitFramebuffer)(dx * S, dy * S, (dx + dw) * S, (dy + dh) * S,
                         0, 0, dw * S, dh * S,
                         GL_COLOR_BUFFER_BIT, GL_NEAREST);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
@@ -1229,7 +1284,61 @@ static const char *STENCIL_FS =
     "void main(){ vec4 c=texelFetch(u_src,ivec2(gl_FragCoord.xy),0);\n"
     "  if(c.a<0.5) discard; frag=vec4(0.0); }\n";
 
+/* Copy of s with every `from` replaced by `to` (malloc'd). */
+static char *psxgl_replace_all(const char *s, const char *from, const char *to) {
+    size_t fl = strlen(from), tl = strlen(to), n = 0;
+    for (const char *p = strstr(s, from); p; p = strstr(p + fl, from)) n++;
+    char *out = (char *)malloc(strlen(s) + n * (tl > fl ? tl - fl : 0) + 1);
+    if (!out) return NULL;
+    char *o = out;
+    for (;;) {
+        const char *p = strstr(s, from);
+        if (!p) { strcpy(o, s); break; }
+        memcpy(o, s, (size_t)(p - s)); o += p - s;
+        memcpy(o, to, tl); o += tl;
+        s = p + fl;
+    }
+    return out;
+}
+
+/* OpenGL ES 3.0: the shaders are desktop GLSL 3.30. Rewrite the few desktop-only
+ * parts: the version line (plus default precisions ES requires); "noperspective"
+ * (no such qualifier in ES; PS1 vertices are 2D with w = 1, so ordinary
+ * interpolation is identical); and the dual-source second output, which ES 3.0
+ * cannot declare (s_dual_src_ok = 0 keeps it unused). Returns malloc'd source. */
+static char *psxgl_gles_source(const char *src) {
+    static const char *hdr =
+        "#version 300 es\n"
+        "precision highp float;\nprecision highp int;\n"
+        "precision highp sampler2D;\nprecision highp usampler2D;\nprecision highp isampler2D;\n";
+    const char *body = src;
+    if (strncmp(body, "#version 330", 12) == 0) {
+        body = strchr(body, '\n');
+        body = body ? body + 1 : "";
+    }
+    char *a = psxgl_replace_all(body, "noperspective ", "");
+    if (!a) return NULL;
+    char *b = psxgl_replace_all(a, "out vec4 frag; out vec4 blend_factor;",
+                                "layout(location=0) out vec4 frag; vec4 blend_factor;");
+    free(a);
+    if (!b) return NULL;
+    char *out = (char *)malloc(strlen(hdr) + strlen(b) + 1);
+    if (out) { strcpy(out, hdr); strcat(out, b); }
+    free(b);
+    return out;
+}
+
+static GLuint compile_shader_raw(GLenum type, const char *src);
 static GLuint compile_shader(GLenum type, const char *src) {
+    if (!s_gles) return compile_shader_raw(type, src);
+    char *es = psxgl_gles_source(src);
+    if (!es) return 0;
+    GLuint s = compile_shader_raw(type, es);
+    free(es);
+    return s;
+}
+
+static GLuint compile_shader_raw(GLenum type, const char *src) {
     GLuint s = p_glCreateShader(type);
     p_glShaderSource(s, 1, &src, NULL);
     p_glCompileShader(s);
@@ -1244,7 +1353,7 @@ static GLuint build_program_ex(const char *vs, const char *fs, int dual_source) 
     if (!v || !f) return 0;
     GLuint p = p_glCreateProgram();
     p_glAttachShader(p, v); p_glAttachShader(p, f);
-    if (dual_source) {
+    if (dual_source && s_dual_src_ok) {
         p_glBindFragDataLocationIndexed(p, 0, 0, "frag");
         p_glBindFragDataLocationIndexed(p, 0, 1, "blend_factor");
     }
@@ -1318,6 +1427,7 @@ static void apply_psx_blend(int mode) {
 
 /* ---- hr FBO render-state bracket ---------------------------------------- */
 static void hr_begin(int clip_to_draw_area) {
+    TC(TC_HR_BIND);
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);
     glViewport(0, 0, VRAM_W * s_scale, VRAM_H * s_scale);
     glEnable(GL_SCISSOR_TEST);
@@ -1328,7 +1438,18 @@ static void hr_begin(int clip_to_draw_area) {
                   sw * s_scale, sh * s_scale);
     }
 }
+/* hr_end used to bind the default framebuffer after every batch. A tile-based
+ * GPU (every phone) ends its render pass on that switch and stores/reloads the
+ * whole hr surface (VRAM at internal scale: 32 MB at 4x) when drawing resumes;
+ * Tomba 2 gameplay did that ~4,500 times a second. Now the hr FBO stays bound
+ * until something else binds its own target. Code that draws to the window
+ * calls hr_release() first; every other path binds its framebuffer itself. */
+static void hr_release(void) {
+    if (s_ctx && p_glBindFramebuffer) p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+}
+
 static void hr_end(void) {
+    TC(TC_HR_END);
     glDisable(GL_BLEND);
     /* apply_psx_blend mode 2 leaves REVERSE_SUBTRACT armed; reset so later
      * host draws (OSD) that re-enable blend do not inherit B-F math. */
@@ -1338,14 +1459,19 @@ static void hr_end(void) {
     glDisable(GL_SCISSOR_TEST);
     p_glBindVertexArray(0);
     p_glUseProgram(0);
-    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+    /* hr FBO stays bound (see hr_release). */
 }
 
 /* ---- coherency: CPU -> GPU upload flush --------------------------------- */
 /* CPU-side VRAM writes (GP0 A0 transfers, DMA, single pixel pokes) land in
  * the CPU array immediately and accumulate s_up_rects. Flushing before the
  * next GPU op (or readback/present) preserves PS1 command order. */
+static void flush_cpu_upload_impl(void);
 static void flush_cpu_upload(void) {
+    if (s_up_nrects) TC(TC_UPLOAD);
+    flush_cpu_upload_impl();
+}
+static void flush_cpu_upload_impl(void) {
     if (!s_raster_ok || s_up_nrects == 0) return;
     const int diag = runtime_upload_diag_enabled();
     if (diag) { s_rt_up_diag[0]++; s_rt_up_diag[1] += (uint64_t)s_up_nrects; }
@@ -1428,9 +1554,10 @@ static void flush_cpu_upload(void) {
  * Sampling an attached render target is undefined, so copy color to the shared
  * scratch texture first. Wide targets never exceed the 1024-pixel VRAM width. */
 static void rebuild_target_stencil(GLuint target_fbo, int target_w, int target_h) {
+    TC(TC_STENCIL);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, target_fbo);
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_scratch_fbo);
-    p_glBlitFramebuffer(0, 0, target_w, target_h, 0, 0, target_w, target_h,
+    (TC(TC_BLIT), p_glBlitFramebuffer)(0, 0, target_w, target_h, 0, 0, target_w, target_h,
                         GL_COLOR_BUFFER_BIT, GL_NEAREST);
 
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, target_fbo);
@@ -1476,6 +1603,7 @@ static void pack_flush(void) {
     int h = s_pack_dirty.y1 - s_pack_dirty.y0 + 1;
     rect_clear(&s_pack_dirty);
     coh_record(GL_COH_PACK, x, y, x + w - 1, y + h - 1);
+    TC(TC_PACK);
 
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_raw_fbo);
     glViewport(0, 0, VRAM_W, VRAM_H);
@@ -1766,7 +1894,7 @@ static void tex_batch_draw_passes(int nverts, int semi) {
              * until a later GP0(E6h) actually enables destination masking. */
             s_stencil_valid = 0;
         }
-    } else if (!s_mask_check && semi == 4) {
+    } else if (!s_mask_check && semi == 4 && s_dual_src_ok) {
         /* Modes 0/1/3 can select opaque-vs-semi behavior per fragment with
          * dual-source factors, so the whole painter-ordered batch is one draw.
          * Mode 2 needs a different blend equation and stays on the conservative
@@ -2258,7 +2386,7 @@ static void gpu_copy_rect(int sx,int sy,int dx,int dy,int w,int h) {
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_scratch_fbo);
     glDisable(GL_SCISSOR_TEST);
-    p_glBlitFramebuffer(sx*S, sy*S, (sx+w)*S, (sy+h)*S,
+    (TC(TC_BLIT), p_glBlitFramebuffer)(sx*S, sy*S, (sx+w)*S, (sy+h)*S,
                         sx*S, sy*S, (sx+w)*S, (sy+h)*S,
                         GL_COLOR_BUFFER_BIT, GL_NEAREST);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
@@ -2607,10 +2735,11 @@ static void upload_present_tex(const uint32_t *pixels, int w, int h, int linear)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     if (w != s_present_w || h != s_present_h) {
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_BGRA, GL_UNSIGNED_BYTE, pixels);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, PSXGL_BGRA_FMT, GL_UNSIGNED_BYTE, pixels);
         s_present_w = w; s_present_h = h;
+        psxgl_bgra_swizzle();
     } else {
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_BGRA, GL_UNSIGNED_BYTE, pixels);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, PSXGL_BGRA_FMT, GL_UNSIGNED_BYTE, pixels);
     }
 }
 
@@ -2941,6 +3070,13 @@ int gl_renderer_init_context(SDL_Window *win) {
     glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE);
     const char *ver = (const char *)glGetString(GL_VERSION);
     fprintf(stdout, "psxrecomp: OpenGL context created (%s)\n", ver ? ver : "?");
+    s_gles = ver && strncmp(ver, "OpenGL ES", 9) == 0;
+    if (s_gles) {
+        const char *rnd = (const char *)glGetString(GL_RENDERER);
+        const char *ext = (const char *)glGetString(GL_EXTENSIONS);
+        fprintf(stdout, "psxrecomp: GLES renderer: %s\n", rnd ? rnd : "?");
+        fprintf(stdout, "psxrecomp: GLES extensions: %.3000s\n", ext ? ext : "?");
+    }
 
     /* All-or-nothing: any missing entry point / failed shader / bad FBO means
      * the whole GL renderer is unavailable and the runtime stays on the pure
@@ -3048,6 +3184,7 @@ void gl_renderer_shutdown(void) {
  * widescreen presents them pillarboxed instead of distorted. */
 void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linear,
                          int force_4_3, int content_w) {
+    hr_release();   /* window target (tile-GPU pass fix) */
     if (!s_ctx) return;
     interp_reset_history();
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
@@ -3102,6 +3239,7 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
      * costs 10% of it, which reads as blur. Still a taste call, hence the knob. */
     int filt_mode = linear ? fmv_filter_mode()
                            : -1;          /* AA off: nearest, no shader work */
+    hr_release();   /* draw to the window, whatever bound the hr FBO on the way */
     glViewport(lx, ly, lw, lh);
     p_glActiveTexture(PSXGL_TEXTURE0);
     upload_present_tex(pixels, src_w, src_h, filt_mode >= 0 ? 1 : 0);
@@ -3139,6 +3277,7 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
 }
 
 void gl_renderer_present_blank(void) {
+    hr_release();   /* window target (tile-GPU pass fix) */
     if (!s_ctx) return;
     interp_reset_history();
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
@@ -3519,7 +3658,7 @@ static int glb_render_wide_display(uint32_t *out, int pitch, int base_x,
     if (!tmp) return 0;
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, fbo);
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
-    glReadPixels(0, ry0, W, out_h, GL_BGRA, GL_UNSIGNED_BYTE, tmp);
+    psxgl_read_bgra(0, ry0, W, out_h, tmp);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
 
     /* Orientation: the wide FBO stores PS1 y inverted (geo shader maps vram_y=0
@@ -3563,7 +3702,7 @@ static int glb_wide_dump_full(uint32_t *out, int cap_pixels, int *ow, int *oh,
     if (!tmp) return 0;
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, fbo);
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
-    glReadPixels(0, 0, W, H, GL_BGRA, GL_UNSIGNED_BYTE, tmp);
+    psxgl_read_bgra(0, 0, W, H, tmp);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
     /* Same orientation reasoning as glb_render_wide_display: glReadPixels row 0 =
      * PS1 top scanline, so copy straight (top-down). */
@@ -3947,6 +4086,7 @@ static void interp_draw_quad(float alpha, int lx, int ly, int lw, int lh) {
 }
 
 static int interp_present(float alpha) {
+    hr_release();   /* window target (tile-GPU pass fix) */
     if (!s_ctx || !s_interp_enabled || s_interp_suspended || s_interp_valid < 1)
         return 0;
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
@@ -4041,12 +4181,13 @@ static void gl_draw_osd_image(const uint32_t *px, int ow, int oh,
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     if (s_osd_tw != ow || s_osd_th != oh) {
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, ow, oh, 0,
-                     GL_BGRA, GL_UNSIGNED_BYTE, px);
+                     PSXGL_BGRA_FMT, GL_UNSIGNED_BYTE, px);
+        psxgl_bgra_swizzle();
         s_osd_tw = ow;
         s_osd_th = oh;
     } else {
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, ow, oh,
-                        GL_BGRA, GL_UNSIGNED_BYTE, px);
+                        PSXGL_BGRA_FMT, GL_UNSIGNED_BYTE, px);
     }
     if (vx + dw > ww) dw = ww - vx;
     if (vy + dh > wh) dh = wh - vy;
@@ -4080,6 +4221,7 @@ static void gl_draw_osd_image(const uint32_t *px, int ow, int oh,
 
 /* Composite host toast + volume bar into the default framebuffer, then swap. */
 static void gl_swap_with_osd(void) {
+    hr_release();   /* window target (tile-GPU pass fix) */
     if (s_present_prog && s_ctx) {
         int ww = 0, wh = 0;
         SDL_GL_GetDrawableSize(s_win, &ww, &wh);
@@ -4151,7 +4293,11 @@ static void gl_swap_with_osd(void) {
             present_shot_done(wrote);
         }
     }
+    TC(TC_PRESENT);
+    Uint64 tc_t0 = SDL_GetPerformanceCounter();
     SDL_GL_SwapWindow(s_win);
+    s_tc_swap_ticks += SDL_GetPerformanceCounter() - tc_t0;
+    tc_report();
 }
 
 static void present_target_quad(GLuint tex, int tex_w, int tex_h,
@@ -4247,6 +4393,7 @@ static void present_bezel(int ww, int wh, int lx, int ly, int lw, int lh) {
 }
 
 int gl_renderer_present_hold_last(void) {
+    hr_release();   /* window target (tile-GPU pass fix) */
     int ww = 0, wh = 0;
     int lx, ly, lw, lh;
     if (!s_ctx || !s_win || s_hold_kind == HOLD_NONE || !s_hold_tex)
@@ -4306,6 +4453,7 @@ int gl_renderer_present_hold_last(void) {
 
 void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
                               int force_4_3) {
+    hr_release();   /* window target (tile-GPU pass fix) */
     if (!s_ctx || !s_raster_ok) return;
     flush_flat_batch();
     flush_tex_batch();
@@ -4395,7 +4543,7 @@ static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, wide_fbo);
     glDisable(GL_SCISSOR_TEST);
-    p_glBlitFramebuffer(base_x * S, 0,
+    (TC(TC_BLIT), p_glBlitFramebuffer)(base_x * S, 0,
                         (base_x + native_w) * S, VRAM_H * S,
                         g_wide_off * S, 0,
                         (g_wide_off + native_w) * S, VRAM_H * S,
@@ -4411,6 +4559,7 @@ static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h
  * bottom-origin → window top). Returns 0 if there's no wide surface for base_x
  * (caller falls back). disp_x is the displayed buffer base (the wide-surface key). */
 int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear) {
+    hr_release();   /* window target (tile-GPU pass fix) */
     if (!s_ctx || !s_raster_ok || g_wide_w <= 0) return 0;
     GLuint fbo = 0, tex = 0;
     for (int i = 0; i < WIDE_MAX_SURF; i++)
