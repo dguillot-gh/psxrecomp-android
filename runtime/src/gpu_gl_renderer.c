@@ -1438,6 +1438,16 @@ static void hr_begin(int clip_to_draw_area) {
                   sw * s_scale, sh * s_scale);
     }
 }
+/* hr_end used to bind the default framebuffer after every batch. A tile-based
+ * GPU (every phone) ends its render pass on that switch and stores/reloads the
+ * whole hr surface (VRAM at internal scale: 32 MB at 4x) when drawing resumes;
+ * Tomba 2 gameplay did that ~4,500 times a second. Now the hr FBO stays bound
+ * until something else binds its own target. Code that draws to the window
+ * calls hr_release() first; every other path binds its framebuffer itself. */
+static void hr_release(void) {
+    if (s_ctx && p_glBindFramebuffer) p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+}
+
 static void hr_end(void) {
     TC(TC_HR_END);
     glDisable(GL_BLEND);
@@ -1449,7 +1459,7 @@ static void hr_end(void) {
     glDisable(GL_SCISSOR_TEST);
     p_glBindVertexArray(0);
     p_glUseProgram(0);
-    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+    /* hr FBO stays bound (see hr_release). */
 }
 
 /* ---- coherency: CPU -> GPU upload flush --------------------------------- */
@@ -3174,6 +3184,7 @@ void gl_renderer_shutdown(void) {
  * widescreen presents them pillarboxed instead of distorted. */
 void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linear,
                          int force_4_3, int content_w) {
+    hr_release();   /* window target (tile-GPU pass fix) */
     if (!s_ctx) return;
     interp_reset_history();
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
@@ -3228,6 +3239,7 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
      * costs 10% of it, which reads as blur. Still a taste call, hence the knob. */
     int filt_mode = linear ? fmv_filter_mode()
                            : -1;          /* AA off: nearest, no shader work */
+    hr_release();   /* draw to the window, whatever bound the hr FBO on the way */
     glViewport(lx, ly, lw, lh);
     p_glActiveTexture(PSXGL_TEXTURE0);
     upload_present_tex(pixels, src_w, src_h, filt_mode >= 0 ? 1 : 0);
@@ -3265,6 +3277,7 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
 }
 
 void gl_renderer_present_blank(void) {
+    hr_release();   /* window target (tile-GPU pass fix) */
     if (!s_ctx) return;
     interp_reset_history();
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
@@ -4073,6 +4086,7 @@ static void interp_draw_quad(float alpha, int lx, int ly, int lw, int lh) {
 }
 
 static int interp_present(float alpha) {
+    hr_release();   /* window target (tile-GPU pass fix) */
     if (!s_ctx || !s_interp_enabled || s_interp_suspended || s_interp_valid < 1)
         return 0;
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
@@ -4207,6 +4221,7 @@ static void gl_draw_osd_image(const uint32_t *px, int ow, int oh,
 
 /* Composite host toast + volume bar into the default framebuffer, then swap. */
 static void gl_swap_with_osd(void) {
+    hr_release();   /* window target (tile-GPU pass fix) */
     if (s_present_prog && s_ctx) {
         int ww = 0, wh = 0;
         SDL_GL_GetDrawableSize(s_win, &ww, &wh);
@@ -4378,6 +4393,7 @@ static void present_bezel(int ww, int wh, int lx, int ly, int lw, int lh) {
 }
 
 int gl_renderer_present_hold_last(void) {
+    hr_release();   /* window target (tile-GPU pass fix) */
     int ww = 0, wh = 0;
     int lx, ly, lw, lh;
     if (!s_ctx || !s_win || s_hold_kind == HOLD_NONE || !s_hold_tex)
@@ -4437,6 +4453,7 @@ int gl_renderer_present_hold_last(void) {
 
 void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
                               int force_4_3) {
+    hr_release();   /* window target (tile-GPU pass fix) */
     if (!s_ctx || !s_raster_ok) return;
     flush_flat_batch();
     flush_tex_batch();
@@ -4542,6 +4559,7 @@ static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h
  * bottom-origin → window top). Returns 0 if there's no wide surface for base_x
  * (caller falls back). disp_x is the displayed buffer base (the wide-surface key). */
 int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear) {
+    hr_release();   /* window target (tile-GPU pass fix) */
     if (!s_ctx || !s_raster_ok || g_wide_w <= 0) return 0;
     GLuint fbo = 0, tex = 0;
     for (int i = 0; i < WIDE_MAX_SURF; i++)
