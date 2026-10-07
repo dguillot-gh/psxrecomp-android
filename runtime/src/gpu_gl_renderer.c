@@ -150,6 +150,11 @@
 #define PSXGL_TEXTURE_SWIZZLE_B     0x8E44
 #define PSXGL_RED                   0x1903
 #define PSXGL_BLUE                  0x1905
+/* OpenGL ES has no glGetTexImage. Its only users are developer dump tools
+ * (stereo pairs, pass generations), which write nothing on Android. */
+#if defined(__ANDROID__)
+#define glGetTexImage(target, level, format, type, pixels) ((void)(pixels))
+#endif
 static int s_gles = 0;          /* context is OpenGL ES (set at context creation) */
 static int s_dual_src_ok = 1;   /* dual-source blending usable (desktop GL 3.3) */
 #define PSXGL_BGRA_FMT (s_gles ? GL_RGBA : GL_BGRA)
@@ -738,7 +743,7 @@ static void tc_report(void) {
             "upload_flush=%.0f blit=%.0f present=%.0f | swap=%.1f ms/s (scale %dx)\n",
             s_tc[TC_HR_BIND] / sec, s_tc[TC_HR_END] / sec, s_tc[TC_PACK] / sec,
             s_tc[TC_STENCIL] / sec, s_tc[TC_UPLOAD] / sec, s_tc[TC_BLIT] / sec,
-            s_tc[TC_PRESENT] / sec, (double)s_tc_swap_ticks * 1000.0 / f / sec, s_scale);
+            s_tc[TC_PRESENT] / sec, (double)s_tc_swap_ticks * 1000.0 / f / sec, s_hr_scale);
     for (int i = 0; i < TC_N; i++) s_tc[i] = 0;
     s_tc_swap_ticks = 0;
     s_tc_last_ms = now;

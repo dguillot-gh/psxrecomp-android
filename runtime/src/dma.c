@@ -829,6 +829,10 @@ static DMAGpuHoldStats s_hold_stats;
 static uint64_t hold_host_ticks(void) {
 #ifdef _WIN32
     LARGE_INTEGER c; QueryPerformanceCounter(&c); return (uint64_t)c.QuadPart;
+#elif defined(__ANDROID__)
+    /* Bionic has timespec_get only from API 29; diagnostics only. */
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 #else
     struct timespec ts; timespec_get(&ts, TIME_UTC);   /* C11; diagnostics only */
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
