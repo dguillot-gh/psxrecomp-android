@@ -138,6 +138,9 @@ extern "C" void psx_game_codegen_forward_if_built(int argc, char** argv);
 #endif
 #include "psx_sdl.h"
 #include "window_fullscreen.h"
+#if defined(__ANDROID__) && defined(PSX_SDL3)
+#include <SDL3/SDL_system.h>
+#endif
 #if defined(PSX_SDL3)
 /*
  * SDL_main.h is a single-header implementation in SDL3. Keep it in the one
@@ -160,6 +163,9 @@ extern "C" void psx_game_codegen_forward_if_built(int argc, char** argv);
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#if defined(__ANDROID__)
+#include <jni.h>
+#endif
 #include <exception>
 #include <array>
 #include <filesystem>
@@ -169,6 +175,361 @@ extern "C" void psx_game_codegen_forward_if_built(int argc, char** argv);
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+/* game.toml [controller] mouse: port 1 holds the Sony Mouse, not a pad. */
+static bool g_port1_mouse = false;
+
+#if defined(__ANDROID__)
+#include <android/log.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+
+/* Read end of the stdout/stderr -> logcat pipe (see below). */
+static int s_stdio_route_read_fd = -1;
+
+/* Fail-fast paths end in exit(1) right after printing their reason; without
+ * this, the process dies before the logcat thread forwards that last line.
+ * Runs last among atexit handlers (registered first): flush, then give the
+ * reader a bounded moment to drain the pipe. */
+static void android_drain_stdio_at_exit(void) {
+    std::fflush(stdout);
+    std::fflush(stderr);
+    for (int i = 0; i < 50; i++) {
+        int pending = 0;
+        if (ioctl(s_stdio_route_read_fd, FIONREAD, &pending) != 0 || pending == 0) break;
+        usleep(4000);
+    }
+    usleep(20000);  /* let the reader finish logging the line it just read */
+}
+
+/* Android discards a native app's stdout/stderr, which silently hides the
+ * runtime's existing status lines (e.g. "text image guard NOT armed"). Route
+ * both streams into logcat under tag "psxrecomp" (`adb logcat -s psxrecomp`).
+ * This adds no output of its own; it only makes the existing lines visible. */
+static void android_route_stdio_to_logcat(void) {
+    static int s_pipe[2] = {-1, -1};
+    if (s_pipe[0] >= 0 || pipe(s_pipe) != 0) return;
+    dup2(s_pipe[1], STDOUT_FILENO);
+    dup2(s_pipe[1], STDERR_FILENO);
+    s_stdio_route_read_fd = s_pipe[0];
+    std::atexit(android_drain_stdio_at_exit);
+    std::thread([] {
+        char buf[1024];
+        size_t len = 0;
+        for (;;) {
+            ssize_t n = read(s_pipe[0], buf + len, sizeof(buf) - 1 - len);
+            if (n <= 0) break;
+            len += (size_t)n;
+            size_t start = 0;
+            for (size_t i = 0; i < len; i++) {
+                if (buf[i] != '\n') continue;
+                buf[i] = '\0';
+                __android_log_write(ANDROID_LOG_INFO, "psxrecomp", buf + start);
+                start = i + 1;
+            }
+            if (start == 0 && len == sizeof(buf) - 1) {
+                /* Line longer than the buffer: emit what we have. */
+                buf[len] = '\0';
+                __android_log_write(ANDROID_LOG_INFO, "psxrecomp", buf);
+                len = 0;
+            } else if (start > 0) {
+                std::memmove(buf, buf + start, len - start);
+                len -= start;
+            }
+        }
+    }).detach();
+}
+
+static constexpr Sint32 kAndroidTouchMouseButtonEvent = 0x504D;
+static constexpr Sint32 kAndroidTouchMouseMotionEvent = 0x504E;
+static std::atomic<uint16_t> g_android_virtual_pad_buttons{0xFFFFu};
+/* Touch sticks: lx | ly<<8 | rx<<16 | ry<<24, all centred at rest. */
+static std::atomic<uint32_t> g_android_virtual_sticks{0x80808080u};
+
+/* Touch-trackpad motion from the Java overlay (UI thread). Marshalled onto the
+ * emulator thread as an SDL user event, like nativeMouseButton below. */
+extern "C" JNIEXPORT void JNICALL
+Java_com_policenauts_recomp_PolicenautsActivity_nativeMouseMotion(
+    JNIEnv *, jclass, jint dx, jint dy)
+{
+    SDL_Event event{};
+    event.type = SDL_EVENT_USER;
+    event.user.code = kAndroidTouchMouseMotionEvent;
+    event.user.data1 = reinterpret_cast<void *>((intptr_t)dx);
+    event.user.data2 = reinterpret_cast<void *>((intptr_t)dy);
+    (void)SDL_PushEvent(&event);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_policenauts_recomp_PolicenautsActivity_nativeMouseButton(
+    JNIEnv *, jclass, jint button, jboolean down)
+{
+    SDL_Event event{};
+    event.type = SDL_EVENT_USER;
+    event.user.code = kAndroidTouchMouseButtonEvent;
+    const intptr_t payload = ((intptr_t)(button & 1) << 1) | (down ? 1 : 0);
+    event.user.data1 = reinterpret_cast<void *>(payload);
+    (void)SDL_PushEvent(&event);
+}
+
+/* The same two calls from the shared pad (PadOverlay's trackpad mode, used when
+ * game.toml [controller] mouse = true), for games on the shared Android layer. */
+extern "C" JNIEXPORT void JNICALL
+Java_com_psxrecomp_android_PsxInput_nativeMouseMotion(JNIEnv *env, jclass cls, jint dx, jint dy)
+{
+    Java_com_policenauts_recomp_PolicenautsActivity_nativeMouseMotion(env, cls, dx, dy);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_psxrecomp_android_PsxInput_nativeMouseButton(JNIEnv *env, jclass cls, jint button, jboolean down)
+{
+    Java_com_policenauts_recomp_PolicenautsActivity_nativeMouseButton(env, cls, button, down);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_policenauts_recomp_PolicenautsActivity_nativePadDirection(
+    JNIEnv *, jclass, jint direction, jboolean down)
+{
+    static constexpr uint16_t buttons[] = { 1u << 4, 1u << 6, 1u << 7, 1u << 5 };
+    if (direction < 0 || direction >= (jint)(sizeof(buttons) / sizeof(buttons[0])))
+        return;
+    if (down) g_android_virtual_pad_buttons.fetch_and((uint16_t)~buttons[direction]);
+    else g_android_virtual_pad_buttons.fetch_or(buttons[direction]);
+}
+
+/* Shared on-screen PS1 pad (psxrecomp/runtime/android, class
+ * com.psxrecomp.android.PsxInput), used by every game's Android app.
+ * nativeSetButtons takes the full set of held buttons as PSX pad bits
+ * (1 = held; Select 0x0001 ... Square 0x8000, as on the SIO wire) and is
+ * stored active-low, ANDed into port 1 with any physical controller. */
+extern "C" JNIEXPORT void JNICALL
+Java_com_psxrecomp_android_PsxInput_nativeSetButtons(JNIEnv *, jclass, jint held)
+{
+    g_android_virtual_pad_buttons.store((uint16_t)~(uint32_t)held);
+}
+
+/* stick 0 = left, 1 = right; x/y are PSX analog bytes (0..255, 0x80 centre). */
+extern "C" JNIEXPORT void JNICALL
+Java_com_psxrecomp_android_PsxInput_nativeSetStick(JNIEnv *, jclass, jint stick,
+                                                   jint x, jint y)
+{
+    if (stick < 0 || stick > 1) return;
+    const uint32_t pair = (uint32_t)(x & 0xFF) | ((uint32_t)(y & 0xFF) << 8);
+    const int shift = stick * 16;
+    uint32_t cur = g_android_virtual_sticks.load();
+    uint32_t next;
+    do {
+        next = (cur & ~(0xFFFFu << shift)) | (pair << shift);
+    } while (!g_android_virtual_sticks.compare_exchange_weak(cur, next));
+}
+
+/* Multi-disc change from the on-screen pad's menu ("Change disc").
+ * g_disc_swap_paths is the game's disc roster resolved to mountable paths,
+ * filled once at boot on the emulator thread (main, next to cdrom_init) and
+ * only read there afterwards. The UI thread never touches the drive: it posts
+ * a 1-based disc number in g_android_disc_swap_request, and
+ * android_apply_disc_swap() performs the change between frames
+ * (cdrom_swap_disc: tray open, new image, tray close). */
+static std::vector<std::string> g_disc_swap_paths;
+static std::atomic<int> g_android_disc_count{0};
+static std::atomic<int> g_android_disc_current{0};
+static std::atomic<int> g_android_disc_swap_request{0};
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_psxrecomp_android_PsxInput_nativeDiscCount(JNIEnv *, jclass)
+{
+    return g_android_disc_count.load();
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_psxrecomp_android_PsxInput_nativeCurrentDisc(JNIEnv *, jclass)
+{
+    return g_android_disc_current.load();
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_psxrecomp_android_PsxInput_nativeRequestDiscSwap(JNIEnv *, jclass, jint disc)
+{
+    if (disc >= 1 && disc <= g_android_disc_count.load())
+        g_android_disc_swap_request.store(disc);
+}
+
+static void android_apply_disc_swap(void)
+{
+    const int want = g_android_disc_swap_request.exchange(0);
+    if (want < 1 || want > (int)g_disc_swap_paths.size()) return;
+    if (want == g_android_disc_current.load()) return;
+    if (!cdrom_swap_disc(g_disc_swap_paths[(size_t)want - 1].c_str())) {
+        host_osd_push(("Disc " + std::to_string(want) + " could not be opened").c_str(), 3000);
+        return;
+    }
+    g_android_disc_current.store(want);
+    /* Savestates belong to the disc they were taken on (see the boot-time call). */
+    savestate_set_disc_scope(want);
+    host_osd_push(("Disc " + std::to_string(want) + " inserted").c_str(), 2500);
+}
+
+/* Save states from the on-screen pad's menu ("Save state" / "Load state").
+ * The runtime's own slots (savestate.c: SAVESTATE_SLOTS, per-disc scope, the
+ * integrity check on load, "Saved/Loaded slot N" toast). The UI thread only
+ * posts a request -- (slot + 1) * 2 + (1 = load) -- and the emulator thread
+ * stages it between frames with savestate_request_save/load, which run it at
+ * the next safe block boundary (savestate_poll). Slots are 0-based here. */
+static std::atomic<int> g_android_state_request{0};
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_psxrecomp_android_PsxInput_nativeStateSlots(JNIEnv *, jclass)
+{
+    return SAVESTATE_SLOTS;
+}
+
+/* Seconds since the epoch the slot was written, or 0 when it is empty. */
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_psxrecomp_android_PsxInput_nativeStateSlotTime(JNIEnv *, jclass, jint slot)
+{
+    if (slot < 0 || slot >= SAVESTATE_SLOTS || !savestate_slot_exists(slot)) return 0;
+    int64_t t = 0;
+    return savestate_slot_mtime(slot, &t) ? (jlong)t : 1;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_psxrecomp_android_PsxInput_nativeRequestState(JNIEnv *, jclass, jint slot, jboolean load)
+{
+    if (slot < 0 || slot >= SAVESTATE_SLOTS) return;
+    g_android_state_request.store((slot + 1) * 2 + (load ? 1 : 0));
+}
+
+static void android_apply_state_request(void)
+{
+    const int req = g_android_state_request.exchange(0);
+    if (req < 2) return;
+    const int slot = req / 2 - 1;
+    const bool load = (req & 1) != 0;
+    const int staged = load ? savestate_request_load(slot) : savestate_request_save(slot);
+    if (!staged)
+        host_osd_push(load ? "Load state not available" : "Save state not available", 2500);
+}
+
+/* Android Dynamic Performance Framework hint for the emulator thread. Without
+ * it the governor parks this single busy thread well below the core's max
+ * clock (measured: 1.89 of 2.91 GHz on a Pixel 8 X3 core, thermals nominal)
+ * even while frames run late. Reporting each frame's duration against the
+ * NTSC target lets the system raise clocks exactly when the guest falls
+ * behind. Resolved through dlsym because minSdk predates API 33. */
+#include <dlfcn.h>
+#include <sched.h>
+#include <time.h>
+
+/* Keep the emulator thread on the highest-capacity cores. The guest runs on
+ * one host thread, and the scheduler kept migrating it to mid/little cores for
+ * seconds at a time (logged as 40 fps dips while the prime core sat at 500 MHz).
+ * Capacity comes from sysfs (cpu_capacity, else cpuinfo_max_freq), so this
+ * picks the prime cluster on any device. Only this thread is affected. */
+static void android_pin_to_fastest_cores(void) {
+    auto read_u32 = [](const char *path) -> uint32_t {
+        FILE *f = std::fopen(path, "r");
+        if (!f) return 0;
+        unsigned long v = 0;
+        if (std::fscanf(f, "%lu", &v) != 1) v = 0;
+        std::fclose(f);
+        return (uint32_t)v;
+    };
+    const int ncpu = (int)sysconf(_SC_NPROCESSORS_CONF);
+    if (ncpu <= 1 || ncpu > CPU_SETSIZE) return;
+    uint32_t cap[CPU_SETSIZE] = {};
+    uint32_t best = 0;
+    for (int c = 0; c < ncpu; c++) {
+        char path[96];
+        std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpu_capacity", c);
+        cap[c] = read_u32(path);
+        if (!cap[c]) {
+            std::snprintf(path, sizeof path,
+                          "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", c);
+            cap[c] = read_u32(path);
+        }
+        if (cap[c] > best) best = cap[c];
+    }
+    if (!best) return;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    char list[128] = {0};
+    size_t used = 0;
+    for (int c = 0; c < ncpu; c++) {
+        if (cap[c] != best) continue;
+        CPU_SET(c, &set);
+        used += (size_t)std::snprintf(list + used, sizeof list - used, "%s%d", used ? "," : "", c);
+        if (used >= sizeof list) break;
+    }
+    const int rc = sched_setaffinity(0, sizeof set, &set);
+    std::fprintf(stdout, "psxrecomp: emulator thread pinned to cpu %s (capacity %u): %s\n",
+                 list, best, rc == 0 ? "ok" : "failed");
+}
+
+static void android_perf_hint_frame(void) {
+    using GetManagerFn = void *(*)(void);
+    using CreateSessionFn = void *(*)(void *, const int32_t *, size_t, int64_t);
+    using ReportFn = int (*)(void *, int64_t);
+    static constexpr int64_t kTargetNs = 16683400;  /* one 59.94 Hz frame */
+    static bool s_tried = false;
+    static void *s_session = nullptr;
+    static ReportFn s_report = nullptr;
+    static int64_t s_last_ns = 0;
+
+    timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    const int64_t now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    if (!s_tried) {
+        s_tried = true;
+        android_pin_to_fastest_cores();  /* first call is on the emulator thread */
+        void *lib = dlopen("libandroid.so", RTLD_NOW);
+        auto get_manager = lib ? (GetManagerFn)dlsym(lib, "APerformanceHint_getManager") : nullptr;
+        auto create = lib ? (CreateSessionFn)dlsym(lib, "APerformanceHint_createSession") : nullptr;
+        s_report = lib ? (ReportFn)dlsym(lib, "APerformanceHint_reportActualWorkDuration") : nullptr;
+        void *manager = get_manager ? get_manager() : nullptr;
+        const int32_t tid = (int32_t)gettid();
+        if (manager && create && s_report) s_session = create(manager, &tid, 1, kTargetNs);
+        std::fprintf(stdout, "psxrecomp: Android performance hint session %s\n",
+                     s_session ? "active" : "unavailable");
+        s_last_ns = now;
+        return;
+    }
+    const int64_t frame_ns = now - s_last_ns;
+    s_last_ns = now;
+    /* Skip the first frame after a pause/resume rather than report it. */
+    if (s_session && frame_ns > 0 && frame_ns < 1000000000LL)
+        s_report(s_session, frame_ns);
+}
+
+/* When port 1 holds the Sony Mouse (sio_set_mouse_enabled), the game never
+ * reads pad direction bits, so the touch D-pad steers the mouse instead,
+ * key-repeat style: a press sends one firm step at once (menus ignore small
+ * per-frame motion, so a quick tap must still move one item), then pauses so a
+ * tap never double-steps, then streams accelerating motion while held for
+ * cursor travel. Called once per VBlank. */
+static void android_dpad_drive_mouse(void) {
+    static constexpr int kTapStep = 20;      /* mouse counts on press (12 was below
+                                              * the title menu's per-item threshold) */
+    static constexpr int kRepeatDelay = 15;  /* frames before streaming */
+    static int held_frames = 0;
+    static int last_dx = 0, last_dy = 0;
+    const uint16_t pad = g_android_virtual_pad_buttons.load();  /* active low */
+    const int up = !(pad & (1u << 4)), right = !(pad & (1u << 5));
+    const int down = !(pad & (1u << 6)), left = !(pad & (1u << 7));
+    const int dx = right - left, dy = down - up;
+    if (!dx && !dy) { held_frames = 0; last_dx = last_dy = 0; return; }
+    /* Sliding to a new direction counts as a fresh press. */
+    if (dx != last_dx || dy != last_dy) held_frames = 0;
+    last_dx = dx;
+    last_dy = dy;
+    held_frames++;
+    int speed;
+    if (held_frames == 1) speed = kTapStep;
+    else if (held_frames <= kRepeatDelay) speed = 0;
+    else if (held_frames <= kRepeatDelay + 30) speed = 3;
+    else speed = 6;
+    if (speed) sio_set_mouse_motion(dx * speed, dy * speed);
+}
+#endif
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -617,6 +978,40 @@ static void fps_telemetry_toggle(void) {
     s_fps_base_title.clear();
     host_osd_push(enabled ? "FPS readout on" : "FPS readout off", 1500);
 }
+
+#if defined(__ANDROID__)
+/* FPS counter from the on-screen pad's menu ("FPS"), remembered per game by the
+ * app. The UI thread posts 1 (off) or 2 (on); the emulator thread applies it
+ * between frames (android_apply_fps_request). The runtime only measures (the
+ * telemetry block in the vblank path stores game fps x100 in
+ * g_android_game_fps_x100); the pad overlay draws it as a movable control and
+ * polls nativeGameFps, so nothing is drawn into the game picture. */
+static std::atomic<int> g_android_fps_request{0};
+static std::atomic<int> g_android_game_fps_x100{0};
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_psxrecomp_android_PsxInput_nativeSetFpsCounter(JNIEnv *, jclass, jboolean on)
+{
+    g_android_fps_request.store(on ? 2 : 1);
+}
+
+/* Game frames per second over the last second; 0 = not measured yet / off. */
+extern "C" JNIEXPORT jfloat JNICALL
+Java_com_psxrecomp_android_PsxInput_nativeGameFps(JNIEnv *, jclass)
+{
+    return (jfloat)g_android_game_fps_x100.load() / 100.0f;
+}
+
+static void android_apply_fps_request(void)
+{
+    const int req = g_android_fps_request.exchange(0);
+    if (!req) return;
+    s_fps_telemetry_enabled = (req == 2) ? 1 : 0;
+    s_fps_last_time = 0;
+    s_fps_last_frame = 0;
+    g_android_game_fps_x100.store(0);
+}
+#endif
 
 /* Hold-to-act host hotkeys must not fire while the game window does not hold
  * keyboard focus.
@@ -2056,6 +2451,14 @@ static void update_adaptive_widescreen() {
  * runtime requirements immediately before every GL window, because launcher
  * teardown resets them and macOS otherwise supplies a legacy 2.1 context. */
 static void configure_core_gl_context_attributes() {
+#if defined(__ANDROID__)
+    /* Phones have OpenGL ES, not desktop GL: ES 3.0 has every feature the GL
+     * renderer needs (integer textures, texelFetch, FBO blits); the renderer
+     * rewrites its shaders for it (gpu_gl_renderer.c, s_gles). */
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+#else
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
     int major = 3, minor = 3;
 #if defined(PSX_OPENXR)
@@ -2084,6 +2487,7 @@ static void configure_core_gl_context_attributes() {
 #endif
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, major);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, minor);
+#endif
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
 }
@@ -2529,6 +2933,14 @@ static std::filesystem::path exe_dir_from_argv(const char* argv0) {
     namespace fs = std::filesystem;
     std::error_code ec;
     fs::path exe_dir;
+#if defined(__ANDROID__) && defined(PSX_SDL3)
+    /* Android's library directory and APK assets are read-only. Keep the
+     * config, imported game files, memory cards, and settings in app-private
+     * storage, where SDL's Activity already grants the process access. */
+    if (const char *storage = SDL_GetAndroidInternalStoragePath();
+        storage && storage[0])
+        return fs::path(storage);
+#endif
 #ifdef _WIN32
     // Authoritative: the real image path, regardless of how we were invoked.
     {
@@ -5110,7 +5522,15 @@ static int assert_sio_pad_profile(int s, bool dev_here) {
     const int mode = effective_player_mode_for_sio(p, s);
     const ModControllerPresentationPolicy& policy = g_mod_controller_policy[s];
     const int boot_mode = policy.callback ? policy.initial_mode : mode;
+    /* Android always exposes the on-screen pad as a connected P1 device,
+     * even before a direction is held. The touch overlay does not create
+     * an SDL joystick, so relying on p.kind here left its injected button
+     * bits unreachable from SIO. */
+#if defined(__ANDROID__)
+    sio_set_pad_connected(s, (p.kind != 0 || dev_here || s == 0) ? 1 : 0);
+#else
     sio_set_pad_connected(s, (p.kind != 0 || dev_here) ? 1 : 0);
+#endif
     /* DIGITAL mode == a plain digital controller that ignores the DualShock
      * config-mode commands (real SCPH-1080 behaviour); ANALOG or an
      * explicitly config-capable mod policy == a config-capable DualShock.
@@ -5263,11 +5683,15 @@ static void axes_to_pad_pair(int16_t vx, int16_t vy, uint8_t* obx, uint8_t* oby,
 /* Buttons for a player's selected device (0xFFFF = none pressed). `player` is
  * 1..5 — selects which keybinds.ini section drives a keyboard port. */
 static uint16_t pad_buttons_for(const PlayerInput& p, int player, bool suppress_stick_axes) {
-    if (p.kind == 1) return pad_from_keyboard(player);
-    if (p.kind == 2)
-        return controller_pad_buttons(controller_map_for(p), p.handle,
-                                      suppress_stick_axes, p.deadzone);
-    return 0xFFFF;
+    uint16_t buttons = 0xFFFF;
+    if (p.kind == 1) buttons = pad_from_keyboard(player);
+    else if (p.kind == 2)
+        buttons = controller_pad_buttons(controller_map_for(p), p.handle,
+                                         suppress_stick_axes, p.deadzone);
+#if defined(__ANDROID__)
+    if (player == 1) buttons &= g_android_virtual_pad_buttons.load();
+#endif
+    return buttons;
 }
 
 /* Analog stick bytes (lx,ly,rx,ry) for a player; centred if no live source.
@@ -5359,6 +5783,22 @@ static void pad_sticks_for(const PlayerInput& p, int player, uint8_t out[4]) {
                                  &out[2], &out[3]);
         }
     }
+#if defined(__ANDROID__)
+    /* On-screen touch sticks (PsxInput.nativeSetStick). A stick under a finger
+     * replaces that stick's bytes; a released one reads centred and leaves
+     * any physical controller in charge. */
+    if (player == 1) {
+        const uint32_t touch = g_android_virtual_sticks.load();
+        if ((touch & 0xFFFFu) != 0x8080u) {
+            out[0] = (uint8_t)touch;
+            out[1] = (uint8_t)(touch >> 8);
+        }
+        if ((touch >> 16) != 0x8080u) {
+            out[2] = (uint8_t)(touch >> 16);
+            out[3] = (uint8_t)(touch >> 24);
+        }
+    }
+#endif
 }
 
 /* Controller-policy facts exposed to trusted game-owned plugins. The runtime
@@ -5758,7 +6198,13 @@ static int capture_pad_slot(int s, PsxNetPad* out, bool guarded) {
     /* Opt-in dev merge: P1 is driven by the keyboard AND every connected
      * controller (PSX_DEV_INPUT=1). Default is strict per-slot routing. */
     const bool dev_here = (dev_any_input_enabled() && s == 0);
-    if (p.kind == 0 && !dev_here) return 0;  /* no device in this port */
+#if defined(__ANDROID__)
+    const bool android_virtual_pad = (s == 0);
+#else
+    const bool android_virtual_pad = false;
+#endif
+    if (p.kind == 0 && !dev_here && !android_virtual_pad)
+        return 0;  /* no device in this port */
 
     /* Resolve the pad type this frame FIRST — the effective analog/digital
      * state gates how the left stick is read for BOTH the button word and the
@@ -5777,8 +6223,7 @@ static int capture_pad_slot(int s, PsxNetPad* out, bool guarded) {
         g_mod_controller_policy[s].callback) {
         pad_sticks_for(p, player, st);
     }
-    const uint16_t policy_buttons =
-        src.device ? pad_buttons_for(p, player, true) : (uint16_t)0xFFFF;
+    const uint16_t policy_buttons = pad_buttons_for(p, player, true);
     const int effective_mode = controller_policy_resolve_mode(
         s, player, mode, src, p, policy_buttons, st);
     const int eff_analog =
@@ -5801,8 +6246,7 @@ static int capture_pad_slot(int s, PsxNetPad* out, bool guarded) {
      * D-pad control (Ape Escape's camera rotate) from being spun by stick
      * movement or centre drift. Digital mode keeps the stick->D-pad fold. */
     const bool suppress_stick = (eff_analog != 0);
-    uint16_t btn = src.device ? pad_buttons_for(p, player, suppress_stick)
-                              : (uint16_t)0xFFFF;
+    uint16_t btn = pad_buttons_for(p, player, suppress_stick);
     /* kind==1 already consumed the binds inside pad_buttons_for — ANDing the
      * same word twice is idempotent, so this stays a plain source check. */
     if (src.keybinds)
@@ -7203,6 +7647,41 @@ static void rewind_host_pause_loop(void) {
             } else if (ev.type == SDL_CONTROLLERDEVICEREMOVED) {
                 close_controller();
                 refresh_player_devices();
+#if defined(PSX_SDL3)
+            } else if (ev.type == SDL_EVENT_MOUSE_MOTION) {
+                sio_set_mouse_motion((int)ev.motion.xrel, (int)ev.motion.yrel);
+            } else if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
+                       ev.type == SDL_EVENT_MOUSE_BUTTON_UP) {
+                static int mouse_left = 0, mouse_right = 0;
+                const int down = ev.button.down ? 1 : 0;
+                if (ev.button.button == SDL_BUTTON_LEFT) mouse_left = down;
+                if (ev.button.button == SDL_BUTTON_RIGHT) mouse_right = down;
+                sio_set_mouse_buttons(mouse_left, mouse_right);
+#if defined(__ANDROID__)
+            } else if (ev.type == SDL_EVENT_USER &&
+                       ev.user.code == kAndroidTouchMouseButtonEvent) {
+                const intptr_t payload = reinterpret_cast<intptr_t>(ev.user.data1);
+                static int touch_mouse_left = 0, touch_mouse_right = 0;
+                const int down = (int)(payload & 1);
+                if ((payload >> 1) == 0) touch_mouse_left = down;
+                else touch_mouse_right = down;
+                sio_set_mouse_buttons(touch_mouse_left, touch_mouse_right);
+            } else if (ev.type == SDL_EVENT_USER &&
+                       ev.user.code == kAndroidTouchMouseMotionEvent) {
+                sio_set_mouse_motion((int)reinterpret_cast<intptr_t>(ev.user.data1),
+                                     (int)reinterpret_cast<intptr_t>(ev.user.data2));
+#endif
+#else
+            } else if (ev.type == SDL_MOUSEMOTION) {
+                sio_set_mouse_motion(ev.motion.xrel, ev.motion.yrel);
+            } else if (ev.type == SDL_MOUSEBUTTONDOWN ||
+                       ev.type == SDL_MOUSEBUTTONUP) {
+                static int mouse_left = 0, mouse_right = 0;
+                const int down = ev.button.state == SDL_PRESSED ? 1 : 0;
+                if (ev.button.button == SDL_BUTTON_LEFT) mouse_left = down;
+                if (ev.button.button == SDL_BUTTON_RIGHT) mouse_right = down;
+                sio_set_mouse_buttons(mouse_left, mouse_right);
+#endif
             } else if (ev.type == SDL_KEYDOWN) {
 #if defined(PSX_SDL3)
                 const SDL_Keymod mod = ev.key.mod;
@@ -7353,6 +7832,49 @@ static bool drain_host_events() {
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
         if (psx_local_mouse_event(ev)) continue;
+        /* Sony Mouse on port 1 ([controller] mouse = true): host mouse and
+         * the Android trackpad (PadOverlay -> SDL user events) feed SIO. */
+#if defined(PSX_SDL3)
+        if (ev.type == SDL_EVENT_MOUSE_MOTION) {
+            sio_set_mouse_motion((int)ev.motion.xrel, (int)ev.motion.yrel);
+        } else if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
+                   ev.type == SDL_EVENT_MOUSE_BUTTON_UP) {
+            static int mouse_left = 0, mouse_right = 0;
+            const int down = ev.button.down ? 1 : 0;
+            if (ev.button.button == SDL_BUTTON_LEFT) mouse_left = down;
+            if (ev.button.button == SDL_BUTTON_RIGHT) mouse_right = down;
+            sio_set_mouse_buttons(mouse_left, mouse_right);
+        }
+#if defined(__ANDROID__)
+        else if (ev.type == SDL_EVENT_USER &&
+                 ev.user.code == kAndroidTouchMouseButtonEvent) {
+            const intptr_t payload = reinterpret_cast<intptr_t>(ev.user.data1);
+            static int touch_mouse_left = 0, touch_mouse_right = 0;
+            const int down = (int)(payload & 1);
+            if ((payload >> 1) == 0) touch_mouse_left = down;
+            else touch_mouse_right = down;
+            sio_set_mouse_buttons(touch_mouse_left, touch_mouse_right);
+            continue;
+        }
+        else if (ev.type == SDL_EVENT_USER &&
+                 ev.user.code == kAndroidTouchMouseMotionEvent) {
+            sio_set_mouse_motion((int)reinterpret_cast<intptr_t>(ev.user.data1),
+                                 (int)reinterpret_cast<intptr_t>(ev.user.data2));
+            continue;
+        }
+#endif
+#else
+        if (ev.type == SDL_MOUSEMOTION) {
+            sio_set_mouse_motion(ev.motion.xrel, ev.motion.yrel);
+        } else if (ev.type == SDL_MOUSEBUTTONDOWN ||
+                   ev.type == SDL_MOUSEBUTTONUP) {
+            static int mouse_left = 0, mouse_right = 0;
+            const int down = ev.button.state == SDL_PRESSED ? 1 : 0;
+            if (ev.button.button == SDL_BUTTON_LEFT) mouse_left = down;
+            if (ev.button.button == SDL_BUTTON_RIGHT) mouse_right = down;
+            sio_set_mouse_buttons(mouse_left, mouse_right);
+        }
+#endif
         if (ev.type == SDL_QUIT) {
             if (psx_netplay_active()) {
                 netplay_soft_exit("sdl_window_close");
@@ -7587,7 +8109,13 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                     snprintf(osd, sizeof(osd), "Game %.0f FPS  %.2fx",
                              fps, speed);
                 }
+#if defined(__ANDROID__)
+                /* Android: the pad overlay draws it (movable), not the picture. */
+                (void)osd;
+                g_android_game_fps_x100.store((int)(fps * 100.0 + 0.5));
+#else
                 host_osd_set_status(osd);
+#endif
             }
             if (netplay_timing_on() && s_np_timing_frames > 0) {
                 const double invf = 1000.0 / (double)frequency;
@@ -7651,6 +8179,14 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                                  &g_runtime_perf.provider_poll_ticks);
     }
 
+#if defined(__ANDROID__)
+    android_perf_hint_frame();
+    if (g_port1_mouse) android_dpad_drive_mouse();
+    android_apply_disc_swap();
+    android_apply_state_request();
+    android_apply_fps_request();
+#endif
+    memcard_flush_settled();
     if (!g_headless) {
         /* Pump SDL events to prevent window freeze. */
         psx_local_mouse_begin(sdl_window, local_mouse_live(override));
@@ -8347,11 +8883,9 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                  * (3x the VRAM touches of the 16-bit path below). */
                 depth24_stage_scanout(&di, sdl_pixel_buf, present_w);
             } else {
-                for (uint32_t y = 0; y < h; y++) {
-                    for (uint32_t x = 0; x < present_w; x++) {
-                        sdl_pixel_buf[y * present_w + x] = gpu_display_pixel_argb(&di, x, y);
-                    }
-                }
+                /* Batch per-scanline, like depth24 above (same pixels). */
+                for (uint32_t y = 0; y < h; y++)
+                    gpu_rgb555_present_row(&di, y, sdl_pixel_buf + y * present_w, present_w);
             }
         }
 
@@ -14214,6 +14748,9 @@ namespace {
 #endif
 
 int main(int argc, char** argv) {
+#if defined(__ANDROID__)
+    android_route_stdio_to_logcat();
+#endif
     /* Force line-buffered output so messages appear even if killed. */
     std::setvbuf(stdout, nullptr, _IOLBF, BUFSIZ);
     std::setvbuf(stderr, nullptr, _IOLBF, BUFSIZ);
@@ -14951,6 +15488,7 @@ int main(int argc, char** argv) {
              * touch this flag, so applying it here (config-load time) is stable.
              * Full history + removal plan: psxrecomp sio.c g_pad_legacy_cfg. */
             sio_set_legacy_cfg(gc.runtime.legacy_pad_config ? 1 : 0);
+            g_port1_mouse = gc.runtime.controller_port1_mouse;
             { const char *e = std::getenv("PSX_GL_FORCE_CPU_PRESENT");
               if (e && e[0] && e[0] != '0') g_gl_fbo_present = 0; }
             game_entry_pc = gc.entry_pc;
@@ -17004,6 +17542,10 @@ session_reboot:
     timers_init();
     interrupts_init();
     sio_init();
+    /* game.toml [controller] mouse: the title expects the Sony Mouse in port 1
+     * (Policenauts). Host mouse input, and on Android the touch overlay's
+     * trackpad, enter that SIO device. */
+    sio_set_mouse_enabled(g_port1_mouse ? 1 : 0);
     psx_event_step_conservative_env_init();
     /* Seed per-player device routing from the resolved [controller] config.
      * SDL controller handles are opened later (after SDL_Init); here we only
@@ -17043,6 +17585,27 @@ session_reboot:
         std::fprintf(stdout, "psxrecomp: SPU float-shadow enabled (verified-enhancement)\n");
     spu_init();
     cdrom_init(disc_path_str.empty() ? NULL : disc_path_str.c_str());
+#if defined(__ANDROID__)
+    /* Disc roster for the pad menu's "Change disc": every disc of the set,
+     * resolved exactly like the boot disc (resolve_selected_disc + normalize).
+     * The disc that just booted keeps its mounted path (it may be a mod's
+     * private patched image). Single-disc titles publish a count of 1. */
+    g_disc_swap_paths.clear();
+    if (game_discs.size() > 1) {
+        for (int d = 1; d <= (int)game_discs.size(); ++d) {
+            if (d == selected_disc_index && !disc_path_str.empty()) {
+                g_disc_swap_paths.push_back(disc_path_str);
+                continue;
+            }
+            const std::filesystem::path p = resolve_selected_disc(game_discs, d, resolved_disc);
+            g_disc_swap_paths.push_back(p.empty() ? std::string()
+                                                  : normalize_disc_path_for_launch(p).string());
+        }
+    }
+    g_android_disc_count.store(game_discs.size() > 1 ? (int)game_discs.size() : 1);
+    g_android_disc_current.store(game_discs.size() > 1 ? selected_disc_index : 1);
+    g_android_disc_swap_request.store(0);
+#endif
 
     /* A disc was requested but nothing mounted. cdrom_init() is non-fatal here
      * (BIOS-only targets run with an empty drive on purpose), so without this
@@ -17284,6 +17847,9 @@ session_reboot:
 #ifdef SDL_HINT_WINDOWS_DPI_SCALING
     SDL_SetHint(SDL_HINT_WINDOWS_DPI_SCALING, "0");
 #endif
+#if defined(__ANDROID__)
+        SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "1");
+#endif
         if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
             std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
             return 1;
@@ -17365,6 +17931,15 @@ session_reboot:
      * borderless desktop fullscreen (keeps the desktop resolution, letterboxes
      * the image), 2 = exclusive fullscreen (real display-mode change), 0 =
      * windowed. Matches the in-game Alt+Enter / Cmd+Ctrl+F hotkey behaviour. */
+#if defined(__ANDROID__)
+    /* An Android window always covers the screen. Opening it "windowed" makes
+     * SDL's Activity show the status and navigation bars over the picture;
+     * fullscreen hides them (immersive) and gives the present path the whole
+     * display to letterbox into. g_fullscreen stays 0 so the desktop
+     * fullscreen helper below (window resize to display bounds) is a no-op. */
+    win_flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+    g_fullscreen = 0;
+#endif
     /* Open at the user-chosen window size (default: see window_size.h)
      * instead of the old hardcoded 640x480. The
      * height follows the configured display aspect (4:3 native, wider for the

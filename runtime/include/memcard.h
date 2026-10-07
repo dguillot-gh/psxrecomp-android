@@ -54,6 +54,9 @@ int memcard_write_sector(int card, int sector, const uint8_t* buf);
 /* Flush pending writes to disk */
 void memcard_flush(int card);
 void memcard_flush_all(void);
+/* Once per frame: write back any card whose last sector write is about half a
+ * second old (a finished save). */
+void memcard_flush_settled(void);
 
 /* Check if card is present */
 int memcard_is_present(int card);

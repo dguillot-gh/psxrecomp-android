@@ -70,6 +70,11 @@ uint32_t gpu_display_pixel_argb(const GpuDisplayInfo* di, uint32_t x, uint32_t y
  * overhead. `out` must hold at least `count` uint32_t ARGB entries. */
 void gpu_depth24_present_row(const GpuDisplayInfo* di, uint32_t y, uint32_t* out,
                              uint32_t count);
+/* Batch equivalent of gpu_display_pixel_argb(di, x, y) for x in [0, count) on
+ * a 15-bit (non-depth24) scanline — byte-identical output, including the
+ * opt-in screen LUT. `out` must hold at least `count` uint32_t ARGB entries. */
+void gpu_rgb555_present_row(const GpuDisplayInfo* di, uint32_t y, uint32_t* out,
+                            uint32_t count);
 /* Depth24: RGB columns covered by CPU→VRAM uploads since the last reset.
  * Returns 0 when no uploads yet, crtc_w when coverage is full/unknown-beyond,
  * else the covered RGB width. Present black-fills [limit, crtc_w) without

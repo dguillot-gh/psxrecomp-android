@@ -722,6 +722,9 @@ struct RuntimeConfig {
     // make that re-detect benign. Scoped per-game; no other title's behaviour changes.
     // Wired to sio_set_legacy_cfg(); see sio.c g_pad_legacy_cfg.
     bool                  legacy_pad_config = false;
+    // mouse: port 1 holds the Sony Mouse (SCPH-1030) instead of a pad, for a
+    // title designed around it (e.g. Policenauts). Default false = a pad.
+    bool                  controller_port1_mouse = false;
     // anti_deadzone: minimum radial analog output after leaving deadzone, in
     // raw SDL axis units (0..32767). This is a game-owned response setting used
     // to compensate a title's own internal stick deadzone. Absent => 0.

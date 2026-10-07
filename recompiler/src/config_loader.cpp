@@ -907,6 +907,9 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         if (ct.contains("legacy_pad_config")) {
             rt.legacy_pad_config = toml::find<bool>(ct, "legacy_pad_config");
         }
+        if (ct.contains("mouse")) {
+            rt.controller_port1_mouse = toml::find<bool>(ct, "mouse");
+        }
         if (ct.contains("anti_deadzone")) {
             const auto n = toml::find<int64_t>(ct, "anti_deadzone");
             if (n < 0 || n > 32767)

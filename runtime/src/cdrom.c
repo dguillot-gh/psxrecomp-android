@@ -3613,3 +3613,17 @@ int cdrom_disc_select(int index_1based) {
     trace_cdrom('M', (uint32_t)index_1based, 1u, 0);
     return 1;
 }
+
+/* Android menu "Change disc": the app passes the picked image's cue path.
+ * Selects it through the roster (cdrom_disc_select), adding it to the roster
+ * first when the launch did not register it. Returns 1 when the disc is in. */
+int cdrom_swap_disc(const char *cue_path) {
+    if (!cue_path || !cue_path[0]) return 0;
+    for (int i = 0; i < s_disc_roster_count; i++)
+        if (strcmp(s_disc_roster[i], cue_path) == 0) return cdrom_disc_select(i + 1);
+    if (s_disc_roster_count >= CDROM_MAX_DISCS ||
+        strlen(cue_path) >= CDROM_DISC_PATH_MAX) return 0;
+    snprintf(s_disc_roster[s_disc_roster_count], CDROM_DISC_PATH_MAX, "%s", cue_path);
+    s_disc_roster_count++;
+    return cdrom_disc_select(s_disc_roster_count);
+}

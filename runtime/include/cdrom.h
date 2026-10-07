@@ -92,6 +92,11 @@ int  cdrom_disc_select(int index_1based);
 uint32_t cdrom_mounted_sector_count(void);
 int      cdrom_mounted_track_count(void);
 
+/* Multi-disc change: open the tray, mount the image at cue_path in place of the
+ * current disc, close the tray (the same guest-visible sequence as above). The
+ * new image is opened first; on failure the old disc stays in and 0 is returned.
+ * Emulator thread only. */
+int cdrom_swap_disc(const char *cue_path);
 /* FMV auto-skip detection: cdrom_xa_stream_active() lets the frontend detect
  * that streaming XA (FMV/CDDA) is in progress. The skip itself is done by the
  * frontend via uncapped pacing (it does NOT alter CD timing — flooding XA

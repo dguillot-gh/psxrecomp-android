@@ -384,7 +384,7 @@ bool sha256_file(const std::filesystem::path& path, std::string& out,
         return true;
     }
 
-    std::array<uint8_t, 1024 * 1024> buffer{};
+    std::vector<uint8_t> buffer(1024 * 1024);
     std::ifstream file(input, std::ios::binary);
     if (!file) {
         if (error) *error = "cannot fingerprint image: " + input.string();

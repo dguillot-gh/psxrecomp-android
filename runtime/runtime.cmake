@@ -211,7 +211,7 @@ if(_psx_sdl_backend STREQUAL "SDL3")
         ON)
     # cmake-clang-v1 1.0.9+ ships SDL3 under deps/; 1.0.7–1.0.8 used pack root.
     # Prefer SDL3_DIR / HINTS — never CMAKE_PREFIX_PATH=pack (mingw include poisons libc++).
-    if(NOT SDL3_DIR)
+    if(NOT ANDROID AND NOT SDL3_DIR)
         foreach(_psx_tc_pfx IN LISTS _PSX_TOOLCHAIN_PREFIX_HINTS)
             foreach(_psx_sdl_root IN ITEMS "${_psx_tc_pfx}/deps" "${_psx_tc_pfx}")
                 if(EXISTS "${_psx_sdl_root}/lib/cmake/SDL3/SDL3Config.cmake" OR
@@ -225,14 +225,21 @@ if(_psx_sdl_backend STREQUAL "SDL3")
             endif()
         endforeach()
     endif()
-    set(_PSX_SDL3_HINTS "")
-    foreach(_psx_tc_pfx IN LISTS _PSX_TOOLCHAIN_PREFIX_HINTS)
-        list(APPEND _PSX_SDL3_HINTS "${_psx_tc_pfx}/deps" "${_psx_tc_pfx}")
-    endforeach()
-    find_package(SDL3 3.4 CONFIG QUIET COMPONENTS SDL3
-        HINTS ${_PSX_SDL3_HINTS}
-        PATH_SUFFIXES lib/cmake/SDL3)
-    unset(_PSX_SDL3_HINTS)
+    if(NOT ANDROID)
+        set(_PSX_SDL3_HINTS "")
+        foreach(_psx_tc_pfx IN LISTS _PSX_TOOLCHAIN_PREFIX_HINTS)
+            list(APPEND _PSX_SDL3_HINTS "${_psx_tc_pfx}/deps" "${_psx_tc_pfx}")
+        endforeach()
+        find_package(SDL3 3.4 CONFIG QUIET COMPONENTS SDL3
+            HINTS ${_PSX_SDL3_HINTS}
+            PATH_SUFFIXES lib/cmake/SDL3)
+        unset(_PSX_SDL3_HINTS)
+    else()
+        # Desktop toolchain packs may contain Windows/Linux SDL binaries. They
+        # cannot be linked into the Android ABI, so Android uses the pinned
+        # SDL source package and builds it with the active NDK instead.
+        message(STATUS "psxrecomp: Android build will compile SDL3 for the NDK ABI")
+    endif()
     if(TARGET SDL3::SDL3)
         # Trust it only if the compiler can actually read its headers. A host
         # SDL3 under /usr/include satisfies find_package and then fails every
@@ -1567,12 +1574,24 @@ function(psxrecomp_add_runtime_target target)
         set(mode_source ${PSXRECOMP_ROOT}/runtime/src/stub_interpreter.c)
     endif()
 
-    add_executable(${target}
-        ${PSXRECOMP_RUNTIME_SOURCES}
-        ${mode_source}
-        ${generated_sources}
-        ${PSXRT_EXTRAS_SOURCES}
-    )
+    if(ANDROID)
+        # SDL's Android Activity loads the native game entry point as libmain.so.
+        add_library(${target} SHARED
+            ${PSXRECOMP_RUNTIME_SOURCES}
+            ${mode_source}
+            ${generated_sources}
+            ${PSXRT_EXTRAS_SOURCES}
+        )
+        # liblog: main.cpp routes stdout/stderr into logcat on Android.
+        target_link_libraries(${target} PRIVATE log)
+    else()
+        add_executable(${target}
+            ${PSXRECOMP_RUNTIME_SOURCES}
+            ${mode_source}
+            ${generated_sources}
+            ${PSXRT_EXTRAS_SOURCES}
+        )
+    endif()
     target_link_libraries(${target} PRIVATE chdr-static)
     # audio_trace.c uses C11 atomics. Make the runtime's actual language
     # requirement explicit instead of relying on a parent project's global
@@ -1667,7 +1686,11 @@ function(psxrecomp_add_runtime_target target)
     else()
         set(_psxrt_overlay_flavor 0)
     endif()
-    set_target_properties(${target} PROPERTIES OUTPUT_NAME "${_psxrt_exe_name}")
+    if(ANDROID)
+        set_target_properties(${target} PROPERTIES OUTPUT_NAME "main")
+    else()
+        set_target_properties(${target} PROPERTIES OUTPUT_NAME "${_psxrt_exe_name}")
+    endif()
 
     # Publish the OVERLAY CODEGEN FLAVOR this target links with, for the same
     # reason the exe name is published just below: so nothing downstream has to
@@ -1756,7 +1779,7 @@ function(psxrecomp_add_runtime_target target)
         # Stage PNG beside the exe when present (AppImage / desktop / SDL icon).
         get_filename_component(_psxrt_ico_dir "${PSXRT_APP_ICON}" DIRECTORY)
         set(_psxrt_png "${_psxrt_ico_dir}/psxrecomp.png")
-        if(EXISTS "${_psxrt_png}")
+        if(EXISTS "${_psxrt_png}" AND NOT ANDROID)
             add_custom_command(TARGET ${target} POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E make_directory
                     "$<TARGET_FILE_DIR:${target}>/assets"
@@ -2020,6 +2043,9 @@ function(psxrecomp_add_runtime_target target)
                 _psxrt_bundled_bios_license_name
                 "${PSXRECOMP_BUNDLED_BIOS_LICENSE}"
                 NAME)
+            # Android ships the BIOS as an APK asset instead (Gradle's
+            # stagePolicenautsAssets); files beside libmain.so are not packaged.
+            if(NOT ANDROID)
             add_custom_command(TARGET ${target} POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E make_directory
                     "$<TARGET_FILE_DIR:${target}>/${_psxrt_bundled_bios_dir}"
@@ -2031,6 +2057,7 @@ function(psxrecomp_add_runtime_target target)
                     "$<TARGET_FILE_DIR:${target}>/${_psxrt_bundled_bios_dir}/${_psxrt_bundled_bios_license_name}"
                 COMMENT "Staging bundled OpenBIOS image and MIT notice"
                 VERBATIM)
+            endif()
             set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS
                 "${PSXRECOMP_BUNDLED_BIOS_SOURCE}"
                 "${PSXRECOMP_BUNDLED_BIOS_LICENSE}")
@@ -2041,8 +2068,9 @@ function(psxrecomp_add_runtime_target target)
     # Skipped for cosim oracles: they have no launcher and no Mods page, and
     # because a cosim exe lands in the same output directory as the runtime,
     # letting it stage would have it wipe and re-stage the runtime's catalog
-    # with only the framework half.
-    if(NOT PSXRT_COSIM)
+    # with only the framework half. Skipped on Android too: the APK packages
+    # only libmain.so from this directory, so a staged catalog never ships.
+    if(NOT PSXRT_COSIM AND NOT ANDROID)
         foreach(_audit_dir IN LISTS PSXRT_AUDIT_MOD_DIRS)
         if(NOT IS_DIRECTORY "${_audit_dir}")
             message(FATAL_ERROR
@@ -2245,24 +2273,30 @@ function(psxrecomp_add_runtime_target target)
         # legacy libGL.so / glx.h (Steam Deck), yet never creates that target —
         # which then fails at generate time. recomp_resolve_gl() picks whatever
         # the host actually has; see recomp-ui/cmake/recomp_gl.cmake.
-        if(NOT COMMAND recomp_resolve_gl
-           AND RECOMP_UI_ROOT AND EXISTS "${RECOMP_UI_ROOT}/cmake/recomp_gl.cmake")
-            include("${RECOMP_UI_ROOT}/cmake/recomp_gl.cmake")
-        endif()
-        if(COMMAND recomp_resolve_gl)
-            recomp_resolve_gl(_psx_gl_target)
-            target_link_libraries(${target} PRIVATE ${_psx_gl_target})
+        if(ANDROID)
+            # The OpenGL backend is kept available in the binary, even when
+            # this title defaults to SDL's software presenter on Android.
+            target_link_libraries(${target} PRIVATE GLESv2)
         else()
-            # No recomp-ui checkout (PSX_RECOMP_UI=OFF): same resolution inline.
-            find_package(OpenGL)
-            if(TARGET OpenGL::GL)
-                target_link_libraries(${target} PRIVATE OpenGL::GL)
-            elseif(TARGET OpenGL::OpenGL)
-                target_link_libraries(${target} PRIVATE OpenGL::OpenGL)
-            elseif(OPENGL_gl_LIBRARY)
-                target_link_libraries(${target} PRIVATE "${OPENGL_gl_LIBRARY}")
-            elseif(OPENGL_opengl_LIBRARY)
-                target_link_libraries(${target} PRIVATE "${OPENGL_opengl_LIBRARY}")
+            if(NOT COMMAND recomp_resolve_gl
+               AND RECOMP_UI_ROOT AND EXISTS "${RECOMP_UI_ROOT}/cmake/recomp_gl.cmake")
+                include("${RECOMP_UI_ROOT}/cmake/recomp_gl.cmake")
+            endif()
+            if(COMMAND recomp_resolve_gl)
+                recomp_resolve_gl(_psx_gl_target)
+                target_link_libraries(${target} PRIVATE ${_psx_gl_target})
+            else()
+                # No recomp-ui checkout (PSX_RECOMP_UI=OFF): same resolution inline.
+                find_package(OpenGL)
+                if(TARGET OpenGL::GL)
+                    target_link_libraries(${target} PRIVATE OpenGL::GL)
+                elseif(TARGET OpenGL::OpenGL)
+                    target_link_libraries(${target} PRIVATE OpenGL::OpenGL)
+                elseif(OPENGL_gl_LIBRARY)
+                    target_link_libraries(${target} PRIVATE "${OPENGL_gl_LIBRARY}")
+                elseif(OPENGL_opengl_LIBRARY)
+                    target_link_libraries(${target} PRIVATE "${OPENGL_opengl_LIBRARY}")
+                endif()
             endif()
         endif()
         # The overlay autocompile watcher (autocompile.c), the debug server and
@@ -2758,7 +2792,12 @@ function(psxrecomp_add_game_runtime target)
             if(NOT IS_ABSOLUTE "${_glob}")
                 set(_glob "${CMAKE_CURRENT_SOURCE_DIR}/${_glob}")
             endif()
-            file(GLOB _hits "${_glob}")
+            # CONFIGURE_DEPENDS: a regeneration can change the NUMBER of shards
+            # (2026-10-05: the zero-run loop fix shrank Parasite Eve 62 -> 53).
+            # Without it the list stayed frozen at configure time, so an
+            # incremental build demanded the deleted shards and the
+            # require_generated check failed ("Recompiled game code is MISSING").
+            file(GLOB _hits CONFIGURE_DEPENDS "${_glob}")
             list(APPEND _psxg_full_list ${_hits})
         endforeach()
         if(NOT _psxg_full_list)
@@ -2777,6 +2816,23 @@ function(psxrecomp_add_game_runtime target)
                     "${_psxg_marker_name}")
                 set(_psxg_full_list "${_psxg_marker_dir}/${_psxg_full_name}")
             endif()
+        endif()
+        # Oversized shards (normal ones are ~1.4 MB) have so far always been the
+        # recompiler emitting a zero-filled area of the EXE as one giant "function":
+        # a placeholder the game fills with code loaded from disc at runtime, which
+        # the dirty-RAM / overlay path then runs. Optimising such a file costs 20-60+
+        # minutes for code that never runs as compiled, so build it at -O0 and outside
+        # LTO. Semantics are unchanged. Remove once the recompiler stops emitting
+        # zero runs as code.
+        if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU" AND NOT MSVC)
+            foreach(_psxg_f IN LISTS _psxg_full_list)
+                file(SIZE "${_psxg_f}" _psxg_sz)
+                if(_psxg_sz GREATER 4000000)
+                    set_source_files_properties("${_psxg_f}" PROPERTIES COMPILE_OPTIONS "-O0;-fno-lto")
+                    get_filename_component(_psxg_fn "${_psxg_f}" NAME)
+                    message(STATUS "psxrecomp: oversized shard ${_psxg_fn} (${_psxg_sz} bytes) built at -O0, no LTO")
+                endif()
+            endforeach()
         endif()
         psxrecomp_add_runtime_target(${target}
             GAME_GENERATED_FULL_C ${_psxg_full_list}

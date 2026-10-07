@@ -34,6 +34,26 @@ psx_fiber_t psx_fiber_create(size_t stack_size, psx_fiber_entry entry, void* arg
 void psx_fiber_switch(psx_fiber_t target) { SwitchToFiber((LPVOID)target); }
 void psx_fiber_destroy(psx_fiber_t fiber) { if (fiber) DeleteFiber((LPVOID)fiber); }
 
+#elif defined(__ANDROID__)
+
+/* Android's bionic libc does not provide the ucontext switching API. The
+ * Android runtime uses the deterministic HLE scheduler, which does not create
+ * host fibers; keep a stable thread identity for exception-owner checks and
+ * make the legacy backend explicitly unavailable. */
+static unsigned char s_android_thread_fiber;
+
+psx_fiber_t psx_fiber_convert_thread(void) { return &s_android_thread_fiber; }
+psx_fiber_t psx_fiber_current(void)      { return &s_android_thread_fiber; }
+psx_fiber_t psx_fiber_create(size_t stack_size, psx_fiber_entry entry, void* arg)
+{
+    (void)stack_size;
+    (void)entry;
+    (void)arg;
+    return NULL;
+}
+void psx_fiber_switch(psx_fiber_t target) { (void)target; }
+void psx_fiber_destroy(psx_fiber_t fiber) { (void)fiber; }
+
 #else /* POSIX: ucontext */
 
 #ifndef _XOPEN_SOURCE

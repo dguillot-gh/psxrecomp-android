@@ -47,6 +47,12 @@ static void sio_debug_poll_maybe(void) {
  * 0 .. PSX_MAX_PLAYERS-1 (not physical SIO slot). */
 static uint16_t pad_buttons[PSX_MAX_PLAYERS] = { PSX_PAD_INIT(0xFFFF) };
 
+/* Optional Sony Mouse attached to physical port 1. The host accumulates raw
+ * relative motion; each 0x42 poll consumes up to one signed byte per axis. */
+static uint8_t psx_mouse_enabled;
+static int32_t psx_mouse_dx, psx_mouse_dy;
+static uint8_t psx_mouse_left, psx_mouse_right;
+
 /* Per-logical-pad type + analog stick state. analog: 0=digital pad (poll id
  * 0x41), 1=DualShock/analog (poll id 0x73). Sticks are 0..255, 0x80 centred. */
 static PSX_BSS uint8_t pad_analog[PSX_MAX_PLAYERS];
@@ -799,6 +805,8 @@ void sio_init(void) {
         pad_supports_config[i] = 1;
     }
     pad_connected = 0;
+    psx_mouse_dx = psx_mouse_dy = 0;
+    psx_mouse_left = psx_mouse_right = 0;
     /* Multitap enable/port are host preferences — leave them alone across
      * sio_init so a soft reset does not drop the tap configuration. */
     mc_state = MC_IDLE;
@@ -834,6 +842,31 @@ void sio_init(void) {
     /* Note: sio_txn_buf, sio_txn_idx, sio_txn_seq deliberately persist
      * across sio_init so post-reset diagnostics can still inspect prior
      * transactions. Boot path zero-inits them via BSS. */
+}
+
+void sio_set_mouse_enabled(int enabled) {
+    psx_mouse_enabled = enabled ? 1u : 0u;
+    psx_mouse_dx = psx_mouse_dy = 0;
+    psx_mouse_left = psx_mouse_right = 0;
+}
+
+static void psx_mouse_add_delta(int32_t *total, int delta) {
+    if (delta > 0 && *total > INT32_MAX - delta)
+        *total = INT32_MAX;
+    else if (delta < 0 && *total < INT32_MIN - delta)
+        *total = INT32_MIN;
+    else
+        *total += delta;
+}
+
+void sio_set_mouse_motion(int dx, int dy) {
+    psx_mouse_add_delta(&psx_mouse_dx, dx);
+    psx_mouse_add_delta(&psx_mouse_dy, dy);
+}
+
+void sio_set_mouse_buttons(int left_pressed, int right_pressed) {
+    psx_mouse_left = left_pressed ? 1u : 0u;
+    psx_mouse_right = right_pressed ? 1u : 0u;
 }
 
 /* Cycle-budgeted precise event slicing: guest CPU cycles until SIO raises a
@@ -1171,8 +1204,11 @@ static void pad_process_byte(uint8_t tx_byte) {
     case PAD_IDLE:
         /* Standard address 01h selects Slot A (or the standalone pad). With a
          * multitap, 02h..04h select pads B–D on that port (psx-spx method 2). */
-        if (tx_byte == 0x01 && pad_port_has_device(selected_slot)) {
-            pad_active_logical = pad_logical_for_port(selected_slot);
+        if (tx_byte == 0x01 &&
+            ((psx_mouse_enabled && selected_slot == 0) ||
+             pad_port_has_device(selected_slot))) {
+            pad_active_logical = (psx_mouse_enabled && selected_slot == 0)
+                                     ? -1 : pad_logical_for_port(selected_slot);
             pad_mtap_addr = 0x01;
             pad_state = PAD_WAIT_ACCESS;
             sio_rx_data = 0xFF;
@@ -1205,6 +1241,30 @@ static void pad_process_byte(uint8_t tx_byte) {
                 pad_fill_status8(base + i, &pad_response[2 + i * 8]);
             pad_response_len = PAD_RESPONSE_MAX;
             mtap_returned[selected_slot] = MTAP_NEXT_BULK;
+            pad_state = PAD_SEND_RESPONSE;
+            sio_rx_data = pad_response[0];
+            sio_stat |= SIO_STAT_ACK;
+            break;
+        }
+        if (psx_mouse_enabled && selected_slot == 0 && pad_mtap_addr == 0x01 &&
+            tx_byte == 0x42) {
+            int32_t dx = psx_mouse_dx;
+            int32_t dy = psx_mouse_dy;
+            if (dx > 127) dx = 127;
+            if (dx < -128) dx = -128;
+            if (dy > 127) dy = 127;
+            if (dy < -128) dy = -128;
+            psx_mouse_dx -= dx;
+            psx_mouse_dy -= dy;
+            pad_response[0] = 0x12; /* Sony Mouse, four data bytes */
+            pad_response[1] = 0x5A;
+            pad_response[2] = 0xFF;
+            pad_response[3] = (uint8_t)(0xF0u |
+                (psx_mouse_right ? 0x00u : 0x04u) |
+                (psx_mouse_left ? 0x00u : 0x08u));
+            pad_response[4] = (uint8_t)(int8_t)dx;
+            pad_response[5] = (uint8_t)(int8_t)dy;
+            pad_response_len = 6;
             pad_state = PAD_SEND_RESPONSE;
             sio_rx_data = pad_response[0];
             sio_stat |= SIO_STAT_ACK;

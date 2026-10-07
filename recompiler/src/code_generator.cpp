@@ -2190,6 +2190,51 @@ std::string CodeGenerator::translate_basic_block(
             break;
         }
 
+        // A long run of zero words (0x00000000 = `sll $0,$0,0`, the canonical nop) is an
+        // empty area of the EXE image — typically an overlay load region that a jal
+        // reaches before the overlay is installed (e.g. Parasite Eve: 441 KB of zeros at
+        // 0x8019234C, one function). Unrolled one statement per word, such a run became a
+        // 20 MB shard holding a single 100k-statement function that clang could not
+        // compile in bounded memory or time. Emit the run as a loop instead. Each word
+        // keeps exactly the per-instruction effects, in the same order, that the
+        // unrolled path below emits for a nop: I-cache fetch at 16-byte line starts,
+        // the nop's interlock step, then the co-sim hook. Only words that would get no
+        // other per-address emission qualify: not the block start, no jump-table
+        // label, no annotation, no pending load-delay pair, not the branch or its
+        // delay slot. Short runs (ordinary nops) keep the unrolled form.
+        if (instr == 0u && !delayed_load_active && addr != block.start_addr) {
+            auto zero_run_word = [&](uint32_t a) {
+                if (a > block.end_addr || a == exit_branch_addr) return false;
+                if (exit_uses_delay_slot && a == block.end_addr) return false;
+                if (extra_labels_.count(a)) return false;
+                if (annotations_ && !annotations_->lookup(a).empty()) return false;
+                auto w = exe_.read_word(a);
+                return w.has_value() && *w == 0u;
+            };
+            constexpr uint32_t kZeroRunLoopMinWords = 64;
+            uint32_t run_end = addr;
+            while (zero_run_word(run_end)) run_end += 4u;
+            if ((run_end - addr) / 4u >= kZeroRunLoopMinWords) {
+                const std::string& in = config_.indent;
+                ss << in << fmt::format("/* 0x{:08X}..0x{:08X}: {} zero words (nop), emitted as a loop */\n",
+                                        addr, run_end - 4u, (run_end - addr) / 4u);
+                ss << in << fmt::format("for (uint32_t _psx_zr = 0x{:08X}u; _psx_zr != 0x{:08X}u; _psx_zr += 4u) {{\n",
+                                        addr, run_end);
+                if (cycle_per_insn) {
+                    ss << "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
+                    ss << in << in << "if ((_psx_zr & 0xCu) == 0u) psx_icache_fetch(cpu, _psx_zr);\n";
+                    ss << in << in << fmt::format("psx_cyc_step(cpu, 0x{:X}u);\n", psx_cyc_dep_res_mask(0u));
+                    ss << "#endif\n";
+                }
+                ss << "#ifdef PSX_COSIM\n";
+                ss << in << in << "cosim_instr(_psx_zr);\n";
+                ss << "#endif\n";
+                ss << in << "}\n";
+                addr = run_end;
+                continue;
+            }
+        }
+
         // Don't emit control flow instructions here (handled separately)
         bool is_cf = ControlFlowAnalyzer::is_control_flow(instr);
 

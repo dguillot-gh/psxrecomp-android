@@ -918,3 +918,9 @@ int psx_cycle_uncharged_end(const PsxCycleFreeze *save) {
     freeze_restore_deferred(save);
     return uncharged;
 }
+
+/* Out-of-line instance of the full charge path; the inlined psx_cyc_charge
+ * fast path (psx_cyc.h) defers here for every case it does not handle. */
+void psx_cyc_charge_slow(uint32_t cycles) {
+    psx_cyc_charge_full(cycles);
+}

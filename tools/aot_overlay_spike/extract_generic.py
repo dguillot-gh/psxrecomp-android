@@ -1016,7 +1016,7 @@ def main():
     doc=tomllib.loads(open(a.game_toml, encoding='utf-8-sig').read())  # utf-8-sig strips BOM
     game=doc.get('game',doc)
     root=os.path.dirname(os.path.abspath(a.game_toml))
-    disc_rel=game.get('disc') or doc.get('game',{}).get('disc')
+    disc_rel=game.get('disc') or doc.get('game',{}).get('disc') or (game.get('discs') or [None])[0]  # multi-disc games list discs = [...]; scan disc 1
     load_addr=int(str(game.get('load_address','0x80010000')),16)
     text_size=int(str(game.get('text_size','0x00080000')),16)
     floor = (load_addr + text_size) & 0x1FFFFFFF
