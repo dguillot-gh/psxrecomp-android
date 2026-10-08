@@ -3498,6 +3498,75 @@ std::vector<GeneratedFunction> CodeGenerator::generate_alias_group(
     return results;
 }
 
+// ---- Data-as-code guard (psx-android, 2026-10-08) -------------------------
+// Real R3000A code never executes a reserved primary opcode (same table as
+// function_analysis' valid_primary_p3; 0x14-0x17 branch-likely, 0x18-0x1F, and
+// the unimplemented coprocessor loads/stores are RESERVED on the PS1 CPU).
+// A "function" whose REACHABLE path from its entry decodes such a word is data
+// that discovery minted as code (pointer tables, strings, packed data). Gran
+// Turismo 2 SCUS-94488: a 120 KB data block at 0x80011D68 produced 8,316
+// mid-function "targets" from data decoded as branches and 1.2 GB of C.
+static bool r3000_primary_valid(uint32_t instr) {
+    static const bool valid[64] = {
+        true,  true,  true,  true,  true,  true,  true,  true,   // 0x00-0x07
+        true,  true,  true,  true,  true,  true,  true,  true,   // 0x08-0x0F
+        true,  false, true,  false, false, false, false, false,  // 0x10-0x17
+        false, false, false, false, false, false, false, false,  // 0x18-0x1F
+        true,  true,  true,  true,  true,  true,  true,  false,  // 0x20-0x27
+        true,  true,  true,  true,  false, false, true,  false,  // 0x28-0x2F
+        true,  false, true,  false, false, false, false, false,  // 0x30-0x37
+        true,  false, true,  false, false, false, false, false,  // 0x38-0x3F
+    };
+    return valid[(instr >> 26) & 0x3Fu];
+}
+
+// Walks the blocks reachable from `entries` and reports whether any decodes a
+// reserved primary opcode. Always-taken branches (beq rs,rs / bgez $zero /
+// bgezal $zero) do NOT fall through: the CFG lists their fall-through as a
+// successor, but inline data commonly follows them in real code.
+static bool data_guard_enabled() {
+    static int on = -1;
+    if (on < 0) { const char* e = std::getenv("PSX_DATA_GUARD"); on = (e && *e == '1') ? 1 : 0; }
+    // Default OFF (opt-in PSX_DATA_GUARD=1). Regression 2026-10-08: "data" regions
+    // (is_data_section) in Tomba 2, Einhander, Policenauts and Parasite Eve hold real
+    // jump targets that play captures executed; skipping them dropped those entries.
+    // Gap chaining alone fixes GT2 (1.2 GB -> 32 MB) with no lost entries anywhere.
+    return on == 1;
+}
+
+static bool cfg_reaches_invalid(const PS1Executable& exe,
+                                const ControlFlowGraph& cfg,
+                                const std::vector<uint32_t>& entries) {
+    std::set<uint32_t> seen;
+    std::vector<uint32_t> work(entries.begin(), entries.end());
+    while (!work.empty()) {
+        uint32_t at = work.back();
+        work.pop_back();
+        if (!seen.insert(at).second) continue;
+        auto it = cfg.blocks.find(at);
+        if (it == cfg.blocks.end()) continue;
+        const auto& b = it->second;
+        for (uint32_t pc = b.start_addr; pc <= b.end_addr && pc >= b.start_addr; pc += 4u) {
+            auto w = exe.read_word(pc);
+            if (w.has_value() && !r3000_primary_valid(*w)) return true;
+        }
+        bool always_taken = false;
+        if (b.exit_instr.type == ControlFlowType::Branch) {
+            auto w = exe.read_word(b.exit_instr.address);
+            if (w.has_value()) {
+                uint32_t op = *w >> 26, rs = (*w >> 21) & 31u, rt = (*w >> 16) & 31u;
+                always_taken = (op == 0x04 && rs == rt) ||                      // beq x,x
+                               (op == 0x01 && rs == 0 && (rt == 0x01 || rt == 0x11));  // bgez/bgezal $zero
+            }
+        }
+        for (uint32_t s : b.successors) {
+            if (always_taken && s == b.exit_instr.address + 8u && s != b.exit_instr.target) continue;
+            work.push_back(s);
+        }
+    }
+    return false;
+}
+
 std::vector<GeneratedFunction> CodeGenerator::generate_all_functions(
     const std::vector<Function>& functions,
     const std::map<uint32_t, ControlFlowGraph>& cfgs) {
@@ -3553,7 +3622,12 @@ std::vector<GeneratedFunction> CodeGenerator::generate_all_functions(
             }
             continue;
         }
-        if (func.is_data_section) {
+        // Data-as-code guard: a function whose reachable path decodes a reserved
+        // opcode is data; emit the same fail-closed stub as is_data_section.
+        const bool as_data = func.is_data_section ||
+            (data_guard_enabled() && cfgs.count(func.start_addr) &&
+             cfg_reaches_invalid(exe_, cfgs.at(func.start_addr), {func.start_addr}));
+        if (as_data) {
             GeneratedFunction stub;
             stub.function_name = func.name;
             stub.signature = fmt::format("void {}(CPUState* cpu)", func.name);
@@ -3850,6 +3924,26 @@ std::string CodeGenerator::generate_file(
         const int MAX_PASSES = 256;
         bool converged = false;
 
+        // Data-as-code guard (opt-in, PSX_DATA_GUARD=1): a function whose reachable
+        // path decodes a reserved opcode is data, and its decoded "branches" do not
+        // mint split targets. Off by default: see data_guard_enabled().
+        std::set<uint32_t> data_funcs;
+        if (data_guard_enabled()) {
+            int newly = 0;
+            for (auto& f : functions_mut) {
+                if (f.alias_walk_lo != 0) continue;
+                if (f.is_data_section) { data_funcs.insert(f.start_addr); continue; }
+                auto c = cfgs_mut.find(f.start_addr);
+                if (c != cfgs_mut.end() && cfg_reaches_invalid(exe_, c->second, {f.start_addr})) {
+                    f.is_data_section = true;
+                    data_funcs.insert(f.start_addr);
+                    newly++;
+                }
+            }
+            if (newly > 0)
+                fmt::print("Data guard: {} function(s) reach a reserved opcode -> data (not split, emitted as stubs)\n", newly);
+        }
+
         for (int pass = 0; pass < MAX_PASSES; pass++) {
             std::set<uint32_t> mid_targets;
 
@@ -3882,9 +3976,11 @@ std::string CodeGenerator::generate_file(
             };
 
             if (cfgs_to_scan.empty()) {
-                for (const auto& [cfg_addr, cfg] : cfgs_mut) scan_cfg(cfg);
+                for (const auto& [cfg_addr, cfg] : cfgs_mut)
+                    if (!data_funcs.count(cfg_addr)) scan_cfg(cfg);
             } else {
                 for (uint32_t addr : cfgs_to_scan) {
+                    if (data_funcs.count(addr)) continue;
                     auto it = cfgs_mut.find(addr);
                     if (it != cfgs_mut.end()) scan_cfg(it->second);
                 }
@@ -3932,9 +4028,16 @@ std::string CodeGenerator::generate_file(
             std::vector<Function> new_funcs;
             std::set<uint32_t> affected;
 
-            for (uint32_t target : gap_targets) {
+            // Several targets in one gap must CHAIN (each piece ends at the next
+            // target), not all run to the next function: pieces made in the same
+            // pass were never truncated later, so they overlapped and every byte
+            // was emitted once per piece (GT2: 309 pieces x 60 KB).
+            std::vector<uint32_t> gap_vec(gap_targets.begin(), gap_targets.end());
+            for (size_t gi = 0; gi < gap_vec.size(); gi++) {
+                uint32_t target = gap_vec[gi];
                 auto next_it = std::upper_bound(func_starts.begin(), func_starts.end(), target);
                 uint32_t gap_end = (next_it != func_starts.end()) ? *next_it : exe_end;
+                if (gi + 1 < gap_vec.size() && gap_vec[gi + 1] < gap_end) gap_end = gap_vec[gi + 1];
                 if (target >= gap_end) continue;
 
                 Function nf;
@@ -3990,12 +4093,22 @@ std::string CodeGenerator::generate_file(
             // Rebuild CFGs for affected functions
             ControlFlowAnalyzer cfg_analyzer(exe_);
             cfgs_to_scan.clear();
+            int data_now = 0;
             for (auto& f : functions_mut) {
                 if (affected.count(f.start_addr)) {
                     cfgs_mut[f.start_addr] = cfg_analyzer.analyze_function(f);
+                    if (data_guard_enabled() &&
+                        (f.is_data_section ||
+                         cfg_reaches_invalid(exe_, cfgs_mut[f.start_addr], {f.start_addr}))) {
+                        if (!f.is_data_section) data_now++;
+                        f.is_data_section = true;
+                        data_funcs.insert(f.start_addr);
+                        continue;   // data: never harvest its decoded "branches"
+                    }
                     cfgs_to_scan.insert(f.start_addr);
                 }
             }
+            if (data_now > 0) fmt::print("  Data guard: {} new piece(s) are data\n", data_now);
 
             total_new += (int)new_funcs.size();
             fmt::print("  Created {} new entry points\n", new_funcs.size());
