@@ -893,6 +893,12 @@ extern uint8_t *memory_get_ram_ptr(void);
 static uint32_t s_mcur_xaddr, s_mcur_yaddr;   /* physical RAM offsets; 0 = unknown */
 static int s_msteer_active, s_msteer_polls;
 static int32_t s_msteer_tx, s_msteer_ty;
+/* Where this steer started reading the cursor, and whether that reading ever changed.
+ * On some screens Policenauts stops updating the found address (it read 292,212 or
+ * 76,40 forever while the real cursor moved: 2026-10-09 log), so a steer whose
+ * reading never moves falls back to the blind corner-reset move for that tap. */
+static int32_t s_msteer_x0, s_msteer_y0;
+static int s_msteer_moved, s_msteer_started;
 
 void sio_mouse_cursor_addr(uint32_t xaddr, uint32_t yaddr) {
     s_mcur_xaddr = xaddr & 0x1FFFFEu;
@@ -905,6 +911,8 @@ static int16_t sio_mouse_read_cursor(uint32_t off) {
     return (int16_t)(ram[off] | (ram[off + 1] << 8));
 }
 
+static void sio_mouse_point_blind(int x, int y, int click, int recalibrate);
+
 void sio_mouse_point(int x, int y, int click, int recalibrate) {
     if (x < 0) x = 0;
     if (y < 0) y = 0;
@@ -916,9 +924,16 @@ void sio_mouse_point(int x, int y, int click, int recalibrate) {
         s_msteer_ty = y;
         s_msteer_active = 1;
         s_msteer_polls = 0;
+        s_msteer_started = 0;
+        s_msteer_moved = 0;
         if (click) s_mpoint_click_pending = 1;
         return;
     }
+    sio_mouse_point_blind(x, y, click, recalibrate);
+}
+
+/* Blind mode: corner reset (recalibrate) + exact move, played back by the poll. */
+static void sio_mouse_point_blind(int x, int y, int click, int recalibrate) {
     psx_mouse_dx = psx_mouse_dy = 0;   /* drop any half-played motion */
     s_mpoint_count = s_mpoint_next = 0;
     if (recalibrate || !s_mpoint_known) {
@@ -953,8 +968,21 @@ static void sio_mouse_point_poll(void) {
         if (cx == last_x && cy == last_y) still++; else still = 0;
         last_x = cx;
         last_y = cy;
+        if (!s_msteer_started) { s_msteer_started = 1; s_msteer_x0 = cx; s_msteer_y0 = cy; }
+        else if (cx != s_msteer_x0 || cy != s_msteer_y0) s_msteer_moved = 1;
+        /* The reading never moved in ~10 polls (~5 frames: the game reads the mouse twice
+         * a frame and moves the cursor once) while being pushed: this screen keeps the
+         * cursor elsewhere. Do this tap blind instead (its click stays pending). */
+        if (!s_msteer_moved && s_msteer_polls >= 10 &&
+            !(ex >= -1 && ex <= 1 && ey >= -1 && ey <= 1)) {
+            still = 0;
+            s_msteer_active = 0;
+            sio_mouse_point_blind(s_msteer_tx, s_msteer_ty, 0, 1);
+            return;
+        }
         /* Arrived, stalled, or the game isn't reading the mouse right now (~2 s): stop. */
-        if ((ex >= -1 && ex <= 1 && ey >= -1 && ey <= 1) || (s_msteer_polls > 2 && still >= 4) ||
+        if ((ex >= -1 && ex <= 1 && ey >= -1 && ey <= 1) ||
+            (s_msteer_moved && s_msteer_polls > 2 && still >= 4) ||
             ++s_msteer_polls > 120) {
             still = 0;
             s_msteer_active = 0;
