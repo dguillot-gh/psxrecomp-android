@@ -144,13 +144,14 @@ final class PsxMenu {
             scales.addView(b, lp);
         }
         list.addView(scales);
-        /* Aspect ratio: hidden. On PSX this framework only engages widescreen from a
-         * per-game widescreen mod package (main.cpp: "widescreen is mod-owned"), and
-         * none of our games ships one yet, so a plain [video] aspect_ratio is ignored. */
-        if (false) {
+        /* Aspect ratio. Real widescreen on PSX is per-game (a widescreen mod package;
+         * main.cpp "widescreen is mod-owned"). Without one, main.cpp's Android
+         * stretch widens the finished 4:3 picture at present time (2026-10-09).
+         * Read at game start, so it applies after a restart. */
+        {
             boolean wide = "\"16:9\"".equals(video.get("aspect_ratio"));
-            list.addView(label("Aspect ratio", "16:9 widens the 3D camera (you see more, nothing is stretched). "
-                    + "2D backgrounds and some edges may not fill it; switch back if a game looks wrong."));
+            list.addView(label("Aspect ratio", "16:9 stretches the picture to fill a wide screen "
+                    + "(everything looks a little wider). Restart the game to apply."));
             LinearLayout aspects = new LinearLayout(activity);
             String[][] choices = { { "4:3", "\"4:3\"" }, { "16:9", "\"16:9\"" } };
             for (int i = 0; i < choices.length; i++) {

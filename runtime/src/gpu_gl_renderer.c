@@ -1032,6 +1032,7 @@ static void hold_capture_drawable(void) {
 static void letterbox_rect_aspect(int ww, int wh, int num, int den,
                                   int *x, int *y, int *w, int *h);
 static void letterbox_rect(int ww, int wh, int *x, int *y, int *w, int *h);
+static void letterbox_rect_pinned(int ww, int wh, int *x, int *y, int *w, int *h);
 
 /* Size of a display-band capture (temporal-blend history, hold-last) whose
  * source band is sw x sh pixels at the output scale. Normally that size. In
@@ -1048,7 +1049,7 @@ static void hiw_capture_size(int sw, int sh, int force_4_3, int *cw, int *ch) {
     if (!s_hiw || !s_win) return;
     SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     if (ww < 1 || wh < 1) return;
-    if (force_4_3) letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
+    if (force_4_3) letterbox_rect_pinned(ww, wh, &lx, &ly, &lw, &lh);
     else letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
     if (lw > 0 && lh > 0 && (int64_t)lw * lh < (int64_t)sw * sh) {
         *cw = lw; *ch = lh;
@@ -4576,6 +4577,18 @@ static void letterbox_rect(int ww, int wh, int *x, int *y, int *w, int *h) {
     letterbox_rect_aspect(ww, wh, s_aspect_num, s_aspect_den, x, y, w, h);
 }
 
+/* Present-only stretch (Android menu "16:9" without a widescreen mod,
+ * 2026-10-09). The present paths pin "native 4:3" frames (FMV, boot, and
+ * EVERY frame while real widescreen is not engaged) to a 4:3 rect; with the
+ * stretch on, those use the display aspect too, so the whole 4:3 picture
+ * fills the wider shape. Nothing upstream of the present changes. */
+static int s_present_stretch = 0;
+void gl_renderer_set_present_stretch(int on) { s_present_stretch = on ? 1 : 0; }
+static void letterbox_rect_pinned(int ww, int wh, int *x, int *y, int *w, int *h) {
+    if (s_present_stretch) letterbox_rect(ww, wh, x, y, w, h);
+    else letterbox_rect_aspect(ww, wh, 4, 3, x, y, w, h);
+}
+
 static GLuint make_tex(GLenum internal, int w, int h, GLenum fmt, GLenum type) {
     GLuint t = 0;
     glGenTextures(1, &t);
@@ -5251,7 +5264,7 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
     glClearColor(0.f,0.f,0.f,1.f); glClear(GL_COLOR_BUFFER_BIT);
     int lx, ly, lw, lh;
     if (force_4_3)
-        letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
+        letterbox_rect_pinned(ww, wh, &lx, &ly, &lw, &lh);
     else
         letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
     /* Short GP1(07h) bands (MotK FMV is 128 lines) only fill a fraction of
@@ -6298,7 +6311,7 @@ static int interp_present_pair(GLuint a, GLuint b, float t, int blend_mode) {
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     int lx, ly, lw, lh;
     if (s_interp_force_4_3)
-        letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
+        letterbox_rect_pinned(ww, wh, &lx, &ly, &lw, &lh);
     else
         letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
     glDisable(GL_SCISSOR_TEST);
@@ -7975,7 +7988,7 @@ int gl_renderer_present_hold_last(void) {
                             0, 0, s_hold_tw, s_hold_th, 0, lx, ly, lw, lh, 0, 0, 1);
     } else {
         if (s_hold_force_4_3)
-            letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
+            letterbox_rect_pinned(ww, wh, &lx, &ly, &lw, &lh);
         else
             letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
         present_target_quad(s_hold_tex, s_hold_tw, s_hold_th,
@@ -8021,7 +8034,7 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     int lx, ly, lw, lh;
     if (force_4_3)
-        letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
+        letterbox_rect_pinned(ww, wh, &lx, &ly, &lw, &lh);
     else
         letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
     /* No short-band adjustment on the 15-bit FBO path: a game's native short

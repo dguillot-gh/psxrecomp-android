@@ -888,8 +888,53 @@ void psx_fatal_halt(const char *reason) {
 
 #include <signal.h>
 
+#ifndef _WIN32
+/* The SIGSEGV/SIGABRT dispositions in place before ours. On Android these are
+ * debuggerd's (SA_SIGINFO), which write the tombstone and the logcat
+ * backtrace; re-raising under plain SIG_DFL bypassed them, so Android crashes
+ * left no backtrace at all (Mizzurna Falls, 2026-10-09). */
+static struct sigaction s_prev_sigsegv, s_prev_sigabrt;
+static int s_prev_saved = 0;
+#endif
+
+#if defined(__ANDROID__)
+/* Android: print the crashing thread's native backtrace straight to logcat
+ * (tag "psxcrash") before anything else. debuggerd's tombstone is not reliable
+ * here (the process exits mid-dump), and a crash on the UI thread (e.g. a tap
+ * into SDL, Mizzurna Falls 2026-10-09) otherwise names no caller at all. */
+#include <unwind.h>
+#include <dlfcn.h>
+#include <unistd.h>
+#include <android/log.h>
+static _Unwind_Reason_Code psx_unwind_frame(struct _Unwind_Context *ctx, void *arg) {
+    int *n = (int *)arg;
+    uintptr_t pc = (uintptr_t)_Unwind_GetIP(ctx);
+    if (!pc) return _URC_NO_REASON;
+    Dl_info info;
+    const char *lib = "?", *sym = "?";
+    uintptr_t off = 0;
+    if (dladdr((void *)pc, &info)) {
+        if (info.dli_fname) lib = info.dli_fname;
+        if (info.dli_sname) { sym = info.dli_sname; off = pc - (uintptr_t)info.dli_saddr; }
+        else off = pc - (uintptr_t)info.dli_fbase;
+    }
+    __android_log_print(ANDROID_LOG_ERROR, "psxcrash", "#%02d pc %p %s (%s+0x%lx)",
+                        *n, (void *)pc, lib, sym, (unsigned long)off);
+    return ++*n >= 48 ? _URC_END_OF_STACK : _URC_NO_REASON;
+}
+static void psx_android_log_backtrace(int sig) {
+    int n = 0;
+    __android_log_print(ANDROID_LOG_ERROR, "psxcrash", "signal %d in thread %d; backtrace:",
+                        sig, (int)gettid());
+    _Unwind_Backtrace(psx_unwind_frame, &n);
+}
+#endif
+
 static void psx_signal_handler(int sig) {
     static char reason[64];
+#if defined(__ANDROID__)
+    psx_android_log_backtrace(sig);
+#endif
     snprintf(reason, sizeof(reason), "signal_%d", sig);
     psx_crash_trace_dump(reason, NULL);
     /* Involuntary death: dump the full freeze-style rings too, so the
@@ -897,7 +942,13 @@ static void psx_signal_handler(int sig) {
      * guards against overwriting an earlier fatal dump. */
     if (!g_psx_fatal_reason) g_psx_fatal_reason = reason;
     freeze_heartbeat_fatal_dump(reason);
-    /* Reraise default handler so debugger / OS can also act. */
+    /* Reraise so debugger / OS can also act: restore the previous handler
+     * (debuggerd on Android) when we saved one, else the default. */
+#ifndef _WIN32
+    if (s_prev_saved && (sig == SIGSEGV || sig == SIGABRT)) {
+        sigaction(sig, sig == SIGSEGV ? &s_prev_sigsegv : &s_prev_sigabrt, NULL);
+    } else
+#endif
     signal(sig, SIG_DFL);
     raise(sig);
 }
@@ -949,6 +1000,9 @@ static void psx_atexit_handler(void) {
 
 void psx_crash_trace_install_handlers(void) {
 #ifndef _WIN32
+    if (sigaction(SIGSEGV, NULL, &s_prev_sigsegv) == 0 &&
+        sigaction(SIGABRT, NULL, &s_prev_sigabrt) == 0)
+        s_prev_saved = 1;
     signal(SIGSEGV, psx_signal_handler);
 #endif
     /* Soft-exit on all hosts (incl. MinGW): MSYS2 kill -TERM must flush PGO. */

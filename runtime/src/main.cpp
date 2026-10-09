@@ -1850,6 +1850,14 @@ extern "C" void debug_get_fmv_config(int *auto_skip, uint32_t *total_table,
 static int           g_video_depth24_trailing_margin = 8;
 static int           g_video_aspect_num = 4;
 static int           g_video_aspect_den = 3;
+#if defined(__ANDROID__)
+/* Android present-only stretch (menu "16:9" without a widescreen mod); 0 = off. */
+static int           g_android_stretch_num = 0;
+static int           g_android_stretch_den = 0;
+/* gpu_gl_renderer.c; declared here rather than in gpu_gl_renderer.h, which is
+ * mirrored into overlay_toolchain/include for overlay builds. */
+extern "C" void gl_renderer_set_present_stretch(int on);
+#endif
 /* [video] fov_scale — VR perspective multiplier on the GTE projection distance
  * H (1.0 = faithful). env PSX_GTE_FOV_SCALE overrides it. */
 static double        g_fov_scale = 1.0;
@@ -14750,6 +14758,13 @@ namespace {
 int main(int argc, char** argv) {
 #if defined(__ANDROID__)
     android_route_stdio_to_logcat();
+    /* Work from the app's files folder. The process starts in "/", where
+     * relative outputs (crash_trace's psx_last_run_report.json, ...) cannot
+     * be written, so Android crashes left no report (2026-10-09). */
+    if (const char* files = SDL_GetAndroidInternalStoragePath()) {
+        if (chdir(files) != 0)
+            std::fprintf(stderr, "psxrecomp: chdir(%s) failed\n", files);
+    }
 #endif
     /* Force line-buffered output so messages appear even if killed. */
     std::setvbuf(stdout, nullptr, _IOLBF, BUFSIZ);
@@ -15000,7 +15015,12 @@ int main(int argc, char** argv) {
     int  player_deadzone[PSX_MAX_PLAYERS];
     int  ctrl_locked_mode[PSX_MAX_PLAYERS];
     for (int i = 0; i < PSX_MAX_PLAYERS; ++i) {
-#if defined(PSX_DEBUG_TOOLS)
+        /* Android boots straight into the game (no PC launcher to assign the
+         * pad), so a "keyboard" default never opened a Bluetooth/USB gamepad:
+         * only buttons Android also reports as keys got through (8BitDo
+         * Ultimate 2C, 2026-10-09). "auto" = first connected controller,
+         * hotplugged; the touch pad is ANDed into port 1 independently. */
+#if defined(PSX_DEBUG_TOOLS) || defined(__ANDROID__)
         player_device[i] = (i == 0) ? "auto" : "none";
 #else
         player_device[i] = (i == 0) ? "keyboard" : "none";
@@ -15858,6 +15878,17 @@ int main(int argc, char** argv) {
     /* Widescreen/View mode is mod-owned on PSX. Clamp the generic display
      * aspect to native 4:3 so neither a legacy game.toml offer/default nor a
      * stale settings.toml value can engage it before trusted mod activation. */
+#if defined(__ANDROID__)
+    /* Android "stretch" (2026-10-09): the in-game menu's 16:9 choice, for titles
+     * without a widescreen mod, stretches the finished 4:3 picture to the wider
+     * shape at present time only. The game, the GTE and the frame stay 4:3
+     * (the clamp below still applies); see the present-aspect call further on.
+     * Read once at boot, so a change applies after restarting the game. */
+    if (!ws_offered && g_video_aspect_num * 3 > g_video_aspect_den * 4) {
+        g_android_stretch_num = g_video_aspect_num;
+        g_android_stretch_den = g_video_aspect_den;
+    }
+#endif
     if (!ws_offered && (g_video_aspect_num != 4 || g_video_aspect_den != 3)) {
         std::fprintf(stdout, "psxrecomp: widescreen is mod-owned on PSX; "
                      "clamping display aspect %d:%d -> 4:3\n",
@@ -17497,6 +17528,20 @@ session_reboot:
      * stretch), squash mode stretches the 4:3 frame into it. */
     gl_renderer_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
     vk_renderer_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
+#if defined(__ANDROID__)
+    /* Android stretch: only when nothing engaged real widescreen (a mod may
+     * have set a wide aspect since the clamp). Present-only; GTE untouched. */
+    if (g_android_stretch_num && g_video_aspect_num * 3 == g_video_aspect_den * 4) {
+        gl_renderer_set_display_aspect(g_android_stretch_num, g_android_stretch_den);
+        vk_renderer_set_display_aspect(g_android_stretch_num, g_android_stretch_den);
+        /* The present pins every frame to 4:3 while real widescreen is not
+         * engaged (fmv_frame = ... || !g_ws_engaged); this makes those pinned
+         * frames use the stretched aspect as well. */
+        gl_renderer_set_present_stretch(1);
+        std::fprintf(stdout, "psxrecomp: display stretched to %d:%d (4:3 game, present only)\n",
+                     g_android_stretch_num, g_android_stretch_den);
+    }
+#endif
     if (g_video_aspect_num * 3 != g_video_aspect_den * 4) {
         /* Hold widescreen off through the BIOS boot (authentic 4:3 logos);
          * the per-frame present path engages it at game entry. */
