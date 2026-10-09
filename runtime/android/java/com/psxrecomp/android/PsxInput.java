@@ -61,4 +61,13 @@ public final class PsxInput {
 
     /** PS1 Mouse button: 0 = left, 1 = right. */
     public static native void nativeMouseButton(int button, boolean down);
+
+    /** PS1 Mouse tap-to-point: (u, v) = spot in the game picture, 0..10000 each; scale1000 =
+     *  cursor units per game pixel (per mille); click = left click once there; recalibrate =
+     *  find the cursor first (pushed into the top-left corner). */
+    public static native void nativeMousePoint(int u, int v, int scale1000, boolean click, boolean recalibrate);
+
+    /** Where the game keeps its cursor (guest addresses of 16-bit X and Y) and the size of the
+     *  area it moves in: tap-to-point then steers by the real position. */
+    public static native void nativeMouseCursor(int xaddr, int yaddr, int width, int height);
 }

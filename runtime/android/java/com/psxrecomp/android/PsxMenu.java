@@ -112,6 +112,14 @@ final class PsxMenu {
             row(list, "Change disc…", () -> { close(); pad.changeDisc(); });
         row(list, "Restart game", this::confirmRestart);
 
+        if (pad.isMouseGame()) {
+            section(list, "Mouse");
+            toggle(list, "Tap to point",
+                    "On: touch where the cursor should go (tap = click there, drag = move it). "
+                    + "Off: drag anywhere like a laptop trackpad.",
+                    pad.isTapToPoint(), on -> pad.setTapToPoint(on));
+        }
+
         section(list, "Display");
         toggle(list, "FPS counter", "Movable: drag it in Edit pad layout", pad.isFpsOn(),
                 on -> pad.setFpsOn(on));

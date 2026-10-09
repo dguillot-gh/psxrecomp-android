@@ -150,6 +150,15 @@ public final class PadOverlay extends View {
     private int padFingers;
     private final float touchSlop;
     private int mouseHeld;   /* bit 0 left, bit 1 right, from the ACT / MOVE controls */
+    /* Tap to point (default on; menu > Mouse): the finger's spot in the game picture is
+     * sent as an absolute position (PsxInput.nativeMousePoint) instead of trackpad motion.
+     * Touch-down finds the cursor (recalibrates) and moves it there, a drag follows the
+     * finger, a quick tap clicks there. POINT_SCALE: cursor units per game pixel, from
+     * game.toml [controller] mouse_point_scale (1.0 unless a game's cursor runs faster). */
+    private static final String PREFS_TAP_POINT = "mouse_tap_point";
+    private boolean tapPoint;
+    private final int pointScale1000;
+    private final boolean pictureWide;   /* menu Aspect ratio 16:9 (stretched picture) */
     /* TOOLS index where the second toolbar row (Done) starts. Game actions and
      * display options live in the menu panel (PsxMenu). */
     private static final int GAME_TOOLS_FROM = 6;
@@ -174,6 +183,10 @@ public final class PadOverlay extends View {
         density = getResources().getDisplayMetrics().density;
         prefs = activity.getSharedPreferences(PREFS, Activity.MODE_PRIVATE);
         mouseMode = readMouseFlag(activity);
+        tapPoint = prefs.getBoolean(PREFS_TAP_POINT, true);
+        pointScale1000 = readPointScale(activity);
+        pictureWide = readWidePicture(activity);
+        if (mouseMode) sendCursorAddress(activity);
         touchSlop = ViewConfiguration.get(activity).getScaledTouchSlop();
         for (int i = 0; i < toolRects.length; i++) toolRects[i] = new RectF();
 
@@ -220,9 +233,68 @@ public final class PadOverlay extends View {
         }
     }
 
+    /** game.toml [controller] mouse_point_scale (cursor units per game pixel), per mille. */
+    private static int readPointScale(Activity activity) {
+        try (java.io.InputStream in = activity.getAssets().open("game.toml.in")) {
+            java.util.Scanner s = new java.util.Scanner(in, "UTF-8").useDelimiter("\\A");
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("(?m)^\\s*mouse_point_scale\\s*=\\s*([0-9.]+)").matcher(s.hasNext() ? s.next() : "");
+            if (m.find()) return Math.max(100, Math.min(8000, Math.round(Float.parseFloat(m.group(1)) * 1000)));
+        } catch (java.io.IOException | NumberFormatException e) { /* default below */ }
+        return 1000;
+    }
+
+    /** game.toml [controller] mouse_cursor = "0xXADDR,0xYADDR,W,H": where the game keeps its
+     *  cursor, found per game (Policenauts: 0x80068928,0x8006892A,320,240). Lets tap-to-point
+     *  steer by the real cursor instead of moving blind. */
+    private static void sendCursorAddress(Activity activity) {
+        try (java.io.InputStream in = activity.getAssets().open("game.toml.in")) {
+            java.util.Scanner s = new java.util.Scanner(in, "UTF-8").useDelimiter("\\A");
+            java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                    "(?m)^\\s*mouse_cursor\\s*=\\s*\"\\s*0x([0-9A-Fa-f]+)\\s*,\\s*0x([0-9A-Fa-f]+)\\s*,\\s*(\\d+)\\s*,\\s*(\\d+)\\s*\"")
+                    .matcher(s.hasNext() ? s.next() : "");
+            if (m.find()) {
+                PsxInput.nativeMouseCursor((int) Long.parseLong(m.group(1), 16), (int) Long.parseLong(m.group(2), 16),
+                        Integer.parseInt(m.group(3)), Integer.parseInt(m.group(4)));
+            }
+        } catch (java.io.IOException | NumberFormatException | UnsatisfiedLinkError e) { /* blind mode */ }
+    }
+
+    /** The menu's 16:9 choice stretches the picture to 16:9 (files/game.toml, read at start). */
+    private static boolean readWidePicture(Activity activity) {
+        try {
+            java.io.File f = new java.io.File(activity.getFilesDir(), "game.toml");
+            String s = new String(java.nio.file.Files.readAllBytes(f.toPath()), java.nio.charset.StandardCharsets.UTF_8);
+            return java.util.regex.Pattern.compile("(?m)^\\s*aspect_ratio\\s*=\\s*\"16:9\"").matcher(s).find();
+        } catch (java.io.IOException e) {
+            return false;
+        }
+    }
+
+    /** Tap to point: send the finger's spot in the game picture (letterboxed 4:3, or the
+     *  16:9 stretch) to the runtime, which moves the cursor there. */
+    private void pointAt(float x, float y, boolean click, boolean recalibrate) {
+        float w = getWidth(), h = getHeight();
+        if (w <= 0 || h <= 0) return;
+        float num = pictureWide ? 16f : 4f, den = pictureWide ? 9f : 3f;
+        float pw = w, ph = w * den / num;
+        if (ph > h) { ph = h; pw = h * num / den; }
+        float left = (w - pw) / 2f, top = (h - ph) / 2f;
+        int u = Math.round(Math.max(0f, Math.min(1f, (x - left) / pw)) * 10000f);
+        int v = Math.round(Math.max(0f, Math.min(1f, (y - top) / ph)) * 10000f);
+        PsxInput.nativeMousePoint(u, v, pointScale1000, click, recalibrate);
+    }
+
     private String toolLabel(int i) { return TOOLS[i]; }
 
     /* ---- used by the menu panel (PsxMenu) ------------------------------- */
+
+    boolean isMouseGame() { return mouseMode; }
+    boolean isTapToPoint() { return tapPoint; }
+    void setTapToPoint(boolean on) {
+        tapPoint = on;
+        prefs.edit().putBoolean(PREFS_TAP_POINT, on).apply();
+    }
 
     boolean isFpsOn() { return fpsOn; }
 
@@ -676,6 +748,7 @@ public final class PadOverlay extends View {
                     fracX = fracY = 0.0f;
                     padMoved = false;
                     padFingers = 1;
+                    if (tapPoint) pointAt(x, y, false, true);   /* the cursor jumps under the finger */
                 } else {
                     padFingers++;            /* a second trackpad finger: two-finger tap */
                 }
@@ -695,6 +768,9 @@ public final class PadOverlay extends View {
                      * moving it only past the touch slop, so taps click in place. */
                     if (padFingers > 1 || Math.hypot(x - padDownX, y - padDownY) <= touchSlop) break;
                     padMoved = true;
+                    if (tapPoint) pointAt(x, y, false, false);
+                } else if (tapPoint) {
+                    pointAt(x, y, false, false);         /* the cursor follows the finger */
                 } else {
                     float ddx = (x - padLastX) / density, ddy = (y - padLastY) / density;
                     float speed = (float) Math.hypot(ddx, ddy) / Math.max(1L, t - padLastTime);
@@ -728,8 +804,15 @@ public final class PadOverlay extends View {
                         padLastY = event.getY(next);
                         padLastTime = event.getEventTime();
                     } else {
-                        if (!padMoved && event.getEventTime() - padDownTime <= TAP_MAX_MS)
-                            mouseClick(padFingers >= 2 ? 1 : 0);
+                        if (!padMoved && event.getEventTime() - padDownTime <= TAP_MAX_MS) {
+                            if (tapPoint && padFingers < 2) {
+                                /* Click where the finger went down, once the cursor is there. */
+                                pointAt(padDownX, padDownY, true, false);
+                                performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
+                            } else {
+                                mouseClick(padFingers >= 2 ? 1 : 0);
+                            }
+                        }
                         padPointer = -1;
                     }
                 }

@@ -242,6 +242,9 @@ static void android_route_stdio_to_logcat(void) {
 
 static constexpr Sint32 kAndroidTouchMouseButtonEvent = 0x504D;
 static constexpr Sint32 kAndroidTouchMouseMotionEvent = 0x504E;
+/* Tap-to-point: data1 = u | v<<16 (position in the picture, 0..10000 each),
+ * data2 = scale (per mille) | click<<20 | recalibrate<<21. */
+static constexpr Sint32 kAndroidTouchMousePointEvent = 0x504F;
 static std::atomic<uint16_t> g_android_virtual_pad_buttons{0xFFFFu};
 /* Touch sticks: lx | ly<<8 | rx<<16 | ry<<24, all centred at rest. */
 static std::atomic<uint32_t> g_android_virtual_sticks{0x80808080u};
@@ -284,6 +287,59 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_psxrecomp_android_PsxInput_nativeMouseButton(JNIEnv *env, jclass cls, jint button, jboolean down)
 {
     Java_com_policenauts_recomp_PolicenautsActivity_nativeMouseButton(env, cls, button, down);
+}
+
+/* Tap-to-point from the overlay: (u, v) = where in the game picture the finger
+ * is, 0..10000 each; scale1000 = cursor units per game pixel (per mille). The
+ * emulator thread turns it into game pixels from the live display mode. */
+extern "C" JNIEXPORT void JNICALL
+Java_com_psxrecomp_android_PsxInput_nativeMousePoint(JNIEnv *, jclass, jint u, jint v,
+                                                     jint scale1000, jboolean click,
+                                                     jboolean recalibrate)
+{
+    if (u < 0) u = 0;
+    if (u > 10000) u = 10000;
+    if (v < 0) v = 0;
+    if (v > 10000) v = 10000;
+    if (scale1000 <= 0 || scale1000 > 0xFFFFF) scale1000 = 1000;
+    SDL_Event event{};
+    event.type = SDL_EVENT_USER;
+    event.user.code = kAndroidTouchMousePointEvent;
+    event.user.data1 = reinterpret_cast<void *>((intptr_t)((uint32_t)u | ((uint32_t)v << 16)));
+    event.user.data2 = reinterpret_cast<void *>((intptr_t)((uint32_t)scale1000 |
+        (click ? (1u << 20) : 0u) | (recalibrate ? (1u << 21) : 0u)));
+    (void)SDL_PushEvent(&event);
+}
+
+/* game.toml [controller] mouse_cursor = "xaddr,yaddr,width,height": where the game keeps
+ * its cursor and the size of the space it moves in. Set once by the overlay at start. */
+static std::atomic<int> g_android_mouse_area_w{0}, g_android_mouse_area_h{0};
+extern "C" JNIEXPORT void JNICALL
+Java_com_psxrecomp_android_PsxInput_nativeMouseCursor(JNIEnv *, jclass, jint xaddr, jint yaddr,
+                                                      jint width, jint height)
+{
+    sio_mouse_cursor_addr((uint32_t)xaddr, (uint32_t)yaddr);
+    g_android_mouse_area_w.store(width > 0 ? width : 0);
+    g_android_mouse_area_h.store(height > 0 ? height : 0);
+}
+
+/* Emulator thread: a tap-to-point event -> cursor coordinates (the configured cursor
+ * area, else the current display's pixels). */
+static void android_touch_mouse_point(const SDL_Event &ev) {
+    const uint32_t uv = (uint32_t)reinterpret_cast<intptr_t>(ev.user.data1);
+    const uint32_t f = (uint32_t)reinterpret_cast<intptr_t>(ev.user.data2);
+    const int u = (int)(uv & 0xFFFFu), v = (int)(uv >> 16);
+    const int scale = (int)(f & 0xFFFFFu);
+    GpuDisplayInfo di;
+    gpu_get_display_info(&di);
+    int w = di.width ? (int)di.width : 320, h = di.height ? (int)di.height : 240;
+    if (g_android_mouse_area_w.load() > 0 && g_android_mouse_area_h.load() > 0) {
+        w = g_android_mouse_area_w.load();
+        h = g_android_mouse_area_h.load();
+    }
+    const int x = (int)((int64_t)u * w * scale / 10000 / 1000);
+    const int y = (int)((int64_t)v * h * scale / 10000 / 1000);
+    sio_mouse_point(x, y, (f >> 20) & 1, (f >> 21) & 1);
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -7678,6 +7734,9 @@ static void rewind_host_pause_loop(void) {
                        ev.user.code == kAndroidTouchMouseMotionEvent) {
                 sio_set_mouse_motion((int)reinterpret_cast<intptr_t>(ev.user.data1),
                                      (int)reinterpret_cast<intptr_t>(ev.user.data2));
+            } else if (ev.type == SDL_EVENT_USER &&
+                       ev.user.code == kAndroidTouchMousePointEvent) {
+                android_touch_mouse_point(ev);
 #endif
 #else
             } else if (ev.type == SDL_MOUSEMOTION) {
@@ -7868,6 +7927,11 @@ static bool drain_host_events() {
                  ev.user.code == kAndroidTouchMouseMotionEvent) {
             sio_set_mouse_motion((int)reinterpret_cast<intptr_t>(ev.user.data1),
                                  (int)reinterpret_cast<intptr_t>(ev.user.data2));
+            continue;
+        }
+        else if (ev.type == SDL_EVENT_USER &&
+                 ev.user.code == kAndroidTouchMousePointEvent) {
+            android_touch_mouse_point(ev);
             continue;
         }
 #endif
