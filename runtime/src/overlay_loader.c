@@ -2135,7 +2135,46 @@ static void abi_preflight_sweep(const char *dir) {
 #endif
 }
 
+#if defined(__ANDROID__)
+/* Android housekeeping: an app keeps its overlay cache across APK updates, so the
+ * shards of every engine version it ever had piled up (2026-10-09: ~2.3 GB over
+ * 10 apps; Tomba 2 had 758 MB of dead d8b96482/6d3e857a shards). A tag dir whose
+ * CODEGEN HASH (cgNN_<hash>_...) differs from this build's can never load again,
+ * so remove it. Dirs with this build's hash are kept whatever their config hash or
+ * flavor. Desktop builds keep their caches (shared between builds on purpose). */
+#include <dirent.h>
+#include <ftw.h>
+static int purge_one(const char *p, const struct stat *sb, int flag, struct FTW *f) {
+    (void)sb; (void)flag; (void)f;
+    return remove(p);
+}
+static void purge_other_codegen_dirs(const char *tier_name) {
+    char parent[768];
+    snprintf(parent, sizeof(parent), "%s/%s/%s/%s",
+             s_cache_dir, s_game_id, tier_name, PSX_OVERLAY_ARCH_ABI);
+    DIR *d = opendir(parent);
+    if (!d) return;
+    char mine[16];
+    snprintf(mine, sizeof(mine), "_%08x_", (unsigned)PSX_OVERLAY_CODEGEN_HASH);
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (strncmp(e->d_name, "cg", 2) != 0) continue;
+        const char *us = strchr(e->d_name, '_');
+        if (!us || strncmp(us, mine, strlen(mine)) == 0) continue;
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/%s", parent, e->d_name);
+        if (nftw(path, purge_one, 16, FTW_DEPTH | FTW_PHYS) == 0)
+            fprintf(stderr, "psxrecomp: removed overlay code from another engine version: %s/%s\n",
+                    tier_name, e->d_name);
+    }
+    closedir(d);
+}
+#endif
+
 static void scan_tier_cache_dirs(const char *tier_name, int tier) {
+#if defined(__ANDROID__)
+    if (PSX_OVERLAY_CODEGEN_HASH != 0u) purge_other_codegen_dirs(tier_name);
+#endif
     char dir[768];
     snprintf(dir, sizeof(dir), "%s/%s/%s/%s/cg%d_%08x_gc%08x_f%u",
              s_cache_dir, s_game_id, tier_name, PSX_OVERLAY_ARCH_ABI,
