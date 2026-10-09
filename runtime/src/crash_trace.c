@@ -905,6 +905,8 @@ static int s_prev_saved = 0;
 #include <unwind.h>
 #include <dlfcn.h>
 #include <unistd.h>
+#include <string.h>
+#include <sys/ucontext.h>
 #include <android/log.h>
 static _Unwind_Reason_Code psx_unwind_frame(struct _Unwind_Context *ctx, void *arg) {
     int *n = (int *)arg;
@@ -927,6 +929,53 @@ static void psx_android_log_backtrace(int sig) {
     __android_log_print(ANDROID_LOG_ERROR, "psxcrash", "signal %d in thread %d; backtrace:",
                         sig, (int)gettid());
     _Unwind_Backtrace(psx_unwind_frame, &n);
+}
+
+/* _Unwind_Backtrace stops at the signal frame (it only showed the handler),
+ * so also walk the CRASHED context: pc/lr from the saved registers, then the
+ * frame-pointer chain (arm64 Android keeps frame pointers). Offsets are from
+ * the library's load base: symbolize with the NDK's llvm-symbolizer against
+ * the unstripped libmain.so in the game's android/app/build folder. */
+static void psx_log_pc(int n, const char *what, uintptr_t pc) {
+    Dl_info info;
+#if defined(__aarch64__)
+    /* Return addresses saved on the stack carry a pointer-authentication code
+     * in their top bits on PAC-enabled phones (Pixel 8): strip it (XPACLRI is
+     * a no-op hint on CPUs without PAC) or dladdr finds no library. */
+    {
+        register uintptr_t x30 __asm__("x30") = pc;
+        __asm__ volatile("xpaclri" : "+r"(x30));
+        pc = x30;
+    }
+#endif
+    if (pc && dladdr((void *)pc, &info) && info.dli_fname)
+        __android_log_print(ANDROID_LOG_ERROR, "psxcrash", "%s #%02d %s +0x%lx (%s)", what, n,
+                            info.dli_fname, (unsigned long)(pc - (uintptr_t)info.dli_fbase),
+                            info.dli_sname ? info.dli_sname : "?");
+    else
+        __android_log_print(ANDROID_LOG_ERROR, "psxcrash", "%s #%02d pc %p", what, n, (void *)pc);
+}
+static void psx_android_log_context(void *uctx) {
+#if defined(__aarch64__)
+    const ucontext_t *uc = (const ucontext_t *)uctx;
+    if (!uc) return;
+    uintptr_t pc = (uintptr_t)uc->uc_mcontext.pc;
+    uintptr_t lr = (uintptr_t)uc->uc_mcontext.regs[30];
+    uintptr_t fp = (uintptr_t)uc->uc_mcontext.regs[29];
+    int n = 0;
+    psx_log_pc(n++, "crashed", pc);
+    psx_log_pc(n++, "crashed", lr);
+    while (fp && (fp & 7) == 0 && n < 48) {
+        const uintptr_t *frame = (const uintptr_t *)fp;
+        uintptr_t next = frame[0], ret = frame[1];
+        if (!ret) break;
+        psx_log_pc(n++, "crashed", ret);
+        if (next <= fp || next - fp > (1u << 20)) break;   /* chain must climb the stack */
+        fp = next;
+    }
+#else
+    (void)uctx;
+#endif
 }
 #endif
 
@@ -998,6 +1047,15 @@ static void psx_atexit_handler(void) {
     psx_crash_trace_dump("atexit", NULL);
 }
 
+#if defined(__ANDROID__)
+/* SA_SIGINFO entry: log the crashed context's frames, then the usual path. */
+static void psx_signal_action(int sig, siginfo_t *si, void *uctx) {
+    (void)si;
+    psx_android_log_context(uctx);
+    psx_signal_handler(sig);
+}
+#endif
+
 void psx_crash_trace_install_handlers(void) {
 #ifndef _WIN32
     if (sigaction(SIGSEGV, NULL, &s_prev_sigsegv) == 0 &&
@@ -1012,6 +1070,17 @@ void psx_crash_trace_install_handlers(void) {
     signal(SIGUSR1, psx_soft_exit_handler);
 #endif
     signal(SIGABRT, psx_signal_handler);
+#if defined(__ANDROID__)
+    {   /* Same handler, but with the crashed thread's registers (see above). */
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_sigaction = psx_signal_action;
+        sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGSEGV, &sa, NULL);
+        sigaction(SIGABRT, &sa, NULL);
+    }
+#endif
 #ifdef _WIN32
     /* Let access violations reach the SEH filter with their faulting CONTEXT.
      * MinGW's SIGSEGV bridge discards EXCEPTION_POINTERS, reducing the report

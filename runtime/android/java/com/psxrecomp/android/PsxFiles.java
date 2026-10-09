@@ -67,6 +67,15 @@ final class PsxFiles {
         File files = context.getFilesDir();
         copyAsset(context, "bios/openbios.bin", new File(files, "bios/openbios.bin"));
         copyAsset(context, "bios/OpenBIOS.LICENSE", new File(files, "bios/OpenBIOS.LICENSE"));
+        /* A game that needs another BIOS (tools\build.ps1: android-bios.txt) has
+         * it bundled under assets/bios too; PsxGameActivity passes it with --bios. */
+        String[] extra = context.getAssets().list("bios");
+        if (extra != null) {
+            for (String name : extra) {
+                if (name.equals("openbios.bin") || name.equals("OpenBIOS.LICENSE")) continue;
+                copyAsset(context, "bios/" + name, new File(files, "bios/" + name));
+            }
+        }
     }
 
     /**

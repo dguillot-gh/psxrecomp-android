@@ -49,10 +49,36 @@ public class PsxGameActivity extends SDLActivity {
         // pick it: software unless the menu's Renderer choice wrote
         // [video] renderer = "opengl" into files/game.toml (OpenGL ES, experimental).
         File toml = new File(getFilesDir(), "game.toml");
+        File bios = wantedBios();
+        if (bios != null) {
+            return new String[] {
+                    "--game", toml.getAbsolutePath(),
+                    "--renderer", wantsGpu(toml) ? "opengl" : "software",
+                    "--bios", bios.getAbsolutePath()
+            };
+        }
         return new String[] {
                 "--game", toml.getAbsolutePath(),
                 "--renderer", wantsGpu(toml) ? "opengl" : "software"
         };
+    }
+
+    /* The runtime does not read game.toml's [bios] path, so a game built with
+     * another BIOS (tools\build.ps1: android-bios.txt, e.g. Mizzurna Falls'
+     * fan translation, which needs Sony's) gets it on the command line. Read
+     * from the APK's own assets/game.toml.in so it follows the installed build,
+     * not a files/game.toml written by an older one. null = the default OpenBIOS. */
+    private File wantedBios() {
+        try {
+            String s = PsxFiles.readAsset(this, "game.toml.in");
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("(?m)^\\s*path\\s*=\\s*\"(bios/[^\"]+)\"").matcher(s);
+            if (!m.find() || m.group(1).equals("bios/openbios.bin")) return null;
+            File f = new File(getFilesDir(), m.group(1));
+            return f.isFile() ? f : null;
+        } catch (IOException e) {
+            return null;
+        }
     }
 
     private static boolean wantsGpu(File toml) {
