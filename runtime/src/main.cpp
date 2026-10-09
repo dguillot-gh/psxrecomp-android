@@ -743,9 +743,18 @@ static void arm_text_image_guard(const std::string &exe_path,
                             tok += c; j++;
                             if (tok.size() > 64) break;
                         }
-                        const size_t s2 = tok.find_last_of("\\/");
-                        if (s2 != std::string::npos) tok = tok.substr(s2 + 1);
-                        if (!tok.empty() && iso.FindFile(tok, ent)) boot_name = tok;
+                        /* The boot EXE may sit in a folder (Policenauts:
+                         * BOOT = cdrom:\NAUTS\SLPS_002.15): try the full path first
+                         * (FindFile takes DIR\FILE), then the bare name in the root.
+                         * Stripping the folder left Policenauts' guard unarmed, so
+                         * native text dispatch ran conservatively (2026-10-09). */
+                        if (!tok.empty() && iso.FindFile(tok, ent)) {
+                            boot_name = tok;
+                        } else {
+                            const size_t s2 = tok.find_last_of("\\/");
+                            if (s2 != std::string::npos) tok = tok.substr(s2 + 1);
+                            if (!tok.empty() && iso.FindFile(tok, ent)) boot_name = tok;
+                        }
                     }
                 }
             }
