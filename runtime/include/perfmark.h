@@ -14,8 +14,13 @@
  *   pm_frame();                          once per emulated frame, on the thread that runs the frame loop
  *   pm_note("renderer", "compute 4x");  free-form facts, written as "# key=value" lines
  * Phases may be timed on any thread (sums are atomic); wall/cpu/core are those of the thread calling pm_frame().
- * The timer is the arm64 virtual counter (a register read, ~19.2 MHz on Snapdragon) so phases entered thousands of
- * times a frame stay cheap; elsewhere clock_gettime / QueryPerformanceCounter.
+ * The timer is the arm64 virtual counter; elsewhere clock_gettime / QueryPerformanceCounter. On the LG V30 a read of
+ * it costs ~121 ns (the kernel traps it: Cortex-A73 erratum 858921), so a timed phase costs ~250 ns per entry: fine for
+ * a few hundred entries a frame, not for thousands. For those, tag instead (one store each, no clock read):
+ *   pm_sampler_start();                 once after pm_open: a thread samples the tag ~2000 times a second
+ *   PM_TAG_BEGIN(PM_P4); ... PM_TAG_END(PM_P4);   the interval between two samples goes to the tag seen at its end
+ * Tagged phases are estimates per frame (~0.5 ms grain) and exact on average; name them "s_..." so reports say so.
+ * Tags are for the frame-loop thread only, and do not nest inside each other (an inner tag restores the outer one).
  * Nothing here changes what the game does: it only reads clocks and writes its own file. */
 #ifndef PERFMARK_H
 #define PERFMARK_H
@@ -33,8 +38,10 @@ enum { PM_C0, PM_C1, PM_C2, PM_C3 };
 extern int pm_on;     /* 1 while recording */
 extern int pm_trace;  /* 1 when coarse phases also go to ATrace */
 extern int pm_coarse[PM_MAX_PHASES];
+extern volatile int pm_tag;  /* the tagged phase the frame-loop thread is in now; -1: none */
 
 int  pm_open(const char* dir, const char* game);
+int  pm_sampler_start(void);
 void pm_phase(int id, const char* name, int coarse);
 void pm_add(int id, uint64_t ticks);
 void pm_count(int id, const char* name, double v);
@@ -63,6 +70,14 @@ uint64_t pm_now(void);
         if (pm_trace && pm_coarse[id]) pm_trace_end(); \
     } while (0)
 
+#define PM_TAG_BEGIN(id) \
+    const int pm_g_##id = pm_tag; \
+    if (pm_on) pm_tag = (id)
+#define PM_TAG_END(id) \
+    do { \
+        if (pm_on) pm_tag = pm_g_##id; \
+    } while (0)
+
 #ifdef __cplusplus
 }
 #endif
@@ -82,6 +97,7 @@ uint64_t pm_now(void);
 #endif
 #include <windows.h>
 #else
+#include <pthread.h>
 #include <unistd.h>
 #endif
 #if defined(__linux__) || defined(__ANDROID__)
@@ -97,6 +113,8 @@ extern "C" {
 
 int pm_on = 0;
 int pm_trace = 0;
+volatile int pm_tag = -1;
+static volatile int pm_sampling_ = 0;
 
 static FILE* pm_file_ = NULL;
 static uint64_t pm_freq_ = 1;  /* ticks per second of pm_now() */
@@ -269,10 +287,47 @@ void pm_frame(void) {
 
 void pm_close(void) {
     if (!pm_file_) return;
+    pm_sampling_ = 0;
     pm_on = 0;
     pm_trace = 0;
     fclose(pm_file_);
     pm_file_ = NULL;
+}
+
+/* (The tag sampler: every ~0.5 ms the time since the last sample goes to the tag the frame-loop thread shows now.) */
+static void pm_sampler_loop_(void) {
+    uint64_t last = pm_now();
+    while (pm_sampling_) {
+#if defined(_WIN32)
+        Sleep(1);
+#else
+        struct timespec ts = {0, 500000};
+        nanosleep(&ts, NULL);
+#endif
+        const int t = pm_tag;
+        const uint64_t now = pm_now();
+        if (t >= 0 && t < PM_MAX_PHASES) PM_ADD(&pm_acc_[t], now - last);
+        last = now;
+    }
+}
+#if defined(_WIN32)
+static DWORD WINAPI pm_sampler_main_(LPVOID arg) { (void)arg; pm_sampler_loop_(); return 0; }
+#else
+static void* pm_sampler_main_(void* arg) { (void)arg; pm_sampler_loop_(); return NULL; }
+#endif
+
+int pm_sampler_start(void) {
+    if (!pm_on || pm_sampling_) return pm_sampling_;
+    pm_sampling_ = 1;
+#if defined(_WIN32)
+    HANDLE h = CreateThread(NULL, 0, pm_sampler_main_, NULL, 0, NULL);
+    if (h) CloseHandle(h); else pm_sampling_ = 0;
+#else
+    pthread_t t;
+    if (pthread_create(&t, NULL, pm_sampler_main_, NULL) == 0) pthread_detach(t); else pm_sampling_ = 0;
+#endif
+    if (pm_file_) fprintf(pm_file_, "# sampler=%s\n", pm_sampling_ ? "2 kHz" : "failed to start: tagged phases stay 0");
+    return pm_sampling_;
 }
 
 #ifdef __cplusplus
