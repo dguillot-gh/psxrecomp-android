@@ -19,6 +19,7 @@
 #include "spu.h"
 #include "spu_gauss.h"
 #include "spu_shadow.h"
+#include "psx_perfmark.h"
 #include "audio_trace.h"
 #include "crc32.h"
 #include "psx_cycles.h"
@@ -983,7 +984,7 @@ void spu_init(void) {
     spu_shadow_reset();
 }
 
-void spu_render(int16_t* out_stereo, int frames) {
+static void spu_render_body(int16_t* out_stereo, int frames) {
     if (!out_stereo || frames <= 0) return;
 
     uint16_t ctrl = spu_regs[reg_index(0x1F801DAAu)];
@@ -1825,4 +1826,11 @@ void spu_snapshot_part_digests(SpuSnapPartDigests *out)
     crc = 0xFFFFFFFFu;
     crc = crc32_update(crc, buf + regs_n + voices_n, SPU_SNAPSHOT_TAIL_BYTES);
     out->tail = crc ^ 0xFFFFFFFFu;
+}
+
+/* perfmark (psx_perfmark.c): the SPU's mixing time, as its own phase. */
+void spu_render(int16_t* out_stereo, int frames) {
+    PSX_PM_BEGIN(PSX_PM_SPU);
+    spu_render_body(out_stereo, frames);
+    PSX_PM_END(PSX_PM_SPU);
 }

@@ -60,6 +60,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "../third_party/stb_image.h"
 #include "gpu_vk_renderer.h"
 #include "frame_pacing.h"
+#include "psx_perfmark.h"
 #include "latency_ring.h"
 #include "sio.h"
 #ifndef PSX_MAX_PLAYERS
@@ -14844,6 +14845,10 @@ int main(int argc, char** argv) {
     std::setvbuf(stderr, nullptr, _IOLBF, BUFSIZ);
     std::fprintf(stderr, "psxrecomp: main() entered\n");
     std::fflush(stderr);
+#ifdef PSX_PERFMARK
+    /* perfmark: per-frame phase times in ./perfmark.csv when ./perfmark exists (on Android: the files folder above). */
+    psx_perfmark_start("psx");
+#endif
 #if defined(RECOMP_LAUNCHER)
     launcher_boot_timing_mark("host:main_enter");
 #endif

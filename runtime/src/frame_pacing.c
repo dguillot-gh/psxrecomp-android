@@ -3,6 +3,7 @@
  * See frame_pacing.h for the Bug B history this replaces.
  */
 #include "frame_pacing.h"
+#include "psx_perfmark.h"
 
 /* FRAME_PACING_PURE_ONLY: tests compile only the SDL-free decision
  * function (tests/test_frame_pacing.c includes this file directly). */
@@ -43,7 +44,7 @@ uint32_t frame_pacing_sleep_ms(uint64_t now, uint64_t deadline,
  * sub-realtime workload into an unbounded catch-up burst. */
 #define FRAME_PACER_CATCHUP_MAX_PERIODS 12u
 
-void frame_pacer_wait(FramePacer *p, double period_ms) {
+static void frame_pacer_wait_body(FramePacer *p, double period_ms) {
     uint64_t freq = SDL_GetPerformanceFrequency();
     uint64_t period = (uint64_t)((double)freq * (period_ms / 1000.0));
     uint64_t now = SDL_GetPerformanceCounter();
@@ -73,5 +74,12 @@ void frame_pacer_wait(FramePacer *p, double period_ms) {
         /* final sub-ms spin */
     }
     p->next_deadline += period;
+}
+
+/* perfmark (psx_perfmark.c): the time the pacer waits out, as its own phase. */
+void frame_pacer_wait(FramePacer *p, double period_ms) {
+    PSX_PM_BEGIN(PSX_PM_PACE);
+    frame_pacer_wait_body(p, period_ms);
+    PSX_PM_END(PSX_PM_PACE);
 }
 #endif /* FRAME_PACING_PURE_ONLY */

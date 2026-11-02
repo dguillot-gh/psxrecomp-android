@@ -76,6 +76,7 @@
 #include "gpu.h"
 #include "gpu_render.h"
 #include "gl_scale_limits.h"
+#include "psx_perfmark.h"
 #include "gpu_sw_renderer.h"
 #include "gpu_gl_renderer.h"
 #include "gpu_hd_textures.h"
@@ -7732,7 +7733,7 @@ static void present_image_ring_capture_gl(void) {
 }
 #endif
 
-static void gl_swap_with_osd(void) {
+static void gl_swap_with_osd_body(void) {
     hr_release();   /* window target (tile-GPU pass fix) */
     openxr_present_native(); /* Copy guest content before host-only overlays. */
     s_native_surface_pending=0; /* Hold-last/resim cannot reuse a native source. */
@@ -8275,3 +8276,12 @@ static const GpuRenderBackend GL_BACKEND = {
 };
 
 const GpuRenderBackend *gl_backend_get(void) { return &GL_BACKEND; }
+
+/* perfmark (psx_perfmark.c): the present (OSD and the swap, where a vsync swap blocks) as its own phase; a frame's
+ * row ends here, at every present. */
+static void gl_swap_with_osd(void) {
+    PSX_PM_BEGIN(PSX_PM_PRESENT);
+    gl_swap_with_osd_body();
+    PSX_PM_END(PSX_PM_PRESENT);
+    PSX_PM_FRAME();
+}
