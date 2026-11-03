@@ -164,6 +164,7 @@ uint64_t psx_get_cycle_count(void);
 struct CPUState;
 void psx_idle_note_check(struct CPUState *cpu, uint32_t check_pc);
 int  psx_idle_skip_is_enabled(void);
+void psx_idle_diag_line(char *out, size_t n);   /* [IDLE] diagnostics since the last call */
 /* Cycles until the nearest IRQ-observable device event (mask-aware); the bound an idle skip may not cross. */
 uint32_t psx_idle_cycles_to_next_observable_event(void);
 extern int      g_idle_skip_enabled;

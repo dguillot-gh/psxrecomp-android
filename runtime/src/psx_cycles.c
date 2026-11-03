@@ -3,6 +3,7 @@
 #include "psx_cycles.h"
 #include "psx_cycle_freeze.h"
 #include "cpu_state.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #if defined(_MSC_VER)
@@ -468,6 +469,22 @@ static uint64_t s_idle_last_mmio = 0;
  * stop before the counter would hit -1, so the real exit branch still runs. */
 static uint32_t s_idle_mem_addr = 1, s_idle_mem_val = 0;
 static int      s_idle_mem_mode = -2;   /* -1 no store, 1 countdown store */
+/* A loop turn can pass several interrupt-check boundaries (FF7's VSync loop:
+ * 0x8003D04C and 0x8003D098 every turn), which used to reset the detector at
+ * every check. The detector now keeps its first PC as the anchor and ignores up
+ * to IDLE_OFF_ANCHOR_MAX other checks between anchor hits; quantum, stores and
+ * registers are then per whole turn. A skip then lands on the last anchor hit
+ * BEFORE the next event, and the real turns deliver the event at the exact
+ * check boundary. */
+enum { IDLE_OFF_ANCHOR_MAX = 4 };
+static uint32_t s_idle_off_anchor = 0;
+static int      s_idle_multi_pc = 0;    /* this anchor had other checks in its turns */
+/* Why the detector did not skip, per reason, since the last psx_idle_diag_line(). */
+enum { IDLE_D_CHECKS, IDLE_D_OFFANCHOR, IDLE_D_NEWPC, IDLE_D_STORE, IDLE_D_MMIO,
+       IDLE_D_REGS, IDLE_D_QUANT, IDLE_D_STREAK, IDLE_D_NEAR, IDLE_D_BOUND, IDLE_D_CAP,
+       IDLE_D_SKIP, IDLE_D_N };
+static uint32_t s_idle_diag[IDLE_D_N];
+static uint32_t s_idle_diag_pc = 0;     /* the anchor at the last full streak */
 
 /* Stores since the last check: -1 none; 1 one countdown store (see above);
  * 0 one main-RAM word store not yet comparable; -2 anything else. Records the
@@ -535,6 +552,15 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
         return;
     }
 
+    s_idle_diag[IDLE_D_CHECKS]++;
+    if (s_idle_pc != 0 && check_pc != s_idle_pc && s_idle_off_anchor < IDLE_OFF_ANCHOR_MAX) {
+        s_idle_off_anchor++;           /* another check boundary inside the same turn */
+        s_idle_diag[IDLE_D_OFFANCHOR]++;
+        return;
+    }
+    if (check_pc == s_idle_pc && s_idle_off_anchor) s_idle_multi_pc = 1;
+    s_idle_off_anchor = 0;
+
     uint64_t cyc = psx_cycle_count;
     const int store_kind = idle_store_kind();
     if (check_pc == s_idle_pc && s_idle_have_snap && (store_kind == -1 || store_kind == 1) &&
@@ -571,6 +597,7 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
                 s_idle_streak = 1;
             }
         } else {
+            s_idle_diag[progress_reg == -2 ? IDLE_D_REGS : IDLE_D_QUANT]++;
             s_idle_streak = 0;
             s_idle_quantum = 0;
             s_idle_progress_reg = -2;
@@ -591,6 +618,12 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
         s_idle_progress_reg = -2;
         s_idle_progress_delta = 0;
     } else {
+        if (check_pc != s_idle_pc) {
+            s_idle_diag[IDLE_D_NEWPC]++;
+            s_idle_multi_pc = 0;
+        } else {
+            s_idle_diag[store_kind == -2 ? IDLE_D_STORE : IDLE_D_MMIO]++;
+        }
         s_idle_pc = check_pc;
         s_idle_streak = 0;
         s_idle_quantum = 0;
@@ -602,24 +635,39 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
     s_idle_last_stores = g_guest_store_count;
     s_idle_last_mmio   = g_mmio_access_count;
 
-    if (s_idle_streak < IDLE_STREAK_MIN) return;
+    if (s_idle_streak < IDLE_STREAK_MIN) {
+        s_idle_diag[IDLE_D_STREAK]++;
+        return;
+    }
+    s_idle_diag_pc = check_pc;
     uint32_t q = s_idle_quantum;
     uint32_t dist = devices_cycles_to_next_idle_event();
-    if (dist <= q) return;               /* one real iteration reaches it */
-    uint32_t k = (dist + q - 1u) / q;    /* first check boundary >= event */
+    if (dist <= q) {                     /* one real iteration reaches it */
+        s_idle_diag[IDLE_D_NEAR]++;
+        return;
+    }
+    /* The first check boundary >= event; with checks inside the turn, the last
+     * anchor hit before it (the remaining turn delivers the event exactly). */
+    uint32_t k = s_idle_multi_pc ? (dist - 1u) / q : (dist + q - 1u) / q;
     if (s_idle_progress_reg > 0) {
         uint32_t value = cpu->gpr[s_idle_progress_reg];
         uint32_t max_k = value > 1u ? value - 1u : 0u;
         if (k > max_k) k = max_k;
-        if (k == 0) return;
     }
     if (s_idle_mem_mode == 1) {
         uint32_t max_k = s_idle_mem_val > 1u ? s_idle_mem_val - 1u : 0u;
         if (k > max_k) k = max_k;
-        if (k == 0) return;
+    }
+    if (k == 0) {
+        s_idle_diag[IDLE_D_BOUND]++;
+        return;
     }
     uint64_t skip = (uint64_t)k * q;
-    if (skip > IDLE_SKIP_MAX_CYCLES) return;
+    if (skip > IDLE_SKIP_MAX_CYCLES) {
+        s_idle_diag[IDLE_D_CAP]++;
+        return;
+    }
+    s_idle_diag[IDLE_D_SKIP]++;
     if (s_idle_progress_reg > 0)
         cpu->gpr[s_idle_progress_reg] -= k;
     if (s_idle_mem_mode == 1) {
@@ -644,6 +692,21 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
     s_idle_last_stores = g_guest_store_count;
     s_idle_last_mmio   = g_mmio_access_count;
 #endif
+}
+
+/* One line of idle-skip diagnostics since the last call (with the [FPS] log
+ * line): skips and skipped cycles, then why checks did not skip. */
+void psx_idle_diag_line(char *out, size_t n) {
+    static uint64_t last_cycles = 0;
+    const uint32_t *d = s_idle_diag;
+    snprintf(out, n, "[IDLE] skips %u cyc %llu | checks %u offanchor %u newpc %u store %u mmio %u "
+             "regs %u quant %u streak %u near %u bound %u cap %u | anchor %08X multi %d",
+             d[IDLE_D_SKIP], (unsigned long long)(g_idle_skip_cycles - last_cycles),
+             d[IDLE_D_CHECKS], d[IDLE_D_OFFANCHOR], d[IDLE_D_NEWPC], d[IDLE_D_STORE],
+             d[IDLE_D_MMIO], d[IDLE_D_REGS], d[IDLE_D_QUANT], d[IDLE_D_STREAK], d[IDLE_D_NEAR],
+             d[IDLE_D_BOUND], d[IDLE_D_CAP], (unsigned)s_idle_diag_pc, s_idle_multi_pc);
+    last_cycles = g_idle_skip_cycles;
+    memset(s_idle_diag, 0, sizeof s_idle_diag);
 }
 
 /* Save-state restore: psx_cycle_count was just overwritten from the snapshot, so

@@ -8232,6 +8232,11 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 std::fprintf(stderr, "[FPS] game: %.1f fps (%.2fx) | frames: %llu\n",
                              fps, speed, (unsigned long long)s_frame_count);
             }
+            if (psx_idle_skip_is_enabled()) {
+                char idle[320];
+                psx_idle_diag_line(idle, sizeof idle);
+                std::fprintf(stderr, "%s\n", idle);
+            }
             std::fflush(stderr);
             s_fps_last_time = now;
             s_fps_last_frame = s_frame_count;
