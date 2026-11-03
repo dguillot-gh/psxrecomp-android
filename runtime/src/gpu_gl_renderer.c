@@ -591,6 +591,17 @@ static GLuint        s_hr_tex = 0, s_hr_fbo = 0, s_hr_rb = 0;
 static GLuint        s_raw_tex = 0, s_raw_fbo = 0;
 /* CPU->VRAM upload staging (native RGBA8). */
 static GLuint        s_up_tex = 0;
+/* CPU->VRAM upload staging: each uploaded rect goes into its own small texture,
+ * re-specified with glTexImage2D at the rect's size, drawn with an offset.
+ * It used to go into s_up_tex (VRAM-sized, 2 MB) with glTexSubImage2D; as
+ * s_up_tex is also the HD placeholder bound by every textured draw, Adreno
+ * then "renamed" (allocated, zeroed, cache-flushed and copied) the whole 2 MB
+ * texture on every upload: 20% of FF7's game thread on the LG V30 at GPU 2x.
+ * A fresh small allocation per rect copies nothing. s_up_tex is no longer
+ * written after init. */
+#define UP_STAGE_POOL 8
+static GLuint        s_up_stage[UP_STAGE_POOL];
+static unsigned      s_up_stage_next = 0;
 /* copy_rect staging (hr-sized RGBA8). */
 static GLuint        s_scratch_tex = 0, s_scratch_fbo = 0;
 static int           s_scratch_w = 0, s_scratch_h = 0;
@@ -692,7 +703,7 @@ static DirtyRect s_pack_dirty;             /* hr FBO content not in raw mirror *
  * only area whose stencil can lag its alpha (deferred-stencil draws). Used at
  * S > 1 so a mask-check toggle rebuilds that rect, not the whole surface. */
 static DirtyRect s_stencil_stale;
-static void hiw_mirror_uploads(const DirtyRect *rects, int nrects);
+static void hiw_mirror_uploads(const DirtyRect *rects, const GLuint *stage, int nrects);
 
 /* CPU writes not yet in the FBO — an EXACT rect list, NOT a single union.
  *
@@ -1864,6 +1875,7 @@ static void flush_cpu_upload_impl(void) {
     hiw_flush_queue();   /* ...and their high-resolution-window replay */
     /* Snapshot + clear first (re-entrancy safe; up_add overflow calls back in). */
     DirtyRect rects[UP_RECTS_MAX];
+    GLuint stage[UP_RECTS_MAX];
     int nrects = s_up_nrects;
     memcpy(rects, s_up_rects, (size_t)nrects * sizeof(DirtyRect));
     s_up_nrects = 0;
@@ -1888,8 +1900,9 @@ static void flush_cpu_upload_impl(void) {
         }
         if (diag) s_rt_up_diag[3] += SDL_GetPerformanceCounter() - t0;
         t0 = diag ? SDL_GetPerformanceCounter() : 0;
-        glBindTexture(GL_TEXTURE_2D, s_up_tex);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, s_conv);
+        stage[i] = s_up_stage[s_up_stage_next++ % UP_STAGE_POOL];
+        glBindTexture(GL_TEXTURE_2D, stage[i]);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, s_conv);
 
         /* Raw mirror takes the CPU data directly — current for this rect, so no
          * pack is needed for uploaded content. */
@@ -1910,17 +1923,17 @@ static void flush_cpu_upload_impl(void) {
     glDisable(GL_BLEND);
     p_glUseProgram(s_blit_prog);
     p_glActiveTexture(PSXGL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, s_up_tex);
     p_glUniform1i(s_uBlitSrc, 0);
     p_glUniform1i(s_uBlitMaskset, 0);
     p_glUniform1i(s_uBlitSrcDiv, s_hr_scale);
-    p_glUniform2i(s_uBlitSrcOff, 0, 0);
     p_glBindVertexArray(s_blit_vao);
     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_blit_vbo);
     for (int i = 0; i < nrects; i++) {
         int x = rects[i].x0, y = rects[i].y0;
         int w = rects[i].x1 - rects[i].x0 + 1;
         int h = rects[i].y1 - rects[i].y0 + 1;
+        glBindTexture(GL_TEXTURE_2D, stage[i]);
+        p_glUniform2i(s_uBlitSrcOff, -x, -y);   /* staging texel = native VRAM - rect corner */
         glScissor(x * s_hr_scale, y * s_hr_scale, w * s_hr_scale, h * s_hr_scale);
         float fx0 = (float)x, fy0 = (float)y, fx1 = (float)(x + w), fy1 = (float)(y + h);
         float verts[6 * 2] = {
@@ -1932,7 +1945,7 @@ static void flush_cpu_upload_impl(void) {
         plain_stencil(1); p_glUniform1i(s_uBlitPass, 2); glDrawArrays(GL_TRIANGLES, 0, 6);
     }
     hr_end();
-    hiw_mirror_uploads(rects, nrects);
+    hiw_mirror_uploads(rects, stage, nrects);
     if (diag) s_rt_up_diag[5] += SDL_GetPerformanceCounter() - draw_t0;
 }
 
@@ -2185,9 +2198,10 @@ static void blit_quad_verts(int x, int y, int w, int h) {
     p_glBufferData(PSXGL_ARRAY_BUFFER, sizeof verts, verts, PSXGL_STREAM_DRAW);
 }
 
-/* CPU->VRAM uploads into the tiles: the same staged native texels (s_up_tex,
- * VRAM-aligned) drawn at S, texel = frag/S + tile origin. */
-static void hiw_mirror_uploads(const DirtyRect *rects, int nrects) {
+/* CPU->VRAM uploads into the tiles: the same staged native texels (one small
+ * staging texture per rect, origin at the rect's corner) drawn at S,
+ * texel = frag/S + tile origin - rect corner. */
+static void hiw_mirror_uploads(const DirtyRect *rects, const GLuint *stage, int nrects) {
     if (!hiw_on() || nrects <= 0) return;
     hiw_flush_queue();
     int S = s_out_scale;
@@ -2198,7 +2212,9 @@ static void hiw_mirror_uploads(const DirtyRect *rects, int nrects) {
             int x0 = rects[i].x0 > T->x0 ? rects[i].x0 : T->x0;
             int x1 = rects[i].x1 + 1 < T->x1 ? rects[i].x1 + 1 : T->x1;
             if (x1 <= x0) continue;
-            if (!any) { hiw_blit_begin(T, s_up_tex, S, T->x0, 0, 0); any = 1; }
+            if (any) hr_end();
+            hiw_blit_begin(T, stage[i], S, T->x0 - rects[i].x0, -rects[i].y0, 0);
+            any = 1;
             int y = rects[i].y0, h = rects[i].y1 - rects[i].y0 + 1;
             glScissor((x0 - T->x0) * S, y * S, (x1 - x0) * S, h * S);
             blit_quad_verts(x0, y, x1 - x0, h);
@@ -4742,6 +4758,8 @@ static int init_gpu_raster(void) {
     if (!s_conv) return 0;
 
     s_up_tex      = make_tex(GL_RGBA8, VRAM_W, VRAM_H, GL_RGBA, GL_UNSIGNED_BYTE);
+    for (int i = 0; i < UP_STAGE_POOL; i++)   /* re-specified per upload (flush_cpu_upload) */
+        s_up_stage[i] = make_tex(GL_RGBA8, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE);
     s_raw_tex     = make_tex(PSXGL_R16UI, VRAM_W, VRAM_H, PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT);
     /* Force the driver's first texture-upload allocation while the renderer is
      * initializing. NVIDIA otherwise defers it until the first MDEC frame,
