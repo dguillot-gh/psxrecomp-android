@@ -460,6 +460,33 @@ static int32_t  s_idle_progress_delta = 0;
 static uint64_t s_idle_last_cycle = 0;
 static uint64_t s_idle_last_stores = 0;
 static uint64_t s_idle_last_mmio = 0;
+/* Countdown-store gate: besides store-free loops, accept exactly one word store
+ * per turn to the same main-RAM word, each one 1 less than the last: a timeout
+ * counter kept in memory (PsyQ VSync(): `while (vsync_count < target) if
+ * (--timeout == -1) ...`, the timeout on the stack; FF7 spends 27-37% of its
+ * game thread there on the LG V30). Skipped turns apply the same decrements and
+ * stop before the counter would hit -1, so the real exit branch still runs. */
+static uint32_t s_idle_mem_addr = 1, s_idle_mem_val = 0;
+static int      s_idle_mem_mode = -2;   /* -1 no store, 1 countdown store */
+
+/* Stores since the last check: -1 none; 1 one countdown store (see above);
+ * 0 one main-RAM word store not yet comparable; -2 anything else. Records the
+ * store for the next comparison. */
+static int idle_store_kind(void) {
+    extern uint64_t g_guest_store_count;
+    extern uint32_t g_guest_last_store_addr, g_guest_last_store_val;
+    const uint64_t n = g_guest_store_count - s_idle_last_stores;
+    if (n == 0) return -1;
+    const uint32_t a = g_guest_last_store_addr, v = g_guest_last_store_val;
+    if (n != 1 || (a & 3u) != 0 || (a & 0x1FFFFFFFu) >= 0x00200000u) {
+        s_idle_mem_addr = 1;
+        return -2;
+    }
+    const int kind = (a == s_idle_mem_addr && v == s_idle_mem_val - 1u) ? 1 : 0;
+    s_idle_mem_addr = a;
+    s_idle_mem_val = v;
+    return kind;
+}
 
 static void idle_snapshot_regs(const CPUState *cpu) {
     for (int i = 1; i < 32; i++) s_idle_gpr[i] = cpu->gpr[i];
@@ -509,8 +536,8 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
     }
 
     uint64_t cyc = psx_cycle_count;
-    if (check_pc == s_idle_pc && s_idle_have_snap &&
-        g_guest_store_count == s_idle_last_stores &&
+    const int store_kind = idle_store_kind();
+    if (check_pc == s_idle_pc && s_idle_have_snap && (store_kind == -1 || store_kind == 1) &&
         g_mmio_access_count == s_idle_last_mmio) {
         int changed = -1, changed_count = 0;
         for (int i = 1; i < 32; i++) {
@@ -533,12 +560,14 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
         if (progress_reg != -2 && quantum > 0 && quantum <= IDLE_QUANTUM_MAX) {
             if (quantum == s_idle_quantum &&
                 progress_reg == s_idle_progress_reg &&
-                progress_delta == s_idle_progress_delta) {
+                progress_delta == s_idle_progress_delta &&
+                store_kind == s_idle_mem_mode) {
                 if (s_idle_streak < 1000000u) s_idle_streak++;
             } else {
                 s_idle_quantum = quantum;
                 s_idle_progress_reg = progress_reg;
                 s_idle_progress_delta = progress_delta;
+                s_idle_mem_mode = store_kind;
                 s_idle_streak = 1;
             }
         } else {
@@ -546,10 +575,10 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
             s_idle_quantum = 0;
             s_idle_progress_reg = -2;
             s_idle_progress_delta = 0;
+            s_idle_mem_mode = -2;
         }
         idle_snapshot_regs(cpu);
-    } else if (check_pc == s_idle_pc &&
-               g_guest_store_count == s_idle_last_stores &&
+    } else if (check_pc == s_idle_pc && store_kind != -2 &&
                g_mmio_access_count == s_idle_last_mmio) {
         /* Second consecutive observation of this PC with no stores/MMIO —
          * take the baseline snapshot; the next hit can compare. Defers the
@@ -584,11 +613,20 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
         if (k > max_k) k = max_k;
         if (k == 0) return;
     }
+    if (s_idle_mem_mode == 1) {
+        uint32_t max_k = s_idle_mem_val > 1u ? s_idle_mem_val - 1u : 0u;
+        if (k > max_k) k = max_k;
+        if (k == 0) return;
+    }
     uint64_t skip = (uint64_t)k * q;
     if (skip > IDLE_SKIP_MAX_CYCLES) return;
-
     if (s_idle_progress_reg > 0)
         cpu->gpr[s_idle_progress_reg] -= k;
+    if (s_idle_mem_mode == 1) {
+        s_idle_mem_val -= k;
+        extern void psx_host_write_word(uint32_t addr, uint32_t val);
+        psx_host_write_word(s_idle_mem_addr, s_idle_mem_val);
+    }
 
     g_idle_skip_count++;
     g_idle_skip_cycles += skip;
