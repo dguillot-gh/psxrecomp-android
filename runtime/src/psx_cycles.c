@@ -205,6 +205,12 @@ static uint32_t devices_cycles_to_next_idle_event(void) {
     return best;
 }
 
+/* dma.c's CPU-held linked-list walk: the distance to the next event of the
+ * other devices (dma.c excludes the list itself while it asks). */
+uint32_t psx_devices_cycles_to_next_internal_event(void) {
+    return devices_cycles_to_next_internal_event();
+}
+
 /* Test/diagnostic accessor for the idle-skip observation boundary above. */
 uint32_t psx_idle_cycles_to_next_observable_event(void) {
     return devices_cycles_to_next_idle_event();
