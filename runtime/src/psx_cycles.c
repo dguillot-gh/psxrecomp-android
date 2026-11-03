@@ -216,9 +216,11 @@ static void psx_devices_recompute_deadline(void) {
     psx_next_service_cycle = psx_cycle_count + (uint64_t)next;
 }
 
+static uint32_t s_svc_count = 0, s_svc_chunks = 0;   /* per [IDLE] line: service passes, catch-up chunks */
 void psx_devices_service_to_now(void) {
     if (g_psx_guest_time_frozen) { psx_cycle_freeze_tick(); return; }
     if (s_in_device_service) return;                 /* device code charged cycles: absorb */
+    s_svc_count++;
     if (g_plp_cycle_diag) g_plp_svc_calls++;
     g_psx_cycle_fast_limit = 0;
     s_in_device_service = 1;
@@ -249,6 +251,7 @@ void psx_devices_service_to_now(void) {
             }
             advance_devices(step);
             interrupts_service_scheduled_events();
+            s_svc_chunks++;
         }
         s_devices_synced_cycle = target;
     }
@@ -732,6 +735,15 @@ void psx_idle_diag_line(char *out, size_t n) {
     last_cycles = g_idle_skip_cycles;
     memset(s_idle_diag, 0, sizeof s_idle_diag);
     size_t used = strlen(out);
+    {
+        extern uint64_t g_spu_sample_enabled_queries;
+        static uint64_t last_spu_q = 0;
+        used += (size_t)snprintf(out + used, used < n ? n - used : 0, " | svc %u chunks %u spuq %llu",
+                                 s_svc_count, s_svc_chunks,
+                                 (unsigned long long)(g_spu_sample_enabled_queries - last_spu_q));
+        last_spu_q = g_spu_sample_enabled_queries;
+        s_svc_count = s_svc_chunks = 0;
+    }
     used += (size_t)snprintf(out + used, used < n ? n - used : 0, " | store_n %u @%08X | pcs",
                              s_idle_diag_store_n, (unsigned)s_idle_diag_store_addr);
     for (int i = 0; i < IDLE_DIAG_PCS && used < n; i++)
