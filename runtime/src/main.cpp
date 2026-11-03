@@ -26,6 +26,9 @@
 #include "psx_bios_backend.h"
 #include "psx_bios_module.h"
 #include "psx_cycles.h"
+/* psx_cycles.c: the [IDLE] diagnostics line. Declared here, not in psx_cycles.h,
+ * which is part of the codegen hash (a change there invalidates every AOT shard). */
+extern "C" void psx_idle_diag_line(char *out, size_t n);
 #include "starvation_ring.h"
 #include "load_accel.h"
 #include "savestate.h"
