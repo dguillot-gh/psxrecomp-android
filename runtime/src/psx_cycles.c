@@ -485,6 +485,23 @@ enum { IDLE_D_CHECKS, IDLE_D_OFFANCHOR, IDLE_D_NEWPC, IDLE_D_STORE, IDLE_D_MMIO,
        IDLE_D_SKIP, IDLE_D_N };
 static uint32_t s_idle_diag[IDLE_D_N];
 static uint32_t s_idle_diag_pc = 0;     /* the anchor at the last full streak */
+/* Detail for the diagnostics: the most frequent check PCs (anchor and others,
+ * a small count table) and the last turn rejected for its stores. */
+enum { IDLE_DIAG_PCS = 6 };
+static uint32_t s_idle_diag_pcs[IDLE_DIAG_PCS], s_idle_diag_pcn[IDLE_DIAG_PCS];
+static uint32_t s_idle_diag_store_n = 0, s_idle_diag_store_addr = 0;
+
+static void idle_diag_note_pc(uint32_t pc) {
+    int free_i = -1, min_i = 0;
+    for (int i = 0; i < IDLE_DIAG_PCS; i++) {
+        if (s_idle_diag_pcs[i] == pc) { s_idle_diag_pcn[i]++; return; }
+        if (!s_idle_diag_pcn[i] && free_i < 0) free_i = i;
+        if (s_idle_diag_pcn[i] < s_idle_diag_pcn[min_i]) min_i = i;
+    }
+    int i = free_i >= 0 ? free_i : min_i;   /* replace the rarest (approximate top-N) */
+    s_idle_diag_pcs[i] = pc;
+    s_idle_diag_pcn[i] = 1;
+}
 
 /* Stores since the last check: -1 none; 1 one countdown store (see above);
  * 0 one main-RAM word store not yet comparable; -2 anything else. Records the
@@ -553,6 +570,7 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
     }
 
     s_idle_diag[IDLE_D_CHECKS]++;
+    idle_diag_note_pc(check_pc);
     if (s_idle_pc != 0 && check_pc != s_idle_pc && s_idle_off_anchor < IDLE_OFF_ANCHOR_MAX) {
         s_idle_off_anchor++;           /* another check boundary inside the same turn */
         s_idle_diag[IDLE_D_OFFANCHOR]++;
@@ -621,8 +639,14 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
         if (check_pc != s_idle_pc) {
             s_idle_diag[IDLE_D_NEWPC]++;
             s_idle_multi_pc = 0;
+        } else if (store_kind == -2) {
+            extern uint64_t g_guest_store_count;
+            extern uint32_t g_guest_last_store_addr;
+            s_idle_diag[IDLE_D_STORE]++;
+            s_idle_diag_store_n = (uint32_t)(g_guest_store_count - s_idle_last_stores);
+            s_idle_diag_store_addr = g_guest_last_store_addr;
         } else {
-            s_idle_diag[store_kind == -2 ? IDLE_D_STORE : IDLE_D_MMIO]++;
+            s_idle_diag[IDLE_D_MMIO]++;
         }
         s_idle_pc = check_pc;
         s_idle_streak = 0;
@@ -707,6 +731,14 @@ void psx_idle_diag_line(char *out, size_t n) {
              d[IDLE_D_BOUND], d[IDLE_D_CAP], (unsigned)s_idle_diag_pc, s_idle_multi_pc);
     last_cycles = g_idle_skip_cycles;
     memset(s_idle_diag, 0, sizeof s_idle_diag);
+    size_t used = strlen(out);
+    used += (size_t)snprintf(out + used, used < n ? n - used : 0, " | store_n %u @%08X | pcs",
+                             s_idle_diag_store_n, (unsigned)s_idle_diag_store_addr);
+    for (int i = 0; i < IDLE_DIAG_PCS && used < n; i++)
+        if (s_idle_diag_pcn[i])
+            used += (size_t)snprintf(out + used, n - used, " %08X:%u",
+                                     (unsigned)s_idle_diag_pcs[i], s_idle_diag_pcn[i]);
+    memset(s_idle_diag_pcn, 0, sizeof s_idle_diag_pcn);
 }
 
 /* Save-state restore: psx_cycle_count was just overwritten from the snapshot, so

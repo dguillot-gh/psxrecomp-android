@@ -8236,7 +8236,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                              fps, speed, (unsigned long long)s_frame_count);
             }
             if (psx_idle_skip_is_enabled()) {
-                char idle[320];
+                char idle[512];
                 psx_idle_diag_line(idle, sizeof idle);
                 std::fprintf(stderr, "%s\n", idle);
             }
