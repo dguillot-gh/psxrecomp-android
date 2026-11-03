@@ -9202,7 +9202,12 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     {
         latency_ring_mark(LAT_SWAP_BEGIN);
         const Uint64 t0 = SDL_GetPerformanceCounter();
+        /* perfmark: the Software renderer's present, and its frame row (the GL
+         * renderer does both in gl_swap_with_osd). */
+        PSX_PM_BEGIN(PSX_PM_PRESENT);
         SDL_RenderPresent(sdl_renderer);
+        PSX_PM_END(PSX_PM_PRESENT);
+        PSX_PM_FRAME();
         const Uint64 t1 = SDL_GetPerformanceCounter();
         latency_ring_mark(LAT_SWAP_END);
         netplay_note_present();
