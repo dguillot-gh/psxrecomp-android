@@ -120,6 +120,31 @@
 #include <string.h>
 #include <stdatomic.h>
 #include "png_write.h"   /* png_write_rgb — present_shot readback */
+#if defined(__ANDROID__)
+/* OpenGL ES (Android): libGLESv2 exports none of these desktop entry points,
+ * which SDL_opengl.h still declares. glClearDepth is glClearDepthf there;
+ * glReadBuffer (ES 3.0) and glGetTexLevelParameteriv (ES 3.1) are looked up
+ * once at first use (a missing one is a no-op / reads 0). */
+static void psx_es_read_buffer(GLenum mode) {
+    static void (APIENTRY *fn)(GLenum) = NULL;
+    static int tried = 0;
+    if (!tried) { tried = 1; fn = (void (APIENTRY *)(GLenum))SDL_GL_GetProcAddress("glReadBuffer"); }
+    if (fn) fn(mode);
+}
+static void psx_es_get_tex_level_parameteriv(GLenum target, GLint level, GLenum pname, GLint *out) {
+    static void (APIENTRY *fn)(GLenum, GLint, GLenum, GLint *) = NULL;
+    static int tried = 0;
+    if (!tried) {
+        tried = 1;
+        fn = (void (APIENTRY *)(GLenum, GLint, GLenum, GLint *))SDL_GL_GetProcAddress("glGetTexLevelParameteriv");
+    }
+    if (fn) fn(target, level, pname, out); else if (out) *out = 0;
+}
+extern void APIENTRY glClearDepthf(GLfloat d);
+#define glReadBuffer(m) psx_es_read_buffer(m)
+#define glGetTexLevelParameteriv(t, l, p, o) psx_es_get_tex_level_parameteriv((t), (l), (p), (o))
+#define glClearDepth(d) glClearDepthf((GLfloat)(d))
+#endif
 static uint64_t s_fg_flips;   /* frame generation (below): game frames seen */
 
 #ifndef GL_BGRA
@@ -1578,11 +1603,7 @@ static void pres_record(int path, int dx, int dy, int w, int h,
      * we pass in are already bottom-origin GL window coords). */
     uint8_t px[3] = { 0, 0, 0 };
     if (probe_pixels && lw > 0 && lh > 0) {
-#if !defined(__ANDROID__)
         glReadBuffer(s_pt_on ? PSXGL_COLOR_ATTACHMENT0 : GL_BACK);
-#else
-        if (s_pt_on) glReadBuffer(PSXGL_COLOR_ATTACHMENT0);
-#endif
         glPixelStorei(GL_PACK_ALIGNMENT, 1);
         glReadPixels(lx + lw / 2, ly + lh / 2, 1, 1, GL_RGB, GL_UNSIGNED_BYTE, px);
         glPixelStorei(GL_PACK_ALIGNMENT, 4);
