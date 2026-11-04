@@ -676,8 +676,12 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
             const auto mode = toml::find<std::string>(video, "texture_filtering");
             if (mode == "nearest")       rt.video_texture_filter = 0;
             else if (mode == "bilinear") rt.video_texture_filter = 1;
+            /* "stable": the GL renderer filters proven 3D world geometry only;
+             * sprites and HUD keep point sampling, so pre-rendered backgrounds'
+             * cutout edges stay sharp (FF7 field: bilinear left green outlines). */
+            else if (mode == "stable")   rt.video_texture_filter = 2;
             else throw std::runtime_error(fmt::format(
-                "[video] texture_filtering must be \"nearest\" or \"bilinear\": {}", mode));
+                "[video] texture_filtering must be \"nearest\", \"bilinear\" or \"stable\": {}", mode));
         }
         if (video.contains("fmv_filter")) {
             const auto mode = toml::find<std::string>(video, "fmv_filter");
@@ -2673,6 +2677,7 @@ UserSettings load_user_settings(const fs::path& path) {
             const auto m = toml::find<std::string>(v, "texture_filtering");
             if (m == "nearest") { s.texture_filter = 0; s.has_texture_filter = true; }
             else if (m == "bilinear") { s.texture_filter = 1; s.has_texture_filter = true; }
+            else if (m == "stable") { s.texture_filter = 2; s.has_texture_filter = true; }
         });
         if (v.contains("fmv_filter")) try_get([&]{
             const auto m = toml::find<std::string>(v, "fmv_filter");

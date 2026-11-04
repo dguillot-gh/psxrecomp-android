@@ -179,9 +179,12 @@ final class PsxMenu {
         toggle(list, "Anti-aliased (smooth edges)",
                 "On: draw big, shrink back (soft). Off: keep the full size (sharp, like DuckStation's upscale).",
                 smooth, on -> setVideo("antialiasing", on ? "true" : "false"));
-        toggle(list, "Smooth textures", "Bilinear filtering instead of blocky pixels.",
-                "\"bilinear\"".equals(video.get("texture_filtering")),
-                on -> setVideo("texture_filtering", on ? "\"bilinear\"" : "\"nearest\""));
+        /* "stable": smooth 3D models, sharp 2D sprites/backgrounds (plain bilinear
+         * outlines pre-rendered backgrounds' cutouts, FF7 2026-11-04). */
+        toggle(list, "Smooth textures", "Smooth 3D textures; 2D backgrounds and sprites stay sharp.",
+                "\"bilinear\"".equals(video.get("texture_filtering"))
+                        || "\"stable\"".equals(video.get("texture_filtering")),
+                on -> setVideo("texture_filtering", on ? "\"stable\"" : "\"nearest\""));
         toggle(list, "Perspective-correct textures", "Fixes textures that warp on floors and walls.",
                 "true".equals(video.get("perspective_texturing")),
                 on -> setVideo("perspective_texturing", on ? "true" : "false"));
