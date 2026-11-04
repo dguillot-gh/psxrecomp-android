@@ -485,7 +485,7 @@ static int      s_idle_mem_mode = -2;   /* -1 no store, 1 countdown store */
  * registers are then per whole turn. A skip then lands on the last anchor hit
  * BEFORE the next event, and the real turns deliver the event at the exact
  * check boundary. */
-enum { IDLE_OFF_ANCHOR_MAX = 4 };
+enum { IDLE_OFF_ANCHOR_MAX = 32 };  /* FF7 movie frame wait 0x80035DC8: 5-16 checks per turn */
 static uint32_t s_idle_off_anchor = 0;
 static int      s_idle_multi_pc = 0;    /* this anchor had other checks in its turns */
 /* Why the detector did not skip, per reason, since the last psx_idle_diag_line(). */
