@@ -20,7 +20,17 @@
 #define gl_renderer_present_probe_reset(...) glt_sync([&]() { return gl_renderer_present_probe_reset(__VA_ARGS__); })
 #define gl_renderer_present_probe_take(...) glt_sync([&]() { return gl_renderer_present_probe_take(__VA_ARGS__); })
 #define gl_renderer_present_rect_dirty(...) glt_sync([&]() { return gl_renderer_present_rect_dirty(__VA_ARGS__); })
-#define gl_renderer_present_vram(...) glt_sync([&]() { return gl_renderer_present_vram(__VA_ARGS__); })
+/* Asynchronous: arguments are evaluated now and copied. The present also
+ * stays synchronous while the OSD or a host menu is showing (they are drawn
+ * from game-thread state during the swap). */
+#include "host_osd.h"
+#define gl_renderer_present_vram(a, b, c, d, e, f) do { \
+        const int a_ = (a), b_ = (b), c_ = (c), d_ = (d), e_ = (e), f_ = (f); \
+        if (host_osd_needs_present()) \
+            glt_sync([&]() { gl_renderer_present_vram(a_, b_, c_, d_, e_, f_); }); \
+        else \
+            glt_async([=]() { gl_renderer_present_vram(a_, b_, c_, d_, e_, f_); }, 1); \
+    } while (0)
 #define gl_renderer_present_wide_fbo(...) glt_sync([&]() { return gl_renderer_present_wide_fbo(__VA_ARGS__); })
 #define gl_renderer_restage_vram_after_savestate(...) glt_sync([&]() { return gl_renderer_restage_vram_after_savestate(__VA_ARGS__); })
 #define gl_renderer_runtime_diag(...) glt_sync([&]() { return gl_renderer_runtime_diag(__VA_ARGS__); })
@@ -31,7 +41,10 @@
 #define gl_renderer_set_interpolation(...) glt_sync([&]() { return gl_renderer_set_interpolation(__VA_ARGS__); })
 #define gl_renderer_set_interpolation_blend(...) glt_sync([&]() { return gl_renderer_set_interpolation_blend(__VA_ARGS__); })
 #define gl_renderer_set_interpolation_source(...) glt_sync([&]() { return gl_renderer_set_interpolation_source(__VA_ARGS__); })
-#define gl_renderer_set_interpolation_suspended(...) glt_sync([&]() { return gl_renderer_set_interpolation_suspended(__VA_ARGS__); })
+#define gl_renderer_set_interpolation_suspended(a) do { \
+        const int a_ = (a); \
+        glt_async([=]() { gl_renderer_set_interpolation_suspended(a_); }, 0); \
+    } while (0)
 #define gl_renderer_set_present_stretch(...) glt_sync([&]() { return gl_renderer_set_present_stretch(__VA_ARGS__); })
 #define gl_renderer_set_scanlines(...) glt_sync([&]() { return gl_renderer_set_scanlines(__VA_ARGS__); })
 #define gl_renderer_set_swap_interval(...) glt_sync([&]() { return gl_renderer_set_swap_interval(__VA_ARGS__); })

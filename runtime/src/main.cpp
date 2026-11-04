@@ -62,8 +62,8 @@ extern "C" void psx_event_step_conservative_env_init(void);
  * Android lifecycle code backs it up and restores it. */
 #include "gl_thread_route.h"
 #include "gpu_hd_textures.h"   /* gpu_hd_textures_active: gates the GL render thread */
-#define SDL_PumpEvents() (glt_handback(), SDL_PumpEvents())
-#define SDL_PollEvent(e) (glt_handback(), SDL_PollEvent(e))
+#define SDL_PumpEvents() (glt_pump_handback(), SDL_PumpEvents())
+#define SDL_PollEvent(e) (glt_pump_handback(), SDL_PollEvent(e))
 #include "render_pass.h"
 /* Declarations only: STB_IMAGE_IMPLEMENTATION lives in psx_window_icon.cpp. */
 #define STBI_NO_STDIO
@@ -8246,14 +8246,17 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
             }
             if (glt_active()) {
                 /* GL render thread per second: posted records, sync calls (game
-                 * thread waited), context handbacks (event pumps), full-ring waits. */
-                uint64_t t[4];
-                static uint64_t last_t[4];
+                 * thread waited), context handbacks, full-ring waits, async calls
+                 * (presents), waits on the two-frames-in-flight limit. */
+                uint64_t t[6];
+                static uint64_t last_t[6];
                 glt_stats(t);
-                std::fprintf(stderr, "[GLT] posts %llu syncs %llu handbacks %llu full %llu\n",
+                glt_stats2(t + 4);
+                std::fprintf(stderr, "[GLT] posts %llu syncs %llu handbacks %llu full %llu async %llu framewaits %llu\n",
                              (unsigned long long)(t[0] - last_t[0]), (unsigned long long)(t[1] - last_t[1]),
-                             (unsigned long long)(t[2] - last_t[2]), (unsigned long long)(t[3] - last_t[3]));
-                for (int i = 0; i < 4; i++) last_t[i] = t[i];
+                             (unsigned long long)(t[2] - last_t[2]), (unsigned long long)(t[3] - last_t[3]),
+                             (unsigned long long)(t[4] - last_t[4]), (unsigned long long)(t[5] - last_t[5]));
+                for (int i = 0; i < 6; i++) last_t[i] = t[i];
             }
             if (psx_idle_skip_is_enabled()) {
                 char idle[512];
