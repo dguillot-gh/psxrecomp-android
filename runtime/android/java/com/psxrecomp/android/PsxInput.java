@@ -56,6 +56,13 @@ public final class PsxInput {
     /** Game frames per second over the last second (0 while off or not measured yet). */
     public static native float nativeGameFps();
 
+    /** Display settings that change while the game runs (main.cpp android_apply_video_live). */
+    public static final int VIDEO_SCALE = 1, VIDEO_FILTER = 2, VIDEO_AA = 3, VIDEO_ASPECT = 4;
+    /** Post a live display change; false when it cannot apply live (restart instead). */
+    public static native boolean nativeSetVideoLive(int key, int value);
+    /** True when a posted live change could not be applied and waits for a restart. */
+    public static native boolean nativeVideoRestartNeeded();
+
     /** PS1 Mouse (games with game.toml [controller] mouse = true): relative motion in mouse counts. */
     public static native void nativeMouseMotion(int dx, int dy);
 

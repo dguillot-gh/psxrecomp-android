@@ -163,7 +163,7 @@ final class PsxMenu {
         {
             boolean wide = "\"16:9\"".equals(video.get("aspect_ratio"));
             list.addView(label("Aspect ratio", "16:9 stretches the picture to fill a wide screen "
-                    + "(everything looks a little wider). Restart the game to apply."));
+                    + "(everything looks a little wider)."));
             LinearLayout aspects = new LinearLayout(activity);
             String[][] choices = { { "4:3", "\"4:3\"" }, { "16:9", "\"16:9\"" } };
             for (int i = 0; i < choices.length; i++) {
@@ -188,8 +188,10 @@ final class PsxMenu {
         toggle(list, "Perspective-correct textures", "Fixes textures that warp on floors and walls.",
                 "true".equals(video.get("perspective_texturing")),
                 on -> setVideo("perspective_texturing", on ? "true" : "false"));
+        if (PsxInput.nativeVideoRestartNeeded()) videoChanged = true;
         TextView note = text(videoChanged ? "Changed: tap Restart game to apply (your place is kept)."
-                : "Display changes apply when the game restarts.", 13, videoChanged ? 0xFFFFD54F : 0xFF9090A0);
+                : "Resolution, aspect and smoothing apply right away; Renderer and perspective after a restart.",
+                13, videoChanged ? 0xFFFFD54F : 0xFF9090A0);
         note.setPadding(0, px(8), 0, 0);
         list.addView(note);
         if (videoChanged) row(list, "Restart game now", this::confirmRestart);
@@ -335,6 +337,29 @@ final class PsxMenu {
         return kv;
     }
 
+    /** Apply a [video] change in the running game when it can be; false = restart needed. */
+    private static boolean applyLive(String key, String value) {
+        try {
+            switch (key) {
+                case "supersampling":
+                    return PsxInput.nativeSetVideoLive(PsxInput.VIDEO_SCALE, Integer.parseInt(value.trim()));
+                case "texture_filtering": {
+                    int f = "\"stable\"".equals(value) ? 2 : "\"bilinear\"".equals(value) ? 1
+                          : "\"xbr\"".equals(value) ? 3 : 0;
+                    return PsxInput.nativeSetVideoLive(PsxInput.VIDEO_FILTER, f);
+                }
+                case "antialiasing":
+                    return PsxInput.nativeSetVideoLive(PsxInput.VIDEO_AA, "true".equals(value) ? 1 : 0);
+                case "aspect_ratio":
+                    return PsxInput.nativeSetVideoLive(PsxInput.VIDEO_ASPECT, "\"16:9\"".equals(value) ? 1 : 0);
+                default:
+                    return false;
+            }
+        } catch (NumberFormatException | UnsatisfiedLinkError e) {
+            return false;
+        }
+    }
+
     /** Set one [video] key (raw TOML value), keeping every other line as it was. */
     private void setVideo(String key, String value) {
         Map<String, String> kv = readVideo();
@@ -357,7 +382,10 @@ final class PsxMenu {
             File tmp = new File(gameToml().getPath() + ".tmp");
             write(tmp, out.toString());
             if (!tmp.renameTo(gameToml())) throw new IOException("rename failed");
-            videoChanged = true;
+            /* Resolution, texture filter, anti-aliasing and the 16:9 stretch apply
+             * while the game runs; everything else (or a live change the engine
+             * refuses) waits for Restart game. */
+            if (!applyLive(key, value)) videoChanged = true;
             if (root != null) root.post(this::refresh);
         } catch (IOException e) {
             new AlertDialog.Builder(activity).setMessage("Could not save the setting: " + e.getMessage())

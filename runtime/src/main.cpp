@@ -2177,6 +2177,7 @@ static int           g_android_stretch_den = 0;
 /* gpu_gl_renderer.c; declared here rather than in gpu_gl_renderer.h, which is
  * mirrored into overlay_toolchain/include for overlay builds. */
 extern "C" void (gl_renderer_set_present_stretch)(int on);   /* (name): see gl_thread_route.h */
+static void android_apply_video_live(void);   /* the display menu's live changes (below) */
 #endif
 /* [video] fov_scale — VR perspective multiplier on the GTE projection distance
  * H (1.0 = faithful). env PSX_GTE_FOV_SCALE overrides it. */
@@ -9984,6 +9985,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     android_apply_disc_swap();
     android_apply_state_request();
     android_apply_fps_request();
+    android_apply_video_live();
 #endif
     memcard_flush_settled();
     {
@@ -11296,6 +11298,76 @@ static int video_resolution_apply_live(int ir, int dynres, int ss_milli) {
     }
     return applied ? 1 : 0;
 }
+
+#if defined(__ANDROID__)
+/* ---- Android display menu: live changes ----------------------------------
+ * PsxMenu.setVideo writes files/game.toml (the next start reads it) and,
+ * for the settings that can change while the game runs, also calls
+ * nativeSetVideoLive. The UI thread only posts the value; the emulator
+ * thread applies it between frames (android_apply_video_live):
+ *   internal resolution  upstream's live scale change (GL renderer only);
+ *   texture filter, AA   the title look, re-resolved (host_look_apply_live);
+ *   16:9 stretch         the present aspect (present-only, GL).
+ * Renderer, render thread and perspective stay restart-only. Returns 0 when
+ * the change cannot apply live (the menu then asks for a restart). */
+enum { AVL_SCALE = 1, AVL_FILTER, AVL_AA, AVL_ASPECT, AVL_N };
+static std::atomic<int> g_android_video_live[AVL_N];   /* value + 1; 0 = none */
+static std::atomic<bool> g_android_video_restart{false};
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_psxrecomp_android_PsxInput_nativeSetVideoLive(JNIEnv *, jclass, jint key, jint value)
+{
+    if (key <= 0 || key >= AVL_N || value < 0) return JNI_FALSE;
+    if ((key == AVL_SCALE || key == AVL_ASPECT) && !g_gl_active) return JNI_FALSE;
+    /* A widescreen mod owns a non-4:3 aspect; the stretch only replaces 4:3. */
+    if (key == AVL_ASPECT && g_video_aspect_num * 3 != g_video_aspect_den * 4) return JNI_FALSE;
+    g_android_video_live[key].store(value + 1);
+    return JNI_TRUE;
+}
+
+/* 1 when a live change could not be applied and waits for a restart. */
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_psxrecomp_android_PsxInput_nativeVideoRestartNeeded(JNIEnv *, jclass)
+{
+    return g_android_video_restart.load() ? JNI_TRUE : JNI_FALSE;
+}
+
+static void android_apply_video_live(void)
+{
+    int v = g_android_video_live[AVL_SCALE].exchange(0);
+    if (v > 0) {
+        const int scale = v - 1 < 1 ? 1 : (v - 1 > 32 ? 32 : v - 1);
+        g_title_scale = scale;          /* Game default: the title's [video] supersampling */
+        char msg[48];
+        if (video_resolution_apply_live(PSX_IR_UNSET, 0, -1)) {
+            std::snprintf(msg, sizeof msg, "Resolution %dx", g_video_scale);
+        } else {
+            g_android_video_restart.store(true);
+            std::snprintf(msg, sizeof msg, "Resolution: restart the game to apply");
+        }
+        host_osd_push(msg, 1500);
+    }
+    bool look = false;
+    if ((v = g_android_video_live[AVL_FILTER].exchange(0)) > 0) {
+        g_title_look.texture_filter = v - 1;   /* PSX_TEXTURE_FILTER_* */
+        look = true;
+    }
+    if ((v = g_android_video_live[AVL_AA].exchange(0)) > 0) {
+        g_title_look.present_linear = v - 1 ? 1 : 0;
+        look = true;
+    }
+    if (look) host_look_apply_live();
+    if ((v = g_android_video_live[AVL_ASPECT].exchange(0)) > 0 && g_gl_active) {
+        const bool wide = v - 1 != 0;
+        g_android_stretch_num = wide ? 16 : 0;
+        g_android_stretch_den = wide ? 9 : 0;
+        if (wide) gl_renderer_set_display_aspect(16, 9);
+        else      gl_renderer_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
+        gl_renderer_set_present_stretch(wide ? 1 : 0);
+        std::fprintf(stdout, "psxrecomp: display %s (live)\n", wide ? "stretched to 16:9" : "4:3");
+    }
+}
+#endif
 
 extern "C" unsigned psx_video_apply_live(const PsxHostVideoSettings *next) {
     if (!next) return 0;
