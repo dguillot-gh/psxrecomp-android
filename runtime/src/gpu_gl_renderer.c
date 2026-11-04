@@ -713,7 +713,8 @@ static DirtyRect s_pack_dirty;             /* hr FBO content not in raw mirror *
  * only area whose stencil can lag its alpha (deferred-stencil draws). Used at
  * S > 1 so a mask-check toggle rebuilds that rect, not the whole surface. */
 static DirtyRect s_stencil_stale;
-static void hiw_mirror_uploads(const DirtyRect *rects, const GLuint *stage, int nrects);
+static void hiw_mirror_uploads(const DirtyRect *rects, const GLuint *stage, int nrects,
+                               const DirtyRect *origin);
 
 /* CPU writes not yet in the FBO — an EXACT rect list, NOT a single union.
  *
@@ -732,7 +733,7 @@ static void hiw_mirror_uploads(const DirtyRect *rects, const GLuint *stage, int 
  * (Pre-context, s_raster_ok == 0, the CPU array is fully authoritative — the
  * software rasterizer mirrors every draw — so union-merging is harmless and
  * used as the overflow strategy there.) */
-#define UP_RECTS_MAX 16
+#define UP_RECTS_MAX 64
 static DirtyRect s_up_rects[UP_RECTS_MAX];
 static int       s_up_nrects = 0;
 static uint64_t  s_rt_up_diag[6];
@@ -855,6 +856,36 @@ static void flush_cpu_upload(void);   /* fwd: overflow flushes then re-adds */
  * band (equal y-range with touching/overlapping x-ranges, or equal x-range
  * with touching/overlapping y-ranges — the row-scan / column-scan poke
  * patterns). Never unions disjoint rects post-init (that was the flicker bug). */
+/* Merge rect i with every other queued rect that joins it exactly (same row-
+ * band or column-band and touching, or contained), repeatedly: column strips
+ * become one rect, so a 24-bit movie frame uploaded in small blocks (FF7:
+ * ~4,000 rects/s) costs a few large uploads, not thousands of small ones.
+ * Only exact unions: never adds an uncovered pixel. Rect order does not
+ * matter (the flush reads every rect from the current CPU VRAM). */
+static void up_coalesce(int i) {
+    for (int changed = 1; changed;) {
+        changed = 0;
+        for (int j = 0; j < s_up_nrects; j++) {
+            if (j == i) continue;
+            DirtyRect *r = &s_up_rects[i], *o = &s_up_rects[j];
+            int join = (o->y0 == r->y0 && o->y1 == r->y1 && o->x0 <= r->x1 + 1 && o->x1 >= r->x0 - 1) ||
+                       (o->x0 == r->x0 && o->x1 == r->x1 && o->y0 <= r->y1 + 1 && o->y1 >= r->y0 - 1) ||
+                       (o->x0 >= r->x0 && o->x1 <= r->x1 && o->y0 >= r->y0 && o->y1 <= r->y1);
+            if (!join) continue;
+            if (o->x0 < r->x0) r->x0 = o->x0;
+            if (o->y0 < r->y0) r->y0 = o->y0;
+            if (o->x1 > r->x1) r->x1 = o->x1;
+            if (o->y1 > r->y1) r->y1 = o->y1;
+            int last = s_up_nrects - 1;
+            s_up_rects[j] = s_up_rects[last];
+            s_up_nrects = last;
+            if (i == last) i = j;
+            changed = 1;
+            break;
+        }
+    }
+}
+
 static void up_add(int x0, int y0, int x1, int y1) {
     if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
     if (x1 > VRAM_W - 1) x1 = VRAM_W - 1;
@@ -866,18 +897,21 @@ static void up_add(int x0, int y0, int x1, int y1) {
             return;                                   /* contained */
         if (x0 <= r->x0 && x1 >= r->x1 && y0 <= r->y0 && y1 >= r->y1) {
             r->x0 = x0; r->y0 = y0; r->x1 = x1; r->y1 = y1;  /* contains */
+            up_coalesce(i);
             return;
         }
         if (y0 == r->y0 && y1 == r->y1 &&
             x0 <= r->x1 + 1 && x1 >= r->x0 - 1) {     /* same row-band extension */
             if (x0 < r->x0) r->x0 = x0;
             if (x1 > r->x1) r->x1 = x1;
+            up_coalesce(i);
             return;
         }
         if (x0 == r->x0 && x1 == r->x1 &&
             y0 <= r->y1 + 1 && y1 >= r->y0 - 1) {     /* same column-band extension */
             if (y0 < r->y0) r->y0 = y0;
             if (y1 > r->y1) r->y1 = y1;
+            up_coalesce(i);
             return;
         }
     }
@@ -904,6 +938,7 @@ static void up_add(int x0, int y0, int x1, int y1) {
     }
     DirtyRect *r = &s_up_rects[s_up_nrects++];
     r->x0 = x0; r->y0 = y0; r->x1 = x1; r->y1 = y1; r->set = 1;
+    up_coalesce(s_up_nrects - 1);
 }
 
 /* Add a GP0(A0) transfer's exact touched region. The software reference wraps
@@ -1872,6 +1907,8 @@ static void hr_end(void) {
  * the CPU array immediately and accumulate s_up_rects. Flushing before the
  * next GPU op (or readback/present) preserves PS1 command order. */
 static void flush_cpu_upload_impl(void);
+static void flush_upload_rects(const DirtyRect *rects, int nrects, int diag);
+static void flush_upload_bbox(const DirtyRect *rects, int nrects, const DirtyRect *bb, int diag);
 static void flush_cpu_upload(void) {
     if (s_up_nrects) TC(TC_UPLOAD);
     flush_cpu_upload_impl();
@@ -1884,11 +1921,127 @@ static void flush_cpu_upload_impl(void) {
     flush_tex_batch();   /* queued textured draws before this upload writes VRAM */
     hiw_flush_queue();   /* ...and their high-resolution-window replay */
     /* Snapshot + clear first (re-entrancy safe; up_add overflow calls back in). */
-    DirtyRect rects[UP_RECTS_MAX];
-    GLuint stage[UP_RECTS_MAX];
-    int nrects = s_up_nrects;
-    memcpy(rects, s_up_rects, (size_t)nrects * sizeof(DirtyRect));
+    DirtyRect all[UP_RECTS_MAX];
+    int nall = s_up_nrects;
+    memcpy(all, s_up_rects, (size_t)nall * sizeof(DirtyRect));
     s_up_nrects = 0;
+    /* At most UP_STAGE_POOL rects per pass: every rect's staging texture must
+     * still hold ITS data when its quad is drawn below (the pool is reused
+     * modulo UP_STAGE_POOL; with more rects than textures in one pass, rect i
+     * was drawn from rect i+8's upload). */
+    if (nall >= 2) {
+        /* Many small rects (FF7's 24-bit startup screens and movies: ~4,000
+         * rects/s of ~640 px, not edge to edge): each costs two texture
+         * uploads with a large fixed driver cost on Adreno 5xx. Stage their
+         * bounding box ONCE and still paint only the exact rects from it,
+         * when the box is not much larger than the rects. */
+        int bx0 = all[0].x0, by0 = all[0].y0, bx1 = all[0].x1, by1 = all[0].y1;
+        long sum = 0;
+        for (int i = 0; i < nall; i++) {
+            if (all[i].x0 < bx0) bx0 = all[i].x0;
+            if (all[i].y0 < by0) by0 = all[i].y0;
+            if (all[i].x1 > bx1) bx1 = all[i].x1;
+            if (all[i].y1 > by1) by1 = all[i].y1;
+            sum += (long)(all[i].x1 - all[i].x0 + 1) * (all[i].y1 - all[i].y0 + 1);
+        }
+        long box = (long)(bx1 - bx0 + 1) * (by1 - by0 + 1);
+        if (box <= 4 * sum && box <= 512L * 512L) {
+            DirtyRect bb;
+            bb.x0 = bx0; bb.y0 = by0; bb.x1 = bx1; bb.y1 = by1; bb.set = 1;
+            flush_upload_bbox(all, nall, &bb, diag);
+            return;
+        }
+    }
+    for (int base = 0; base < nall; base += UP_STAGE_POOL) {
+        int nrects = nall - base < UP_STAGE_POOL ? nall - base : UP_STAGE_POOL;
+        flush_upload_rects(all + base, nrects, diag);
+    }
+}
+
+/* One staging upload of the bounding box bb (RGBA8 + raw R16UI), then every
+ * exact rect is raw-blitted and painted from it (see flush_cpu_upload_impl). */
+static void flush_upload_bbox(const DirtyRect *rects, int nrects, const DirtyRect *bb, int diag) {
+    const int bx = bb->x0, by = bb->y0;
+    const int bw = bb->x1 - bb->x0 + 1, bh = bb->y1 - bb->y0 + 1;
+    for (int i = 0; i < nrects; i++) {
+        coh_record(GL_COH_FLUSH, rects[i].x0, rects[i].y0, rects[i].x1, rects[i].y1);
+        if (diag) s_rt_up_diag[2] += (uint64_t)(rects[i].x1 - rects[i].x0 + 1) *
+                                     (uint64_t)(rects[i].y1 - rects[i].y0 + 1);
+    }
+    uint64_t t0 = diag ? SDL_GetPerformanceCounter() : 0;
+    for (int row = 0; row < bh; row++) {
+        const uint16_t *src = s_vram + (size_t)(by + row) * VRAM_W + bx;
+        uint32_t *dst = s_conv + (size_t)row * bw;
+        for (int col = 0; col < bw; col++) dst[col] = conv_1555_to_rgba8(src[col]);
+    }
+    if (diag) s_rt_up_diag[3] += SDL_GetPerformanceCounter() - t0;
+    t0 = diag ? SDL_GetPerformanceCounter() : 0;
+    GLuint st = s_up_stage[s_up_stage_next++ % UP_STAGE_POOL];
+    glBindTexture(GL_TEXTURE_2D, st);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, bw, bh, 0, GL_RGBA, GL_UNSIGNED_BYTE, s_conv);
+    GLuint raw_stage = s_raw_stage[(s_up_stage_next - 1u) % UP_STAGE_POOL];
+    glBindTexture(GL_TEXTURE_2D, raw_stage);
+    {
+        static uint16_t raw_rows[VRAM_W * VRAM_H];
+        for (int row = 0; row < bh; row++)
+            memcpy(raw_rows + (size_t)row * bw, s_vram + (size_t)(by + row) * VRAM_W + bx,
+                   (size_t)bw * sizeof(uint16_t));
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 2);
+        glTexImage2D(GL_TEXTURE_2D, 0, PSXGL_R16UI, bw, bh, 0,
+                     PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT, raw_rows);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    }
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_raw_stage_fbo);
+    p_glFramebufferTexture2D(PSXGL_READ_FRAMEBUFFER, PSXGL_COLOR_ATTACHMENT0,
+                             GL_TEXTURE_2D, raw_stage, 0);
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_raw_fbo);
+    glDisable(GL_SCISSOR_TEST);
+    for (int i = 0; i < nrects; i++) {
+        int x = rects[i].x0, y = rects[i].y0;
+        int w = rects[i].x1 - rects[i].x0 + 1, h = rects[i].y1 - rects[i].y0 + 1;
+        p_glBlitFramebuffer(x - bx, y - by, x - bx + w, y - by + h, x, y, x + w, y + h,
+                            GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    }
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+    if (diag) s_rt_up_diag[4] += SDL_GetPerformanceCounter() - t0;
+
+    uint64_t draw_t0 = diag ? SDL_GetPerformanceCounter() : 0;
+    hr_begin(0);
+    glDisable(GL_BLEND);
+    p_glUseProgram(s_blit_prog);
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    p_glUniform1i(s_uBlitSrc, 0);
+    p_glUniform1i(s_uBlitMaskset, 0);
+    p_glUniform1i(s_uBlitSrcDiv, s_hr_scale);
+    p_glBindVertexArray(s_blit_vao);
+    p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_blit_vbo);
+    glBindTexture(GL_TEXTURE_2D, st);
+    p_glUniform2i(s_uBlitSrcOff, -bx, -by);   /* staging texel = native VRAM - box corner */
+    for (int i = 0; i < nrects; i++) {
+        int x = rects[i].x0, y = rects[i].y0;
+        int w = rects[i].x1 - rects[i].x0 + 1, h = rects[i].y1 - rects[i].y0 + 1;
+        glScissor(x * s_hr_scale, y * s_hr_scale, w * s_hr_scale, h * s_hr_scale);
+        float fx0 = (float)x, fy0 = (float)y, fx1 = (float)(x + w), fy1 = (float)(y + h);
+        float verts[6 * 2] = {
+            fx0, fy0,  fx1, fy0,  fx0, fy1,
+            fx1, fy0,  fx0, fy1,  fx1, fy1,
+        };
+        p_glBufferData(PSXGL_ARRAY_BUFFER, sizeof verts, verts, PSXGL_STREAM_DRAW);
+        plain_stencil(0); p_glUniform1i(s_uBlitPass, 1); glDrawArrays(GL_TRIANGLES, 0, 6);
+        plain_stencil(1); p_glUniform1i(s_uBlitPass, 2); glDrawArrays(GL_TRIANGLES, 0, 6);
+    }
+    hr_end();
+    {
+        GLuint stages[UP_RECTS_MAX];
+        DirtyRect origins[UP_RECTS_MAX];
+        for (int i = 0; i < nrects; i++) { stages[i] = st; origins[i] = *bb; }
+        hiw_mirror_uploads(rects, stages, nrects, origins);
+    }
+    if (diag) s_rt_up_diag[5] += SDL_GetPerformanceCounter() - draw_t0;
+}
+
+static void flush_upload_rects(const DirtyRect *rects, int nrects, int diag) {
+    GLuint stage[UP_STAGE_POOL];
 
     /* Stage every rect's CPU data first (texture uploads outside the FBO
      * bracket), then draw all the quads in one bracket. Only the exact
@@ -1918,11 +2071,19 @@ static void flush_cpu_upload_impl(void) {
          * pack is needed for uploaded content. Staged, then blitted (above). */
         GLuint raw_stage = s_raw_stage[(s_up_stage_next - 1u) % UP_STAGE_POOL];
         glBindTexture(GL_TEXTURE_2D, raw_stage);
-        glPixelStorei(PSXGL_UNPACK_ROW_LENGTH, VRAM_W);
-        glTexImage2D(GL_TEXTURE_2D, 0, PSXGL_R16UI, w, h, 0,
-                     PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT,
-                     s_vram + (size_t)y * VRAM_W + x);
-        glPixelStorei(PSXGL_UNPACK_ROW_LENGTH, 0);
+        {   /* Contiguous copy first: a strided (UNPACK_ROW_LENGTH) integer upload
+             * sends the Adreno 5xx driver down its software tiling path
+             * (A5xBltDevice::GenTiledRowCol, ~55% of the render thread during
+             * FF7's 24-bit startup screens and movies). */
+            static uint16_t raw_rows[VRAM_W * VRAM_H];
+            for (int row = 0; row < h; row++)
+                memcpy(raw_rows + (size_t)row * w, s_vram + (size_t)(y + row) * VRAM_W + x,
+                       (size_t)w * sizeof(uint16_t));
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 2);
+            glTexImage2D(GL_TEXTURE_2D, 0, PSXGL_R16UI, w, h, 0,
+                         PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT, raw_rows);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        }
         p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_raw_stage_fbo);
         p_glFramebufferTexture2D(PSXGL_READ_FRAMEBUFFER, PSXGL_COLOR_ATTACHMENT0,
                                  GL_TEXTURE_2D, raw_stage, 0);
@@ -1981,7 +2142,7 @@ static void flush_cpu_upload_impl(void) {
         plain_stencil(1); p_glUniform1i(s_uBlitPass, 2); glDrawArrays(GL_TRIANGLES, 0, 6);
     }
     hr_end();
-    hiw_mirror_uploads(rects, stage, nrects);
+    hiw_mirror_uploads(rects, stage, nrects, rects);
     if (diag) s_rt_up_diag[5] += SDL_GetPerformanceCounter() - draw_t0;
 }
 
@@ -2237,7 +2398,10 @@ static void blit_quad_verts(int x, int y, int w, int h) {
 /* CPU->VRAM uploads into the tiles: the same staged native texels (one small
  * staging texture per rect, origin at the rect's corner) drawn at S,
  * texel = frag/S + tile origin - rect corner. */
-static void hiw_mirror_uploads(const DirtyRect *rects, const GLuint *stage, int nrects) {
+/* origin[i]: the VRAM corner held by stage[i]'s texel (0,0) (the rect itself,
+ * or a shared bounding box). */
+static void hiw_mirror_uploads(const DirtyRect *rects, const GLuint *stage, int nrects,
+                               const DirtyRect *origin) {
     if (!hiw_on() || nrects <= 0) return;
     hiw_flush_queue();
     int S = s_out_scale;
@@ -2249,7 +2413,7 @@ static void hiw_mirror_uploads(const DirtyRect *rects, const GLuint *stage, int 
             int x1 = rects[i].x1 + 1 < T->x1 ? rects[i].x1 + 1 : T->x1;
             if (x1 <= x0) continue;
             if (any) hr_end();
-            hiw_blit_begin(T, stage[i], S, T->x0 - rects[i].x0, -rects[i].y0, 0);
+            hiw_blit_begin(T, stage[i], S, T->x0 - origin[i].x0, -origin[i].y0, 0);
             any = 1;
             int y = rects[i].y0, h = rects[i].y1 - rects[i].y0 + 1;
             glScissor((x0 - T->x0) * S, y * S, (x1 - x0) * S, h * S);
