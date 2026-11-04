@@ -1939,8 +1939,7 @@ static void flush_cpu_upload_impl(void) {
                 for (int r = 0; r < h; r++)
                     for (int c = 0; c < w; c++)
                         if (got[r * w + c] != s_vram[(size_t)(y + r) * VRAM_W + x + c]) bad++;
-                fprintf(stdout, "psxrecomp: raw-blit check %d,%d %dx%d: %d of %d words differ (glerr %d)
-",
+                fprintf(stdout, "psxrecomp: raw-blit check %d,%d %dx%d: %d of %d words differ (glerr %d)\n",
                         x, y, w, h, bad, w * h, (int)glGetError());
             }
         }
