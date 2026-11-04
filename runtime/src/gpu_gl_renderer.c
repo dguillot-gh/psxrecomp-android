@@ -1925,6 +1925,25 @@ static void flush_cpu_upload_impl(void) {
         p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_raw_fbo);
         glDisable(GL_SCISSOR_TEST);
         p_glBlitFramebuffer(0, 0, w, h, x, y, x + w, y + h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        {   /* One-off self-check of the blit path: the first uploads after start
+             * are read back from the raw mirror and compared with the CPU VRAM. */
+            static int checks_left = 32;
+            static uint16_t got[64 * 64];
+            if (checks_left > 0 && w <= 64 && h <= 64) {
+                checks_left--;
+                p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_raw_fbo);
+                glPixelStorei(GL_PACK_ALIGNMENT, 2);
+                glReadPixels(x, y, w, h, PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT, got);
+                glPixelStorei(GL_PACK_ALIGNMENT, 4);
+                int bad = 0;
+                for (int r = 0; r < h; r++)
+                    for (int c = 0; c < w; c++)
+                        if (got[r * w + c] != s_vram[(size_t)(y + r) * VRAM_W + x + c]) bad++;
+                fprintf(stdout, "psxrecomp: raw-blit check %d,%d %dx%d: %d of %d words differ (glerr %d)
+",
+                        x, y, w, h, bad, w * h, (int)glGetError());
+            }
+        }
         p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
         if (diag) s_rt_up_diag[4] += SDL_GetPerformanceCounter() - t0;
     }
