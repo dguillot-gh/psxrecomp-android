@@ -602,6 +602,12 @@ static GLuint        s_up_tex = 0;
 #define UP_STAGE_POOL 8
 static GLuint        s_up_stage[UP_STAGE_POOL];
 static unsigned      s_up_stage_next = 0;
+/* The raw mirror (s_raw_tex, 1 MB, sampled by every textured draw) took the
+ * same uploads with glTexSubImage2D and was renamed the same way. Each rect now
+ * goes into a small R16UI staging texture and is blitted into s_raw_fbo: a GPU
+ * copy, ordered with the draws, which the driver does not rename. */
+static GLuint        s_raw_stage[UP_STAGE_POOL];
+static GLuint        s_raw_stage_fbo = 0;
 /* copy_rect staging (hr-sized RGBA8). */
 static GLuint        s_scratch_tex = 0, s_scratch_fbo = 0;
 static int           s_scratch_w = 0, s_scratch_h = 0;
@@ -1905,13 +1911,21 @@ static void flush_cpu_upload_impl(void) {
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, s_conv);
 
         /* Raw mirror takes the CPU data directly — current for this rect, so no
-         * pack is needed for uploaded content. */
-        glBindTexture(GL_TEXTURE_2D, s_raw_tex);
+         * pack is needed for uploaded content. Staged, then blitted (above). */
+        GLuint raw_stage = s_raw_stage[(s_up_stage_next - 1u) % UP_STAGE_POOL];
+        glBindTexture(GL_TEXTURE_2D, raw_stage);
         glPixelStorei(PSXGL_UNPACK_ROW_LENGTH, VRAM_W);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h,
-                        PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT,
-                        s_vram + (size_t)y * VRAM_W + x);
+        glTexImage2D(GL_TEXTURE_2D, 0, PSXGL_R16UI, w, h, 0,
+                     PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT,
+                     s_vram + (size_t)y * VRAM_W + x);
         glPixelStorei(PSXGL_UNPACK_ROW_LENGTH, 0);
+        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_raw_stage_fbo);
+        p_glFramebufferTexture2D(PSXGL_READ_FRAMEBUFFER, PSXGL_COLOR_ATTACHMENT0,
+                                 GL_TEXTURE_2D, raw_stage, 0);
+        p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_raw_fbo);
+        glDisable(GL_SCISSOR_TEST);
+        p_glBlitFramebuffer(0, 0, w, h, x, y, x + w, y + h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
         if (diag) s_rt_up_diag[4] += SDL_GetPerformanceCounter() - t0;
     }
 
@@ -4758,8 +4772,11 @@ static int init_gpu_raster(void) {
     if (!s_conv) return 0;
 
     s_up_tex      = make_tex(GL_RGBA8, VRAM_W, VRAM_H, GL_RGBA, GL_UNSIGNED_BYTE);
-    for (int i = 0; i < UP_STAGE_POOL; i++)   /* re-specified per upload (flush_cpu_upload) */
+    for (int i = 0; i < UP_STAGE_POOL; i++) { /* re-specified per upload (flush_cpu_upload) */
         s_up_stage[i] = make_tex(GL_RGBA8, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE);
+        s_raw_stage[i] = make_tex(PSXGL_R16UI, 1, 1, PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT);
+    }
+    p_glGenFramebuffers(1, &s_raw_stage_fbo);
     s_raw_tex     = make_tex(PSXGL_R16UI, VRAM_W, VRAM_H, PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT);
     /* Force the driver's first texture-upload allocation while the renderer is
      * initializing. NVIDIA otherwise defers it until the first MDEC frame,
