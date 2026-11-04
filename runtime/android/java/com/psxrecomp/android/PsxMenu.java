@@ -53,16 +53,44 @@ final class PsxMenu {
     private FrameLayout root;
     private ScrollView scroll;
     private boolean videoChanged;
+    /* Launcher mode (pad == null): the start menu's Settings dialog. Only the
+     * display settings, no game running: changes apply when the game starts. */
+    private final boolean launcher;
+    private AlertDialog dialog;
+    private LinearLayout dialogList;
 
     PsxMenu(Activity activity, PadOverlay pad) {
         this.activity = activity;
         this.pad = pad;
         this.dp = activity.getResources().getDisplayMetrics().density;
+        this.launcher = pad == null;
+    }
+
+    /** Start menu: the display settings as a dialog (files/game.toml must exist). */
+    void showSettings() {
+        if (!gameToml().exists()) {
+            new AlertDialog.Builder(activity)
+                    .setMessage("Pick the game file first: the settings are kept in the game's own configuration.")
+                    .setPositiveButton("OK", null)
+                    .show();
+            return;
+        }
+        scroll = new ScrollView(activity);
+        scroll.setBackgroundColor(0xFF181820);
+        dialogList = new LinearLayout(activity);
+        dialogList.setOrientation(LinearLayout.VERTICAL);
+        dialogList.setPadding(px(16), px(10), px(16), px(16));
+        scroll.addView(dialogList);
+        build(dialogList);
+        dialog = new AlertDialog.Builder(activity).setView(scroll).create();
+        dialog.setOnDismissListener(d -> { dialog = null; dialogList = null; });
+        dialog.show();
     }
 
     boolean isOpen() { return root != null; }
 
     void close() {
+        if (launcher) { if (dialog != null) dialog.dismiss(); return; }
         if (root == null) return;
         ((ViewGroup) root.getParent()).removeView(root);
         root = null;
@@ -100,7 +128,7 @@ final class PsxMenu {
     private void build(LinearLayout list) {
         LinearLayout head = new LinearLayout(activity);
         head.setGravity(Gravity.CENTER_VERTICAL);
-        TextView title = text("Menu", 22, Color.WHITE);
+        TextView title = text(launcher ? "Settings" : "Menu", 22, Color.WHITE);
         title.setTypeface(Typeface.DEFAULT_BOLD);
         head.addView(title, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
         TextView x = text("✕", 24, Color.WHITE);
@@ -109,6 +137,7 @@ final class PsxMenu {
         head.addView(x);
         list.addView(head);
 
+        if (!launcher) {
         section(list, "Game");
         row(list, "Save state…", () -> { close(); pad.stateSlots(false); });
         row(list, "Load state…", () -> { close(); pad.stateSlots(true); });
@@ -123,10 +152,12 @@ final class PsxMenu {
                     + "Off: drag anywhere like a laptop trackpad.",
                     pad.isTapToPoint(), on -> pad.setTapToPoint(on));
         }
+        }
 
         section(list, "Display");
-        toggle(list, "FPS counter", "Movable: drag it in Edit pad layout", pad.isFpsOn(),
-                on -> pad.setFpsOn(on));
+        if (!launcher)
+            toggle(list, "FPS counter", "Movable: drag it in Edit pad layout", pad.isFpsOn(),
+                    on -> pad.setFpsOn(on));
 
         Map<String, String> video = readVideo();
         boolean gpu = "\"opengl\"".equals(video.get("renderer"));
@@ -188,13 +219,15 @@ final class PsxMenu {
         toggle(list, "Perspective-correct textures", "Fixes textures that warp on floors and walls.",
                 "true".equals(video.get("perspective_texturing")),
                 on -> setVideo("perspective_texturing", on ? "true" : "false"));
-        if (PsxInput.nativeVideoRestartNeeded()) videoChanged = true;
-        TextView note = text(videoChanged ? "Changed: tap Restart game to apply (your place is kept)."
+        if (!launcher && restartNeededNative()) videoChanged = true;
+        TextView note = text(launcher ? "Applies when the game starts."
+                : videoChanged ? "Changed: tap Restart game to apply (your place is kept)."
                 : "Resolution, aspect and smoothing apply right away; Renderer and perspective after a restart.",
                 13, videoChanged ? 0xFFFFD54F : 0xFF9090A0);
         note.setPadding(0, px(8), 0, 0);
         list.addView(note);
-        if (videoChanged) row(list, "Restart game now", this::confirmRestart);
+        if (videoChanged && !launcher) row(list, "Restart game now", this::confirmRestart);
+        if (launcher) return;
 
         section(list, "Controls");
         row(list, "Edit pad layout…", () -> { close(); pad.startEditing(); });
@@ -203,6 +236,14 @@ final class PsxMenu {
 
     /* Rebuild the panel (new values, the restart note), keeping the scroll position. */
     private void refresh() {
+        if (launcher) {
+            if (dialogList == null) return;
+            final int y = scroll.getScrollY();
+            dialogList.removeAllViews();
+            build(dialogList);
+            scroll.post(() -> scroll.scrollTo(0, y));
+            return;
+        }
         final int y = scroll != null ? scroll.getScrollY() : 0;
         close();
         open();
@@ -337,6 +378,10 @@ final class PsxMenu {
         return kv;
     }
 
+    private static boolean restartNeededNative() {
+        try { return PsxInput.nativeVideoRestartNeeded(); } catch (UnsatisfiedLinkError e) { return false; }
+    }
+
     /** Apply a [video] change in the running game when it can be; false = restart needed. */
     private static boolean applyLive(String key, String value) {
         try {
@@ -385,8 +430,9 @@ final class PsxMenu {
             /* Resolution, texture filter, anti-aliasing and the 16:9 stretch apply
              * while the game runs; everything else (or a live change the engine
              * refuses) waits for Restart game. */
-            if (!applyLive(key, value)) videoChanged = true;
+            if (!launcher && !applyLive(key, value)) videoChanged = true;
             if (root != null) root.post(this::refresh);
+            else if (launcher && scroll != null) scroll.post(this::refresh);
         } catch (IOException e) {
             new AlertDialog.Builder(activity).setMessage("Could not save the setting: " + e.getMessage())
                     .setPositiveButton("OK", null).show();

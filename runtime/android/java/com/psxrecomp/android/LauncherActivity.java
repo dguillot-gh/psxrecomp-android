@@ -163,6 +163,11 @@ public class LauncherActivity extends Activity {
         importCard.setOnClickListener(v -> pickCard());
         root.addView(importCard, button(dp));
 
+        Button settings = new Button(this);
+        settings.setText("Settings");
+        settings.setOnClickListener(v -> new PsxMenu(this, null).showSettings());
+        root.addView(settings, button(dp));
+
         TextView hint = new TextView(this);
         hint.setText("Pick the .cue and its .bin together (long-press to select both), "
                 + "or a single .bin, .iso or .chd. Several discs: select every disc's .cue and .bin "
