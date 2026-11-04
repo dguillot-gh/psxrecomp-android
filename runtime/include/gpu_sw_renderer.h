@@ -12,6 +12,8 @@ extern "C" {
 
 /* Initialize software renderer */
 void sw_renderer_init(uint16_t* vram);
+/* Rebind the VRAM array only; draw state is kept. */
+void sw_renderer_rebind_vram(uint16_t* vram);
 
 /* Internal-resolution supersampling (SSAA).
  * scale == 1 : disabled, renderer behaves exactly as native VRAM only.
@@ -122,6 +124,8 @@ void sw_wide_set_target(int base_x);
 void sw_wide_disable_target(void);
 void sw_wide_clear(int base_x, int y, int h, uint16_t color);
 void sw_wide_clear_margins(int base_x, int y, int h, uint16_t color, int sides);
+void sw_wide_feedback_rect(int src_base, int src_x, int src_y, int dst_x, int dst_y,
+                           int w, int h, int r, int g, int b, int raw, int semi);
 /* MMX6 native-wide reveal-column tile: rasterize a 16x16 textured tile into the
  * wide surface ONLY (canonical VRAM + hi-res mirror untouched). See definition. */
 void sw_wide_emit_tile(int band_y, int x, int y, int u, int v,

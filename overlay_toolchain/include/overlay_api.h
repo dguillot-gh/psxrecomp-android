@@ -124,8 +124,11 @@
  *      entry hooks, guarded pre-instruction callback.
  * v30: the two lines merged. OverlayCallbacks keeps the master layout, which
  *      already holds every release-line callback; shards built against either
- *      v28 or v29 are rejected and recompiled. */
-#define PSX_OVERLAY_ABI_VERSION 30
+ *      v28 or v29 are rejected and recompiled.
+ * v31/v32: reserved for the experimental selector/adapter stack.
+ * v33: guarded load/store effective-address adapter on the master layout.
+ * v34: frozen, activation-only immediate selectors on the v33 layout. */
+#define PSX_OVERLAY_ABI_VERSION 34
 
 /* Process-lifetime overlay candidate capacity.  Every accepted manifest F
  * record consumes one slot, even when another DLL carries an identical
@@ -230,11 +233,14 @@ typedef struct OverlayCallbacks {
     /* Interrupt check with the guest PC that should resume if a game-installed
      * handler later RFEs to the sentinel outside the synchronous host window. */
     void (*check_interrupts_at)(CPUState *cpu, uint32_t resume_pc);
-    /* Guest-cycle accounting (ABI v7): block-cycle charge. Overlay code built
+    /* Guest-cycle accounting (ABI v7): the CPU charge. Overlay code built
      * with PSX_ENABLE_BLOCK_CYCLES must charge the SAME shared host cycle/timer
      * timeline as the dirty-RAM interpreter and the BIOS, or timer-sensitive
-     * code reads different values per backend (Tomba2 logo Timer1 fork). */
-    void (*advance_cycles)(uint32_t cycles);
+     * code reads different values per backend (Tomba2 logo Timer1 fork). The
+     * host binds its psx_cpu_charge (psx_cycles.h), so [timing]
+     * guest_cycle_scale applies to overlay code exactly as to native code.
+     * (Named advance_cycles before; same slot, same arguments.) */
+    void (*cpu_charge)(uint32_t cycles);
     /* GTE coprocessor 2 execution */
     void (*gte_execute)(CPUState *cpu, uint32_t cmd);
     /* MIPS syscall (break/syscall instructions). Returns 1 if control
@@ -384,6 +390,10 @@ typedef struct OverlayCallbacks {
     int32_t (*nclip_exact_sign)(int32_t native_mac0, uint32_t pc);
     /* Guarded pre-instruction mod callback (ABI v27). */
     void (*mod_instruction)(CPUState*, uint32_t, uint32_t);
+    /* Guarded load/store effective-address adapters (ABI v33). */
+    uint32_t (*mod_memory_address)(const CPUState*, uint32_t, uint32_t, uint32_t);
+    /* [[mod_immediate.sites]] selector of a group (ABI v34); NULL = stock. */
+    uint32_t (*mod_immediate_select)(uint32_t group);
 } OverlayCallbacks;
 
 #ifdef __cplusplus

@@ -27,6 +27,9 @@ extern uint64_t s_frame_count;
 #define MDEC_NEVER_DECODED ((uint64_t)0 - 1000u)
 static uint64_t mdec_last_color_decode_cycle = MDEC_NEVER_DECODED;
 
+/* Beetle OutFIFO depth: 0x20 words (MDEC_DMACanRead's block size). */
+#define MDEC_OUT_FIFO_BYTES (0x20u * 4u)
+
 enum {
     MDEC_CMD_NOP = 0,
     MDEC_CMD_DECODE = 1,
@@ -1061,7 +1064,18 @@ uint32_t mdec_read(uint32_t addr) {
     if (!write_ready) status |= 1u << 30;
     if (mdec.enable_dma_out && mdec_dma_read_ready()) status |= 1u << 27;
     if (mdec.enable_dma_in && write_ready) status |= 1u << 28;
-    if (mdec.busy) status |= 1u << 29;
+    /* Bit 29 is Beetle's InCommand (mdec.c MDEC_Read). The hardware decodes
+     * progressively and stalls while its 32-word OutFIFO is full, so a decode
+     * command stays in progress until all but the last FIFO-load of its output
+     * has been read. This model decodes a whole command at once, so derive that
+     * from the unread output instead of clearing the bit at execute time:
+     * libpress DecDCTin spins on this bit before issuing the next frame, and
+     * reporting ready early let Breath of Fire IV's player issue the next
+     * DecDCTin/DecDCTout while a column DMA was mid-transfer. DecDCTout's
+     * CHCR=0 restart then dropped the words already moved, misaligning every
+     * later column (vertical stripes + one-macroblock wrap in the FMV). */
+    if (mdec.busy || mdec.output_size - mdec.output_pos > MDEC_OUT_FIFO_BYTES)
+        status |= 1u << 29;
     if (mdec.output_pos >= mdec.output_size) status |= 1u << 31;
     mdec.last_status = status;
     return status;
@@ -1335,7 +1349,9 @@ int mdec_snapshot_validate(const uint8_t *p, uint32_t len) {
         mdec_wire_u32(p, 0u) != MDEC_SNAP_VER_V1) return 0;
     input_count = mdec_wire_u32(p, MDEC_SNAP_OFF_COUNTS);
     output_size = mdec_wire_u32(p, MDEC_SNAP_OFF_COUNTS + 4u);
-    if (input_count > MDEC_SNAP_INPUT_MAX || output_size > MDEC_SNAP_OUTPUT_MAX)
+    if (input_count > MDEC_SNAP_INPUT_MAX ||
+        mdec_wire_u32(p, 8u) > MDEC_SNAP_INPUT_MAX || /* expected_halfwords */
+        output_size > MDEC_SNAP_OUTPUT_MAX)
         return 0;
     if (mdec_wire_u32(p, MDEC_SNAP_OFF_OUTPUT_POS) > output_size) return 0;
     return (uint64_t)len - mdec_snap_fixed_bytes() >=
@@ -1391,7 +1407,11 @@ int mdec_snapshot_read(const uint8_t *p, uint32_t len) {
     if ((size_t)(r.end - r.p) <
         (size_t)input_count * 2u + (size_t)output_size)
         return 0;
-    if (!ensure_input_capacity(input_count ? input_count : 1u)) return 0;
+    /* Continued MMIO/DMA writes fill the complete command, not just the
+     * prefix already present when the snapshot was saved. */
+    uint32_t input_capacity = input_count > mdec.expected_halfwords
+                            ? input_count : mdec.expected_halfwords;
+    if (!ensure_input_capacity(input_capacity ? input_capacity : 1u)) return 0;
     if (!ensure_output_capacity(output_size ? output_size : 1u)) return 0;
     mdec.input_count = input_count;
     mdec.output_size = output_size;

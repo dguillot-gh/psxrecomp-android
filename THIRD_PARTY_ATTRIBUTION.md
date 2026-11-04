@@ -1,5 +1,13 @@
 # Third-Party Attribution
 
+## json11 — native translation catalogs
+
+[json11](https://github.com/dropbox/json11), Copyright (c) 2013 Dropbox, Inc.,
+is licensed **MIT**. The vendored sources in `runtime/third_party/json11/`
+parse native text catalogs. A direct `<cstdint>` include supplies the integer
+types required by current compilers. The license is also staged through
+`runtime/licenses/json11-LICENSE.txt` for every linked runtime release.
+
 ## OpenBIOS — PCSX-Redux's free PS1 BIOS
 
 [OpenBIOS](https://github.com/grumpycoders/pcsx-redux) (src/mips/openbios) by
@@ -43,6 +51,50 @@ compiled in statically, so its notice and the source location ship with any
 netplay binary: `runtime/licenses/libjuice-NOTICES.txt`. MPL-2.0 is file-level
 copyleft: a change to a libjuice file must be published under MPL-2.0. The build
 changes none.
+
+## libwebp - static texture-image decoder
+
+[libwebp 1.6.0](https://chromium.googlesource.com/webm/libwebp/+/refs/tags/v1.6.0)
+by Google Inc. and WebM contributors is licensed **BSD-3-Clause**. The runtime
+builds only its static decoder, without command-line tools, the encoder, or a
+libwebp DLL. The dependency is unmodified and pinned to commit
+`4fa21912338357f89e4fd51cf2368325b59e9bd9`, with immutable archive SHA-256
+`923f3382a47a2af185c3240c954cf004428b237bd7317413a95146d01eb4b94b` in
+`third_party/deps.manifest`. Its original COPYING, PATENTS, and AUTHORS texts
+ship in `runtime/licenses/libwebp-NOTICES.txt`, which release packagers carry
+into `licenses/`. Developers can use the verified archive or an explicit
+`FETCHCONTENT_SOURCE_DIR_PSX_LIBWEBP` / `PSX_LIBWEBP_SOURCE_DIR` source override.
+PNG and JPEG continue to use the existing shared stb_image implementation.
+
+## xBR — edge-directed texture filter (Hyllian)
+
+The `texture_filtering = "xbr"` mode in `runtime/src/gpu_gl_renderer.c`
+(`xbr_d`, `xbr_sample`) follows Hyllian's xBR algorithm: its 5x5 neighbourhood,
+YUV-weighted colour distance and the `4*d(H,F)` / `4*d(E,I)` edge sums. It is
+an adaptation (CLUT texel fetches, primitive UV clamping, an anti-aliased corner
+cut), not a copy of a shader file, but it derives from that work, licensed MIT:
+
+```
+Copyright (C) 2011-2016 Hyllian - sergiogdb@gmail.com
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+```
 
 ## Vendored libraries
 

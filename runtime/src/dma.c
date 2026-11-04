@@ -9,7 +9,7 @@
  * request-mode transfers are advanced from the guest cycle clock so games
  * which synchronize video decode through DMA busy/request state see realistic
  * backpressure.
- * Reference: nocash PSX specs, DuckStation src/core/dma.cpp
+ * Reference: PSX-SPX, page dmachannels (DMA Channels).
  */
 
 #include "dma.h"
@@ -17,6 +17,7 @@
 #include "crash_trace.h"
 #include "dirty_ram_interp.h"
 #include "dma_gpu_ll.h"
+#include "dma_host_draw.h"
 #include "gpu.h"
 #include "mdec.h"
 #include "mod_memory.h"
@@ -94,6 +95,24 @@ static uint32_t ll_cycles_to_event(void) {
     uint32_t d = dma_gpu_ll_cycles_to_event(&gpu_linked_list);
     return d > UINT32_MAX - s_ll_ahead ? UINT32_MAX : d + s_ll_ahead;
 }
+static DMAHostDrawRange s_host_draw[2];
+static const uint8_t *s_host_draw_view[2];
+static uint64_t s_host_draw_nodes,s_host_draw_words;
+int psx_mod_set_host_gpu_draw_range(unsigned slot,uint32_t start,uint32_t bytes) {
+    extern int psx_mod_host_output_scope(void);
+    extern int psx_mod_gpu_dma_memory_contains(uint32_t,uint32_t);
+    extern const uint8_t *psx_mod_gpu_dma_read_view(uint32_t,uint32_t);
+    if(slot>=2 || start>=0xC0000000u || psx_mod_host_output_scope())return 0;
+    if(bytes && ((start&3u) || (bytes&3u) || !psx_mod_gpu_dma_memory_contains(start,bytes)))return 0;
+    const uint8_t *view=bytes?psx_mod_gpu_dma_read_view(start,bytes):NULL;
+    if(bytes && !view)return 0;
+    s_host_draw[slot].start=start&0x00FFFFFFu;s_host_draw[slot].bytes=bytes;s_host_draw_view[slot]=view;
+    return 1;
+}
+void dma_debug_host_draw(uint64_t *nodes,uint64_t *words) {
+    if(nodes)*nodes=s_host_draw_nodes;
+    if(words)*words=s_host_draw_words;
+}
 static DMAGpuOtStats gpu_ot_stats;
 static uint64_t gpu_ot_start_cycle;
 static uint32_t gpu_ot_polls_this_walk;
@@ -131,6 +150,12 @@ void     cd_dma_log_get_entry(uint32_t idx, int *lba, uint32_t *dest, uint32_t *
 
 #define DMA_MDEC_IN_CYCLES_PER_WORD   1u
 #define DMA_MDEC_OUT_CYCLES_PER_WORD 14u
+/* The maintained reference publishes each word. The selected media-job TU
+ * uses one output-FIFO-sized job; it does not change the word budget, data
+ * path, RAM observers, final completion or another device's deadlines. */
+#ifndef PSX_MDEC_WORDS_PER_JOB
+#define PSX_MDEC_WORDS_PER_JOB 1u
+#endif
 #define DMA_GPU_CYCLES_PER_WORD       1u
 #define DMA_CDROM_CYCLES_PER_WORD     1u
 /* SPU DMA (ch4) per-word cost. Faithful to the Beetle/mednafen oracle, which
@@ -635,7 +660,13 @@ static void advance_mdec_channel(int ch, uint32_t cycles) {
     }
 
     uint32_t words_budget = a->cycles_accum / cycles_per_word;
+#if PSX_MDEC_WORDS_PER_JOB > 1
+    const uint32_t job_words = a->remaining_words < PSX_MDEC_WORDS_PER_JOB
+                             ? a->remaining_words : PSX_MDEC_WORDS_PER_JOB;
+    if (words_budget < job_words) return;
+#else
     if (words_budget == 0) return;
+#endif
 
     uint32_t addr = DMA_RAM_ADDR(channels[ch].madr);
     uint32_t moved = 0;
@@ -760,6 +791,13 @@ static uint32_t gpu_ll_resolve_address(void *opaque, uint32_t address) {
 
 static uint32_t gpu_ll_read_word(void *opaque, uint32_t address) {
     (void)opaque;
+    for(unsigned i=0;i<2;++i) {
+        if(s_host_draw_view[i] && address>=s_host_draw[i].start &&
+           address-s_host_draw[i].start<=s_host_draw[i].bytes-4u) {
+            const uint8_t*p=s_host_draw_view[i]+address-s_host_draw[i].start;
+            return p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24;
+        }
+    }
     return psx_read_word(address);
 }
 
@@ -880,6 +918,11 @@ static void hold_cpu_for_gpu_linked_list(void) {
     while (gpu_linked_list.active && ((channels[2].chcr >> 24) & 1u) &&
            channel_enabled(2)) {
         const uint32_t moved = gpu_linked_list.total_words;
+        if((s_host_draw[0].bytes || s_host_draw[1].bytes) &&
+           dma_host_draw_drain(&gpu_linked_list,s_host_draw,&gpu_ll_ops,NULL)) {
+            ++s_host_draw_nodes;s_host_draw_words+=gpu_linked_list.total_words-moved;
+            continue;
+        }
         s_ll_exclude = 1;
         const uint32_t other = psx_devices_cycles_to_next_internal_event();
         s_ll_exclude = 0;
@@ -1234,10 +1277,10 @@ uint32_t dma_cycles_to_irq(uint32_t i_mask) {
 uint32_t dma_cycles_to_internal_event(void) {
     uint32_t best = 0xFFFFFFFFu;
 
-    /* Async MDEC channels move one word whenever their cycle accumulator
-     * reaches the channel cost. Completion-only scheduling batches many RAM
-     * writes at a later service boundary, which is observably different when
-     * the CPU polls the destination buffer. */
+    /* MDEC's selected publication boundary: one word in REFERENCE, a bounded
+     * FIFO-sized job in ENHANCED. The tail keeps its original completion
+     * deadline; this is not completion-only scheduling of a whole frame.
+     * CPU polls can observe a partial destination up to one job later. */
     for (int ch = 0; ch < 2; ch++) {
         const DMAAsyncChannel *a = &mdec_async[ch];
         if (!a->active || a->remaining_words == 0 ||
@@ -1251,7 +1294,14 @@ uint32_t dma_cycles_to_internal_event(void) {
             continue;
         uint32_t cpw = ch == 0 ? DMA_MDEC_IN_CYCLES_PER_WORD
                                : DMA_MDEC_OUT_CYCLES_PER_WORD;
+#if PSX_MDEC_WORDS_PER_JOB > 1
+        const uint32_t words = a->remaining_words < PSX_MDEC_WORDS_PER_JOB
+                             ? a->remaining_words : PSX_MDEC_WORDS_PER_JOB;
+        const uint32_t cost = words * cpw;
+        uint32_t d = a->cycles_accum < cost ? cost - a->cycles_accum : 1u;
+#else
         uint32_t d = a->cycles_accum < cpw ? cpw - a->cycles_accum : 1u;
+#endif
         if (d < best) best = d;
     }
 
@@ -1393,6 +1443,8 @@ void dma_advance(uint32_t cycles) {
 }
 
 void dma_init(void) {
+    memset(s_host_draw,0,sizeof(s_host_draw));
+    memset(s_host_draw_view,0,sizeof(s_host_draw_view));
     memset(channels, 0, sizeof(channels));
     memset(mdec_async, 0, sizeof(mdec_async));
     memset(&cdrom_async, 0, sizeof(cdrom_async));

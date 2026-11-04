@@ -84,6 +84,15 @@ typedef struct {
  * port=0 uses the default (4370). */
 void debug_server_init(int port);
 
+/* The launcher mod requests the listener before session startup. Release
+ * defaults off; PSX_DEBUG_SERVER=0/1 explicitly overrides the mod/build default.
+ * Reset the mod request before activating each new session's plugins. */
+void debug_server_request(int enabled);
+int debug_server_requested(void);
+/* Reconcile listener policy after every session's mod activation. Keeps an
+ * enabled listener, starts a newly enabled one, and closes a disabled one. */
+void debug_server_apply_request(int port);
+
 /* Current listener status for heartbeat diagnostics. error is the platform
  * socket error captured by init, or 0 when the listener is active. */
 void debug_server_get_status(int *listening, int *port, int *error);
@@ -198,11 +207,28 @@ void debug_server_check_watchpoints(void);
 /* Returns >= 0 if the debug server wants to override pad input,
  * -1 if no override is active. Value is PS1 16-bit button mask. */
 int debug_server_get_input_override(void);
+/* Port-2 override word (set_input/press "port":2), or -1. */
+int debug_server_get_input_override_port2(void);
 
 /* Optional analog-stick override set alongside set_input (lx/ly/rx/ry,
  * 0..255, 0x80 = centre). Returns 1 and fills st[lx,ly,rx,ry] when armed,
  * 0 when the injection is buttons-only. */
 int debug_server_get_axis_override(unsigned char st[4]);
+
+/* Optional debug-only emulated controller identity set by set_input/press:
+ * -1 follows normal device selection; otherwise 0=digital, 1=DualShock,
+ * 2=JogCon. */
+int debug_server_get_pad_type_override(void);
+/* set_input/press connected: -1 leaves device selection unchanged; 0/1
+ * unplug/plug the serial endpoint for that injected sample. */
+int debug_server_get_pad_connected_override(int slot);
+
+/* Host-pad layer (set_input {"layer":"host", buttons, lx..ry, lt, rt}): a
+ * virtual P1 gamepad feeding the normal offline input path and host shortcut
+ * polling. Returns 1 while armed (until clear_input) and fills the PSX
+ * active-low word, sticks and trigger values (0..255). */
+int debug_server_get_host_pad(uint16_t *buttons, uint8_t st[4], uint8_t *lt,
+                              uint8_t *rt);
 
 /* TCP-controlled turbo mode. When enabled the frontend skips presentation and
  * wall-clock pacing at vblank, matching the keyboard TAB turbo path. */

@@ -157,6 +157,17 @@ p2_mode = "digital"
               controller_defaults_config.runtime.default_p2_mode ==
                   PSXRecompV4::PAD_MODE_DIGITAL,
           "parser preserves per-game controller device defaults");
+    check(!controller_defaults_config.runtime.has_multitap_default,
+          "offline multitap keeps the framework default when unset");
+
+    const auto no_multitap = write_config(root, "no-multitap", R"toml(
+[controller]
+multitap = false
+)toml");
+    const auto no_multitap_config = PSXRecompV4::load_game_config(no_multitap);
+    check(no_multitap_config.runtime.has_multitap_default &&
+              !no_multitap_config.runtime.multitap_default,
+          "parser preserves a title's offline multitap default");
 
     const auto netplay_viewport = write_config(root, "netplay-viewport", R"toml(
 [runtime]
@@ -425,7 +436,7 @@ expected = "0x24420155"
                  "expected must be ADDI/ADDIU rt,zero,imm",
                  "parser rejects non-constant terrain-angle instructions");
 
-    const auto aspect_cone = write_config(root, "aspect-cone", R"toml(
+    const std::string aspect_tables = R"toml(
 [widescreen.cull.aspect_cone]
 forward_addr = "0x1F8000E8"
 object_type_offset = 12
@@ -452,7 +463,8 @@ x_reg = 19
 z_reg = 18
 y_reg = 17
 queue_guard = false
-)toml");
+)toml";
+    const auto aspect_cone = write_config(root, "aspect-cone", aspect_tables);
     const auto aspect_config =
         PSXRecompV4::load_game_config(aspect_cone);
     check(aspect_config.ws_aspect_cone.sites.size() == 2 &&
@@ -473,6 +485,8 @@ queue_guard = false
               !aspect_config.ws_aspect_cone.sites[1].queue_guard &&
               aspect_config.ws_aspect_cone.forward_addr ==
                   0x1F8000E8u &&
+              aspect_config.ws_aspect_cone.forward_offsets ==
+                  std::array<uint32_t, 3>{0u, 2u, 4u} &&
               aspect_config.ws_aspect_cone.object_reg == 19u &&
               aspect_config.ws_aspect_cone.x_reg == 16u &&
               aspect_config.ws_aspect_cone.z_reg == 17u &&
@@ -485,6 +499,22 @@ queue_guard = false
 
     const auto aspect_hash = PSXRecompV4::overlay_codegen_config_hash(
         aspect_config);
+    auto axis_tables = aspect_tables;
+    axis_tables.insert(axis_tables.find("forward_addr"),
+                       "forward_offsets = [0, 4, 2]\n");
+    const auto axis_config = PSXRecompV4::load_game_config(
+        write_config(root, "aspect-cone-axis-order", axis_tables));
+    check(axis_config.ws_aspect_cone.forward_offsets ==
+              std::array<uint32_t, 3>{0u, 4u, 2u},
+          "parser maps a middle-vertical forward vector explicitly");
+    check(aspect_hash != PSXRecompV4::overlay_codegen_config_hash(axis_config),
+          "forward component order changes overlay cache identity");
+    axis_tables.replace(axis_tables.find("[0, 4, 2]"), 9, "[0, 2, 2]");
+    const auto bad_axis_config =
+        write_config(root, "aspect-cone-repeated-axis", axis_tables);
+    check_throws([&] { (void)PSXRecompV4::load_game_config(bad_axis_config); },
+                 "forward_offsets must be a permutation",
+                 "parser rejects a duplicated forward component");
     auto changed_aspect_config = aspect_config;
     changed_aspect_config.ws_aspect_cone.hysteresis_pixels++;
     check(aspect_hash != PSXRecompV4::overlay_codegen_config_hash(

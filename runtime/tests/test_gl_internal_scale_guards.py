@@ -63,7 +63,7 @@ class GlScaleGuards(unittest.TestCase):
         geo = body(GL, "static void gpu_geometry(")
         self.assertIn("if (is_line && s_hr_scale > 1) {", geo)
         self.assertIn("if (draw_mode == GL_LINES) glLineWidth((float)s_hr_scale);", geo)
-        quad = body(GL, "static void present_target_quad(GLuint tex, int tex_w, int tex_h,\n"
+        quad = body(GL, "static void present_target_quad(GLuint tex, float tex_w, float tex_h,\n"
                         "                                int x, int y, int w, int h, int linear,\n"
                         "                                int lx, int ly, int lw, int lh, int v_flip,\n"
                         "                                int apply_gamma, int src_scale) {")
@@ -132,8 +132,11 @@ class HiresWindowGuards(unittest.TestCase):
             self.assertIn("if (!hiw_on()", body(GL, fn))
             # an immediate write into the window lands after every queued draw
             self.assertIn("hiw_flush_queue();", body(GL, fn))
+        # Queued when the window is on, or (full-VRAM surface) when a native-wide
+        # mirror can ride the queue (wide_queue_live).
         for site in ("flush_tex_batch(void)", "flush_flat_batch(void)"):
-            self.assertIn("if (hiw_on() && hiw_enqueue_", body(GL, "static void " + site))
+            self.assertRegex(body(GL, "static void " + site),
+                             r"if \(\(hiw_on\(\) \|\| \(mirror[^)]*wide_queue_live\(\)\)\) &&\s*hiw_enqueue_")
 
     def test_wide_mirror_queued_in_windowed_mode(self):
         # Windowed mode: a draw's native-wide mirror rides in its window queue
@@ -141,14 +144,16 @@ class HiresWindowGuards(unittest.TestCase):
         # surface), not as a surface switch per batch. The immediate mirror
         # runs only when the entry did not take it.
         for site, call in (("static void flush_tex_batch(void)",
-                            "if (hiw_on() && hiw_enqueue_tex(nverts, semi, mirror, s_tb_gate)) mirror = 0;"),
+                            "hiw_enqueue_tex(nverts, semi, mirror, s_tb_gate)) mirror = 0;"),
                            ("static void flush_flat_batch(void)",
-                            "if (hiw_on() && hiw_enqueue_geo(s_fb, nverts, semi, mask, mirror, s_fb_gate)) mirror = 0;"),
+                            "hiw_enqueue_geo(s_fb, nverts, semi, mask, mirror, s_fb_gate)) mirror = 0;"),
                            ("static void gpu_geometry(", "mirror = 0;")):
             fn = body(GL, site)
             self.assertIn(call, fn, site)
-            self.assertLess(fn.index(call), fn.index("if (mirror) {"), site)
-            self.assertIn("wide_target_begin(", fn[fn.index("if (mirror) {"):], site)
+            # the immediate mirror is the last `if (mirror) {` (an earlier one
+            # notes the stencil the draw leaves behind)
+            self.assertLess(fn.index(call), fn.rindex("if (mirror) {"), site)
+            self.assertIn("wide_target_begin(", fn[fn.rindex("if (mirror) {"):], site)
         ok = body(GL, "static int hiw_wide_queue_ok(int mirror)")
         self.assertIn("return mirror && g_wide_cur && s_ws_ablate == 0;", ok)
         for fn in ("static int hiw_enqueue_tex(", "static int hiw_enqueue_geo("):
@@ -156,12 +161,14 @@ class HiresWindowGuards(unittest.TestCase):
             self.assertIn("if (!wq && !hiw_area_touches()) return 0;", b)
             self.assertIn("if (wq) hiw_wide_set(c, gate);", b)
         flush = body(GL, "static void hiw_flush_queue(void)")
+        if "hiw_flush_tail();" in flush:   # shared with the native-wide-only queue
+            flush = body(GL, "static void hiw_flush_tail(void) {")
         self.assertIn("hiw_replay_wide();", flush)
         self.assertLess(flush.index("hiw_replay_wide();"), flush.index("hr_end();"))
         replay = body(GL, "static void hiw_replay_wide(void)")
         for need in ("if (!c->wfbo) continue;", "p_glBindFramebuffer(PSXGL_FRAMEBUFFER, c->wfbo);",
                      "glViewport(0, 0, g_wide_w * S, VRAM_H * S);",
-                     "glScissor(0, sy * S, g_wide_w * S, sh * S);",
+                     "glScissor(c->wsx * S, c->wsy * S, c->wsw * S, c->wsh * S);",
                      "p_glUniform1f(s_tex_uXoff, (float)c->wdx);",
                      "p_glUniform1f(s_geo_uXoff, (float)c->wdx);",
                      "tex_draw_passes_ex(c->vcount, c->semi, c->mask, c->check, 0);",
@@ -175,7 +182,7 @@ class HiresWindowGuards(unittest.TestCase):
         for fn in ("static void glb_wide_configure(",
                    "static void glb_wide_clear(", "static void glb_wide_clear_margins(",
                    "static int glb_render_wide_display(", "static int glb_wide_dump_full(",
-                   "int gl_renderer_present_wide_fbo(", "static void rebuild_mask_stencils(void)"):
+                   "static int present_wide_fbo_impl(", "static void rebuild_mask_stencils(void)"):
             self.assertIn("hiw_flush_queue();", body(GL, fn), fn)
 
     def test_queue_syncs_before_the_raw_mirror_changes(self):
@@ -186,7 +193,7 @@ class HiresWindowGuards(unittest.TestCase):
         self.assertIn("hiw_flush_queue();", body(GL, "static void depth24_clear_skipped_fb(void)"))
         self.assertIn("hiw_flush_queue();", body(GL, "static void rebuild_mask_stencils(void)"))
         self.assertIn("hiw_flush_queue();", body(GL, "static const HiwTile *hiw_ensure(int x0, int x1)"))
-        present = body(GL, "void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,")
+        present = body(GL, "static void present_vram_impl(int disp_x, int disp_y, int w, int h, int linear,")
         self.assertIn("if (s_hiw) {", present)
         self.assertIn("int src_tw = VRAM_W, src_x = disp_x, src_scale = s_out_scale;", present)
 
@@ -311,38 +318,38 @@ class InternalResolutionGuards(unittest.TestCase):
                                r"effective_internal_resolution\(\) == PSX_IR_DISPLAY\);")
         self.assertRegex(MAIN, r"if \(g_video_hidpi_window\)\s*win_flags \|= PSX_SDL_WINDOW_HIGH_DENSITY;")
 
-    def test_vocabulary_is_optional_abi(self):
-        # Builds against an older recomp-ui must still compile: every use of
-        # the new launcher fields sits behind the capability macro.
-        for field in ("gi->internal_resolution_labels", "ls.internal_resolution",
-                      "= internal_resolution_for_launcher();"):
-            for m in re.finditer(re.escape(field), MAIN):
-                before = MAIN[:m.start()]
-                opened = before.count("#if defined(RECOMP_LAUNCHER_HAS_INTERNAL_RESOLUTION)")
-                closed = len(re.findall(r"#endif", before[before.rfind(
-                    "#if defined(RECOMP_LAUNCHER_HAS_INTERNAL_RESOLUTION)"):]))
-                self.assertGreater(opened, 0, field)
-                self.assertEqual(closed, 0, field + " outside its #if block")
+    def test_launcher_never_carries_the_internal_resolution(self):
+        # The internal resolution is the built-in Internal Resolution mod's
+        # (psx.enhancement.internal-resolution), not a launcher row: no
+        # launcher seed, adoption or settings.toml write may carry it, and the
+        # row is cleared for an older recomp-ui whose profile still offers it.
+        for field in ("internal_resolution_labels", "ls.internal_resolution",
+                      "seed.internal_resolution", "us.internal_resolution",
+                      "ls.supersampling", "seed.supersampling", "us.supersampling",
+                      "us.supersample_milli"):
+            self.assertNotIn(field, MAIN, field)
+        self.assertIn("gi->has_supersampling = 0;",
+                      body(MAIN, "static void psx_launcher_hide_mod_owned_rows("))
+
+    def test_session_resolves_the_mod_over_the_title(self):
+        # Every session start restores the title's baseline (its value, dynamic
+        # resolution, legacy factor and supersample) and lays the mod's choice
+        # over it, before the env overrides and the scale resolution.
+        fn = body(MAIN, "static void session_internal_resolution(void)")
+        self.assertIn("psx_host_enh_resolve_resolution(&g_title_resolution, &req)", fn)
+        self.assertIn("g_video_scale = g_title_scale;", fn)
+        self.assertIn("g_video_ss_milli = g_title_ss_milli;", fn)
+        call = MAIN.index("    session_internal_resolution();")
+        self.assertLess(call, MAIN.index('std::getenv("PSX_INTERNAL_RESOLUTION")'))
+        self.assertLess(call, MAIN.index("    apply_internal_resolution(match_display_px_h(nullptr));"))
 
     def test_unset_preset_leaves_supersampling(self):
         self.assertIn("if (preset == PSX_IR_UNSET) return;",
                       body(MAIN, "static void apply_internal_resolution(int display_px_h)"))
 
-    def test_launcher_trips_use_the_round_trip_helpers(self):
-        # Both launcher exits (first boot, netplay soft-return) seed and adopt
-        # through internal_resolution.h, whose behaviour with and without the
-        # Internal resolution row is unit-tested (internal_resolution_test).
-        # A bare factor copy next to a sticky preset let the preset override
-        # a pick in an older launcher's Supersampling row.
-        self.assertEqual(MAIN.count("psx_ir_launcher_seed_supersampling("), 2)
-        self.assertEqual(MAIN.count("psx_ir_adopt_launcher("), 2)
-        self.assertEqual(MAIN.count("kLauncherHasInternalResolution, ir_preset_seeded, ir_ss_seeded,"), 2)
-        self.assertNotRegex(MAIN, r"g_video_scale\s*=\s*(seed|ls)\.supersampling;")
-        self.assertIn("g_video_internal_res = ir.preset;", MAIN)
-
     def test_env_override_is_never_persisted(self):
-        # PSX_INTERNAL_RESOLUTION wins for the run only: the launcher shows and
-        # settings.toml saves the configured preset.
+        # PSX_INTERNAL_RESOLUTION wins for the run only, over the session's
+        # choice (the Internal Resolution mod's or the title's).
         self.assertIn("if (psx_ir_parse(e, &v)) g_video_internal_res_env = v;", MAIN)
         self.assertNotRegex(MAIN, r"g_video_internal_res\s*=\s*v;")
         self.assertIn("g_video_internal_res_env != PSX_IR_UNSET ? g_video_internal_res_env",

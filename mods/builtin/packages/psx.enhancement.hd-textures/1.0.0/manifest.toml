@@ -3,7 +3,7 @@ id = "psx.enhancement.hd-textures"
 version = "1.0.0"
 name = "HD Texture Packs"
 author = "psxrecomp"
-description = "Load compatible DuckStation PNG texture packs with OpenGL or dump original textures during gameplay. No artwork is bundled."
+description = "Load compatible DuckStation PNG/JPEG/WebP packs with OpenGL or capture originals during gameplay. Exit the game to finish capture PNGs. No artwork is bundled."
 resolver = "declarative"
 save_compatibility = "shared"
 
@@ -13,7 +13,7 @@ game_id = "*"
 [[feature]]
 id = "hd-textures"
 name = "HD Texture Packs"
-description = "Disabled by default. Open the pack folder to install PNG artwork in replacements, or enable Dump textures to collect originals in dumps. Options apply on Play. OpenGL displays replacements; other backends retain original artwork."
+description = "Disabled by default. Install PNG/JPEG/WebP artwork in replacements, or enable Dump textures to collect originals. Exit the game to finish capture PNGs in dumps. Options apply on Play. OpenGL displays replacements; other backends retain original artwork."
 group = "Visual"
 default_enabled = false
 
@@ -21,7 +21,7 @@ default_enabled = false
 feature = "hd-textures"
 id = "pack"
 label = "Texture pack folder"
-description = "The launcher creates mods/texture-packs/<game-id> beside the executable on first use. Open folder to add replacement PNGs or read captured originals; Change folder selects another compatible pack or empty directory."
+description = "The launcher creates mods/texture-packs/<game-id> beside the executable on first use. Open folder to add replacement images or read captured originals; Change folder selects another compatible pack or empty directory."
 format = "directory"
 required = true
 
@@ -29,7 +29,7 @@ required = true
 feature = "hd-textures"
 id = "replacements"
 label = "Load replacements"
-description = "Display matching PNG artwork from replacements in OpenGL. Unsupported or missing replacements retain the original artwork."
+description = "Display matching PNG/JPEG/WebP artwork from replacements in OpenGL. Unsupported or missing replacements retain the original artwork."
 type = "boolean"
 default = "true"
 
@@ -37,7 +37,7 @@ default = "true"
 feature = "hd-textures"
 id = "dump"
 label = "Dump textures"
-description = "Write original texture PNGs under dumps as they are encountered while playing. Disable after collecting the areas you need."
+description = "Collect original texture usage while playing. Exit the game to finish capture PNGs under dumps, then edit the files you need."
 type = "boolean"
 default = "false"
 

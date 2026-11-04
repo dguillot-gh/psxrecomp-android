@@ -8,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace PSXRecompV4 {
@@ -82,6 +83,20 @@ struct ModFeature {
     bool default_enabled = false;
     bool hidden = false;
     bool legacy = false;
+    /* Manifest `quick`: offered in the launcher's Quick Mods card by default.
+     * The player's own choice (state.toml [quick_mods]) overrides it. */
+    bool quick = false;
+    /* Derived at parse: every contribution of this feature is a
+     * netplay = "host_only" plugin (ModPlugin::netplay_host_only). Such a
+     * feature changes only this machine's presentation, audio output or host
+     * tools, so it stays the player's own in netplay and the canonical plan
+     * fingerprint leaves it out (canonical_resolution). */
+    bool host_only = false;
+    /* Manifest `vsync = "off"` (format 11): while enabled, this feature's
+     * plugin presents with driver vsync off (frame interpolation, native
+     * VBlank pacing above the panel rate). The launcher shows its VSync row
+     * as overridden instead of offering a choice that would not apply. */
+    bool vsync_off = false;
 };
 
 enum class ModConstraintKind {
@@ -196,6 +211,9 @@ struct ModOverlay {
     ModPatchTarget target = ModPatchTarget::DiscRaw;
     uint64_t location = 0;
     std::filesystem::path file;
+    // Format 10: verified same-feature derived resource instead of a package file.
+    std::string resource_id;
+    uint64_t resource_offset = 0;
     std::string sha256;
     std::string expected_sha256;
     uint64_t size = 0;
@@ -214,15 +232,39 @@ struct ModPlugin {
     std::string id;
     std::map<std::string, std::string> when;
     int64_t order = 0;
+    /* [[plugin]] netplay = "local_view": the plugin only changes what this
+     * player sees. In a netplay match it stays on, per player, but its hooks
+     * run only inside the sandboxed own-view render
+     * (psx_mod_render_local_view), never in the shared simulation. */
+    bool netplay_local_view = false;
+    /* netplay = "input": the plugin only transforms this player's own pad
+     * before it is staged (psx_mod_set_pad_transform). Online it stays on per
+     * player: the post-transform pad is what every peer simulates. */
+    bool netplay_input = false;
+    /* netplay = "host_output": the plugin only reads guest state and drives
+     * host output (rumble, haptics). Online it stays on per player and its
+     * hooks run in the shared simulation, but every guest write it attempts
+     * is refused there, so it can never diverge the peers. */
+    bool netplay_host_output = false;
+    /* netplay = "host_only" (format 11): the plugin never touches guest
+     * execution at all -- it only sets host presentation, audio output or
+     * host-tool state from its activation (the framework's CRT Filter, Image
+     * Filtering, Enhanced Audio and Rewind). Its feature may own nothing
+     * else (ModFeature::host_only). It stays on per player in every netplay
+     * mode, is never published in a lobby plan, and is not part of the plan
+     * fingerprint. */
+    bool netplay_host_only = false;
 };
 
 struct ModResource {
     std::string feature_id;
+    std::map<std::string, std::string> when;
     std::string id;
     std::string label;
     std::string description;
     std::string file_patterns;
     std::string file_description;
+    std::string texture_game_id; // Optional title identity required for HD installation.
     std::string format = "file";
     bool required = false;
     uint64_t size = 0;
@@ -232,6 +274,9 @@ struct ModResource {
     std::string shared_source;
     bool input_only = false;
     bool hidden = false;
+    // Package-relative path used when the player has not selected one (for
+    // example a pack folder the package ships). A selection always wins.
+    std::string default_path;
 };
 
 struct ModDerivedDisc {
@@ -298,6 +343,9 @@ struct ModPackage {
     std::vector<ModDerivedDisc> derived_discs;
 };
 
+// False requests cancellation. Providers report between bounded work units
+// and before publishing outputs; no UI code runs on the preparation worker.
+using ModPrepareProgress = std::function<bool(float, const std::string&)>;
 struct ModPrepareContext {
     const ModPackage& package;
     std::string feature_id;
@@ -305,11 +353,19 @@ struct ModPrepareContext {
     std::filesystem::path cache_root;
     std::filesystem::path application_dir;
     std::map<std::string, std::filesystem::path> inputs;
+    ModPrepareProgress progress;
 };
 using ModMediaPreparer = std::function<bool(const ModPrepareContext&,
     std::map<std::string, std::filesystem::path>&, std::string&)>;
 // Implementations are linked trusted code. A manifest cannot execute a command.
-bool mod_register_media_preparer(const std::string& id, ModMediaPreparer callback);
+// Normally called synchronously during launch preparation. A title enabling
+// PSX_LAUNCHER_MOD_COMMIT_WORKER_SAFE also permits preboot offline preparation
+// on a launcher-owned worker. Every registered callback/service used by that
+// title must then support serialized worker calls without SDL/UI/GL or
+// main-thread affinity. Registration must finish before opening the launcher;
+// activation callbacks still run separately, before renderer initialization.
+bool mod_register_media_preparer(const std::string& id, ModMediaPreparer callback,
+                                 ModMediaPreparer cache_probe = {});
 
 struct ModFeatureSelection {
     bool enabled = false;
@@ -367,6 +423,10 @@ struct ModResolution {
         std::string id;
         std::string package_id;
         std::string feature_id;
+        bool netplay_local_view = false;
+        bool netplay_input = false;
+        bool netplay_host_output = false;
+        bool netplay_host_only = false;
     };
     std::vector<Plugin> plugins;
     struct Resource {
@@ -430,6 +490,10 @@ public:
         developer_channel_ = visible;
     }
     bool developer_channel_visible() const { return developer_channel_; }
+    /* Trusted title policy: hide and deactivate these ids even when an old
+     * bundle or an installed copy survives an update. Saved choices stay
+     * dormant and files remain untouched. Set before scan(). */
+    void set_disabled_packages(std::vector<std::string> ids) { disabled_packages_ = std::move(ids); }
 
     /* Build-owned catalog: wiped and re-staged by every build. */
     std::filesystem::path bundled_root() const { return root_ / "bundled"; }
@@ -439,10 +503,16 @@ public:
     bool scan(std::string* error = nullptr);
     bool load_state(std::string* error = nullptr);
     bool save_state(std::string* error = nullptr) const;
+    /* Quick Mods card membership: the saved player choice, else the
+     * manifest's quick flag. Never changes activation or the fingerprint. */
+    bool quick_visible(const std::string& package, const std::string& feature) const;
+    bool set_quick_visible(const std::string& package, const std::string& feature,
+                           bool visible, std::string* error = nullptr);
     bool prepare_resources(const std::string& game_id,
                            const std::filesystem::path& disc_path,
                            const std::filesystem::path& cache_root,
-                           std::string* error = nullptr);
+                           std::string* error = nullptr, bool cached_only = false,
+                           const ModPrepareProgress& progress = {});
 
     bool install_archive(const std::filesystem::path& archive,
                          std::string* installed_id = nullptr,
@@ -474,6 +544,15 @@ public:
         return packages_;
     }
     const std::map<std::string, ModSelection>& selections() const { return selections_; }
+    /* Swap the in-memory selection for `next` and return the previous one.
+     * Never saved by itself: a session that must not run the player's whole
+     * choice (a netplay match) swaps a reduced selection in, resolves, and
+     * swaps the player's back before anything can save_state(). */
+    std::map<std::string, ModSelection> exchange_selections(
+        std::map<std::string, ModSelection> next) {
+        selections_.swap(next);
+        return next;
+    }
     const ModPackage* selected_package(const std::string& id) const;
     const ModFeature* selected_feature(const std::string& package_id,
                                        const std::string& feature_id) const;
@@ -482,10 +561,22 @@ public:
     std::string feature_option_value(const std::string& package_id,
                                      const std::string& feature_id,
                                      const std::string& option_id) const;
+    /* Runtime-derived defaults are not player selections and are never saved.
+     * relative_path is rooted at this manager's mods root, captured as an
+     * absolute path at registration so subsequent cwd changes cannot rebase it.
+     * Existing explicit selections (including legacy absolute paths) win. */
+    bool set_generated_feature_resource_default(const std::string& package_id,
+        const std::string& feature_id, const std::string& resource_id,
+        const std::filesystem::path& relative_path, std::string* error = nullptr);
+
     std::filesystem::path feature_resource_path(
         const std::string& package_id,
         const std::string& feature_id,
         const std::string& resource_id) const;
+    // Conditions only: pickers stay configurable while the feature is off.
+    bool feature_resource_active(const std::string& package_id,
+                                 const std::string& feature_id,
+                                 const std::string& resource_id) const;
     /* True when an active [[requirement]] activates this feature for the
      * session although state.toml does not enable it. feature_enabled() keeps
      * answering for the player's own choice, which is what the launcher shows
@@ -540,18 +631,28 @@ private:
         std::vector<ModResolution::Diagnostic>* diagnostics,
         std::vector<std::string>* errors) const;
 
+    std::filesystem::path generated_resource_default(const std::string& package_id,
+        const std::string& feature_id, const std::string& resource_id) const;
+    std::map<std::tuple<std::string, std::string, std::string>, std::filesystem::path>
+        generated_resource_defaults_;
     std::filesystem::path root_;
     bool developer_channel_ = kDeveloperChannelDefault;
     std::vector<std::string> scan_errors_;
     std::map<std::string, std::map<std::string, ModPackage>> packages_;
+    std::vector<std::string> disabled_packages_;
     std::map<std::string, ModSelection> selections_;
+    std::map<std::string, bool> quick_visibility_;   /* "package/feature" */
     std::map<std::string, std::filesystem::path> sources_;
 };
 
 bool mod_register_builtin_resolver(const std::string& id, ModBuiltinResolver resolver);
 void mod_clear_builtin_resolvers_for_tests();
 bool mod_register_activation_plugin(const std::string& id, void (*callback)(void));
+bool mod_register_session_reset_plugin(const std::string& id, void (*callback)(void));
+void mod_reset_plugin_sessions();
 bool mod_register_vblank_plugin(const std::string& id, void (*callback)(void));
+bool mod_register_pcm_plugin(const std::string& id, PSXModPCMCallback callback);
+PSXModPCMCallback mod_pcm_callback(const std::string& id);
 bool mod_register_savestate_plugin(const std::string& id, void (*callback)(void));
 void mod_invoke_savestate_plugin(const std::string& id);
 /* A function-entry hook is a trusted implementation like the others: manifests
@@ -563,6 +664,7 @@ bool mod_register_function_filter_plugin(const std::string& id, uint32_t address
 bool mod_register_guest_function_plugin(const std::string& id, uint32_t address,
                                         PSXModFunctionEntryCallback callback);
 bool mod_plugin_registered(const std::string& id);
+bool mod_register_function_override_marker(const std::string& id);
 void mod_invoke_activation_plugin(const std::string& id);
 void mod_invoke_vblank_plugin(const std::string& id);
 struct ModFunctionEntryHook {
@@ -576,11 +678,14 @@ std::vector<ModFunctionEntryHook> mod_function_entry_hooks(const std::string& id
 std::vector<ModFunctionEntryHook> mod_guest_functions(const std::string& id);
 struct ModInstructionHook {
     uint32_t address, expected;
-    PSXModFunctionEntryCallback callback;
+    PSXModFunctionEntryCallback callback = nullptr;
+    PSXModMemoryAddressCallback memory_address = nullptr;
 };
 bool mod_register_instruction_plugin(const std::string& id, uint32_t address,
                                       uint32_t expected, PSXModFunctionEntryCallback callback);
 std::vector<ModInstructionHook> mod_instruction_hooks(const std::string& id);
+bool mod_register_memory_address_plugin(const std::string& id, uint32_t address,
+    uint32_t expected, PSXModMemoryAddressCallback callback);
 void mod_clear_plugins_for_tests();
 
 /* Every id a trusted implementation registered (activation, vblank or

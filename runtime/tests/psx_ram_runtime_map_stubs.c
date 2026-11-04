@@ -26,6 +26,11 @@ void (*g_overlay_flush_pending_cycles)(void);
 uint32_t g_psx_cyc_batch;
 uint32_t g_psx_cyc_batch_limit;
 uint32_t *g_psx_cyc_local_acc;
+#ifndef PSX_STUBS_REAL_PGXP
+/* memory.c drops the PGXP shadow of a DMA / host store (pgxp.cpp).
+ * pgxp_untracked_store_test links the real engine. */
+void pgxp_invalidate_word(uint32_t addr) { (void)addr; }
+#endif
 #ifndef PSX_STUBS_REAL_ICACHE
 /* The I-cache model (psx_icache.c). isc_store_test links the real one. */
 uint32_t g_psx_icache_tv[1024];
@@ -64,8 +69,16 @@ void gte_canonicalize_cpu_state(CPUState *cpu) { (void)cpu; }
 
 /* ---- scheduler / interrupts ------------------------------------------------ */
 void psx_advance_cycles_slow(uint32_t c) { psx_cycle_count += c; }
+/* [timing] guest_cycle_scale at 1 (faithful) for the real memory.c/icache. */
+uint32_t g_psx_gcs_recip_q16 = 65536u;
+uint32_t g_psx_gcs_frac = 0u;
+uint32_t psx_guest_cycle_scale_config(void) { return 1u; }
+void psx_guest_cycle_scale_snapshot(uint32_t out[3]) { out[0] = out[1] = out[2] = 0u; }
+void psx_guest_cycle_scale_restore(const uint32_t in[3]) { (void)in; }
 void psx_devices_mmio_sync(void) {}
 void psx_devices_service_to_now(void) {}
+void spu_catch_up(void) {}
+int mod_runtime_snapshot_package_active(const char *id) { (void)id; return 0; }
 int  psx_get_in_exception(void) { return 0; }
 void psx_irq_raise(uint32_t bit, uint32_t detail) { (void)bit; (void)detail; }
 void psx_irq_refresh_cause_ip2(void) {}
@@ -113,6 +126,7 @@ void gpu_ws_restore_linked_list_rank(uint32_t r) { (void)r; }
  * linked list synchronously while a pass runs; with the flag at 0 neither
  * path is taken, so the doubles trap if they ever are. */
 int g_psx_render_pass_active;
+int render_pass_mmio_read_allowed(uint32_t a, uint32_t w) { (void)a; (void)w; return 1; }
 int g_psx_guest_time_frozen;
 int render_pass_store_to(const void *t, uint32_t a, uint32_t v, uint32_t w) {
     (void)t; (void)a; (void)v; (void)w; __builtin_trap();
@@ -149,6 +163,15 @@ STUB_SECTION(spu, 80u)
 STUB_SECTION(cdrom, 64u)
 STUB_SECTION(sio, 48u)
 STUB_SECTION(mdec, 400u)
+STUB_SECTION(spu_cd, 4u)
+int spu_snapshot_len_ok(uint32_t len) { return len == 80u; }
+/* This fixture's CD writer emits exactly 64 bytes of 0xA5. Validate that
+ * wire without counting a restore or mutating any device. */
+int cdrom_snapshot_validate(const uint8_t *p, uint32_t len) {
+    if (!p || len != 64u) return 0;
+    for (uint32_t i = 0; i < len; ++i) if (p[i] != 0xA5) return 0;
+    return 1;
+}
 int sio_snapshot_validate(const uint8_t *p, uint32_t len) { return p && len == 48u; }
 int mdec_snapshot_validate(const uint8_t *p, uint32_t len) { return p && len == 400u; }
 
@@ -171,3 +194,5 @@ void gr_vram_transfer_in(int x, int y, int w, int h, const uint16_t *d) {
     g_stub_device_restores++;
 }
 void gr_vram_upload_begin(int x,int y,int w,int h) { (void)x; (void)y; (void)w; (void)h; }
+void gr_vram_upload_commit(int x,int y,int w,int h,const uint16_t *d) { gr_vram_transfer_in(x,y,w,h,d); }
+void gr_vram_upload_set_open(int open) { (void)open; }

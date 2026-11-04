@@ -170,13 +170,17 @@ static void test_gen_flip_matches(void) {
 }
 
 static void test_budget_and_ema(void) {
-    CHECK(fabs(render_pass_budget(0, 0, 100.0, 0.5) - 50.0) < 1e-9,
-          "no history spends the share of the frame");
+    CHECK(render_pass_budget(0, 0, 100.0, 0.5) == 0.0,
+          "zero measured credit spends nothing, including startup");
     CHECK(fabs(render_pass_budget(20.0, 10.0, 100.0, 0.8) - 24.0) < 1e-9,
           "idle plus pass time, scaled");
     CHECK(render_pass_budget(500.0, 0.0, 100.0, 0.8) == 100.0,
           "never more than a frame");
     CHECK(render_pass_budget(10.0, 10.0, 0.0, 0.8) == 0.0, "no frame, no budget");
+    CHECK(render_pass_budget(20.0, 10.0, 100.0, 2.0) == 30.0,
+          "share above one remains clamped");
+    CHECK(render_pass_budget(20.0, 10.0, 100.0, 0.0) == 0.0,
+          "zero share spends nothing");
     CHECK(render_pass_ema(0.0, 4.0) == 4.0, "first sample seeds the average");
     CHECK(fabs(render_pass_ema(4.0, 8.0) - 5.0) < 1e-9, "quarter-weight update");
     CHECK(render_pass_ema(4.0, -1.0) == 4.0, "bad samples are ignored");
@@ -292,6 +296,89 @@ static void test_budget_and_ema(void) {
     }
 }
 
+static void test_repeated_zero_credit_plans(void) {
+    RenderPassPlanInput in = {0};
+    RenderPassCost cost = {0};
+    uint32_t phases[RENDER_PASS_MAX_PHASES], wanted;
+    unsigned rewarms = 0;
+    double previous_pass = 0.0;
+    /* Millisecond host ticks: a 50 ms frame, 30 ms warmed replay and 80% share.
+     * Keep a real output grid inside each frame. With the former both-zero
+     * fallback, these calls alternated budget40/admit1 and budget24/admit0,
+     * each measured replay preventing a cost rewarm. */
+    in.frame_length = 50.0;
+    in.target_period = 1000.0 / 165.0;
+    in.max = 1;
+    for (unsigned i = 0; i < RENDER_PASS_COST_WARMUP; i++)
+        render_pass_cost_add(&cost, 30.0, 0);
+    for (unsigned i = 0; i < 20; i++) {
+        uint32_t n;
+        in.frame_start = 1000.0 + i * in.frame_length;
+        in.next_deadline = in.frame_start + in.target_period;
+        in.pass_cost = render_pass_cost_estimate(&cost);
+        in.budget = render_pass_budget(0.0, previous_pass, in.frame_length, 0.8);
+        n = render_pass_plan_phases(&in, phases, &wanted);
+        if (wanted && render_pass_cost_note_plan(&cost)) {
+            rewarms++;
+            in.pass_cost = 0.0;
+            n = render_pass_plan_phases(&in, phases, NULL);
+        }
+        CHECK(wanted > 0 && n == 0, "repeated zero credit never reinvents nominal budget");
+        previous_pass = 0.0;
+        if (n) {
+            render_pass_cost_add(&cost, 30.0, 0);
+            previous_pass = 30.0;
+        }
+    }
+    CHECK(rewarms == 0, "the zero-credit regression is independent of rewarming");
+
+    /* A later stale-estimate rewarm still cannot buy its measuring pass from
+     * zero credit. The cost stays unknown until measured idle returns. */
+    for (unsigned i = 20; i < 80; i++) {
+        uint32_t n;
+        in.frame_start += in.frame_length;
+        in.next_deadline = in.frame_start + in.target_period;
+        in.pass_cost = render_pass_cost_estimate(&cost);
+        in.budget = render_pass_budget(0.0, 0.0, in.frame_length, 0.8);
+        n = render_pass_plan_phases(&in, phases, &wanted);
+        if (wanted && render_pass_cost_note_plan(&cost)) {
+            rewarms++;
+            in.pass_cost = 0.0;
+            n = render_pass_plan_phases(&in, phases, NULL);
+        }
+        CHECK(n == 0, "zero-credit rewarm does not fund a measuring pass");
+    }
+    CHECK(rewarms == 1, "one rewarm stays unknown until actual credit returns");
+
+    /* When genuine idle returns, the same unknown cost left by that rewarm
+     * seeds normally and keeps replaying; do not reset the estimator here. */
+    for (unsigned i = 0; i < RENDER_PASS_COST_WARMUP + 2u; i++) {
+        uint32_t n;
+        in.frame_start += in.frame_length;
+        in.next_deadline = in.frame_start + in.target_period;
+        in.pass_cost = render_pass_cost_estimate(&cost);
+        in.budget = render_pass_budget(40.0, 0.0, 50.0, 0.8);
+        n = render_pass_plan_phases(&in, phases, &wanted);
+        CHECK(n == 1 && wanted > 0, "positive measured idle warms and admits replay");
+        CHECK(!render_pass_cost_note_plan(&cost), "measured affordable replay never rewarms");
+        if (n) render_pass_cost_add(&cost, 30.0, 0);
+    }
+    CHECK(render_pass_cost_estimate(&cost) == 30.0, "genuine idle seeds the measured cost");
+
+    /* Ordinary previous replay credit is still real input: 30*.8 cannot fund
+     * another 30 ms replay, but it can fund a measured 10 ms replay. */
+    in.pass_cost = render_pass_cost_estimate(&cost);
+    in.budget = render_pass_budget(0.0, 30.0, 50.0, 0.8);
+    CHECK(in.budget == 24.0 && render_pass_plan_phases(&in, phases, NULL) == 0,
+          "prior pass credit is retained without reinvention after shedding");
+    memset(&cost, 0, sizeof cost);
+    for (unsigned i = 0; i < RENDER_PASS_COST_WARMUP; i++)
+        render_pass_cost_add(&cost, 10.0, 0);
+    in.pass_cost = render_pass_cost_estimate(&cost);
+    CHECK(render_pass_plan_phases(&in, phases, NULL) == 1,
+          "ordinary prior credit still funds an affordable replay");
+}
+
 static void test_store_policy(void) {
     CHECK(render_pass_mmio_class(0x1F801810u, 0x28000000u, 4) == -1, "GP0 reaches the GPU");
     CHECK(render_pass_mmio_class(0x1F801814u, 0x04000002u, 4) == -1, "GP1 DMA mode allowed");
@@ -327,6 +414,33 @@ static void test_stereo_pair_fresh(void) {
 }
 
 int main(void) {
+    {
+        const uint64_t order[]={0,1,2};
+        CHECK(render_pass_generation_write(0,2,order,3)==2,
+            "keep pending frame while next frame is drawn before its flip");
+        CHECK(render_pass_generation_oldest(6,order,3)==1,
+            "matching queued generations promote in drawing order");
+        CHECK(render_pass_generation_write(1,6,order,3)==0,
+            "promotion frees the previous shown slot");
+        CHECK(render_pass_generation_write(0,7,order,3)==1,
+            "queue overflow evicts oldest pending, preserving shown frame");
+        CHECK(render_pass_generation_oldest(0,order,3)==-1,
+            "an unrelated flip cannot promote any queued generation");
+    }
+    {
+        const uint32_t phases[] = {0, 16384, 32768, 65536};
+        uint32_t lo, hi; float blend;
+        CHECK(render_pass_gen_select_mode(phases, 4, 0.375, 1, &lo, &hi, &blend) &&
+              lo == 1 && hi == 1 && blend == 0.0f, "HOLD keeps a native sample between phases");
+        CHECK(render_pass_gen_select_mode(phases, 4, 0.5, 1, &lo, &hi, &blend) &&
+              lo == 2 && hi == 2 && blend == 0.0f, "HOLD advances at the next native phase");
+        CHECK(render_pass_gen_select_mode(phases, 4, 0.375, 0, &lo, &hi, &blend) &&
+              lo == 1 && hi == 2 && blend == 0.5f, "explicit blending remains supported");
+        CHECK(render_pass_gen_select_mode(phases, 4, 2.0, 1, &lo, &hi, &blend) &&
+              lo == 3 && hi == 3, "late HOLD uses newest native image");
+        CHECK(!render_pass_gen_select_mode(phases, 4, 5.0, 1, &lo, &hi, &blend),
+              "HOLD cannot revive an expired generation");
+    }
     test_stereo_pair_fresh();
     test_store_policy();
     test_counts_per_rate();
@@ -335,6 +449,7 @@ int main(void) {
     test_gen_select_late();
     test_gen_flip_matches();
     test_budget_and_ema();
+    test_repeated_zero_credit_plans();
     printf(failures ? "FAILED (%d)\n" : "ALL PASS\n", failures);
     return failures ? 1 : 0;
 }
