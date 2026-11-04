@@ -19,6 +19,7 @@ import android.text.format.DateFormat;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
+import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -60,7 +61,9 @@ import java.util.regex.Pattern;
 public class LauncherActivity extends Activity {
     private static final int REQUEST_FILES = 81;
     private static final int REQUEST_FOLDER = 82;
+    private static final int REQUEST_CARD = 83;
     private static final String PREFS = "psx_launcher";
+    private static final long CARD_SIZE = 131072; // 128 KB – exactly one PS1 memory card
     private static final Pattern CUE_FILE =
             Pattern.compile("^\\s*FILE\\s+(?:\"([^\"]+)\"|(\\S+))", Pattern.CASE_INSENSITIVE);
     /* The runtime's slot files (savestate.c savestate_slot_path):
@@ -94,12 +97,31 @@ public class LauncherActivity extends Activity {
         super.onCreate(state);
         float dp = getResources().getDisplayMetrics().density;
 
+        FrameLayout container = new FrameLayout(this);
+        container.setBackgroundColor(0xFF101014);
+
+        int bgId = getResources().getIdentifier("launcher_bg", "drawable", getPackageName());
+        if (bgId != 0) {
+            ImageView bgView = new ImageView(this);
+            bgView.setImageResource(bgId);
+            bgView.setScaleType(ImageView.ScaleType.CENTER_CROP);
+            container.addView(bgView, new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+            // Subtle dark overlay to ensure text and buttons remain easily readable
+            View scrim = new View(this);
+            scrim.setBackgroundColor(0x55000000);
+            container.addView(scrim, new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        }
+
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setGravity(Gravity.CENTER);
-        root.setBackgroundColor(0xFF101014);
         int pad = (int) (24 * dp);
         root.setPadding(pad, pad, pad, pad);
+        container.addView(root, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
         TextView title = new TextView(this);
         title.setText(resString("psx_game_title"));
@@ -136,6 +158,11 @@ public class LauncherActivity extends Activity {
         select.setOnClickListener(v -> pickFiles());
         root.addView(select, button(dp));
 
+        Button importCard = new Button(this);
+        importCard.setText("Import memory card");
+        importCard.setOnClickListener(v -> pickCard());
+        root.addView(importCard, button(dp));
+
         TextView hint = new TextView(this);
         hint.setText("Pick the .cue and its .bin together (long-press to select both), "
                 + "or a single .bin, .iso or .chd. Several discs: select every disc's .cue and .bin "
@@ -146,7 +173,7 @@ public class LauncherActivity extends Activity {
         hint.setPadding(0, (int) (16 * dp), 0, 0);
         root.addView(hint, wrap());
 
-        setContentView(root);
+        setContentView(container);
     }
 
     @Override
@@ -358,10 +385,21 @@ public class LauncherActivity extends Activity {
         startActivityForResult(intent, REQUEST_FOLDER);
     }
 
+    private void pickCard() {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("*/*");
+        startActivityForResult(intent, REQUEST_CARD);
+    }
+
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
         if (resultCode != RESULT_OK || data == null) return;
+        if (requestCode == REQUEST_CARD && data.getData() != null) {
+            importCard(data.getData());
+            return;
+        }
         List<Pick> picks = new ArrayList<>();
         try {
             if (requestCode == REQUEST_FILES) {
@@ -381,6 +419,88 @@ public class LauncherActivity extends Activity {
             return;
         }
         if (!picks.isEmpty()) importPicks(picks);
+    }
+
+    /**
+     * Copy a .mcd file picked by the user into files/card1.mcd.
+     * Validates the file is exactly 128 KB. If a card already exists, asks
+     * the user before overwriting (the existing card is NOT backed up here –
+     * use phone.ps1 -Action backup-saves for that).
+     */
+    private void importCard(Uri uri) {
+        // Resolve the display name and size from the content provider.
+        String displayName;
+        long size;
+        try (android.database.Cursor c = getContentResolver().query(uri,
+                new String[]{ OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE },
+                null, null, null)) {
+            if (c == null || !c.moveToFirst()) {
+                showError("Cannot read the selected file."); return;
+            }
+            displayName = c.getString(0);
+            size = c.isNull(1) ? -1 : c.getLong(1);
+        }
+        if (size != CARD_SIZE) {
+            showError("\"" + displayName + "\" is " + size + " bytes. "
+                    + "A PS1 memory card image must be exactly 131072 bytes (128 KB).");
+            return;
+        }
+        File dest = new File(getFilesDir(), "card1.mcd");
+        if (dest.exists()) {
+            // Show what the existing card is so the user can decide safely.
+            java.text.DateFormat dateFmt = android.text.format.DateFormat.getMediumDateFormat(this);
+            java.text.DateFormat timeFmt = android.text.format.DateFormat.getTimeFormat(this);
+            java.util.Date existing = new java.util.Date(dest.lastModified());
+            String existingInfo = "Last saved: " + dateFmt.format(existing)
+                    + " at " + timeFmt.format(existing)
+                    + "\nSize: " + dest.length() + " bytes";
+            new AlertDialog.Builder(this)
+                    .setTitle("Memory card already exists")
+                    .setMessage("card1.mcd is already in the app.\n\n"
+                            + existingInfo + "\n\n"
+                            + "Replace it with \"" + displayName + "\"?\n\n"
+                            + "⚠ Back up the existing card first:\n"
+                            + "phone.ps1 -Action backup-saves")
+                    .setPositiveButton("Replace", (d, w) -> doImportCard(uri, displayName, dest))
+                    .setNegativeButton("Keep existing", null)
+                    .show();
+        } else {
+            doImportCard(uri, displayName, dest);
+        }
+    }
+
+    private void doImportCard(Uri uri, String displayName, File dest) {
+        new Thread(() -> {
+            String error = null;
+            try (InputStream in = getContentResolver().openInputStream(uri);
+                 FileOutputStream out = new FileOutputStream(dest)) {
+                if (in == null) throw new IOException("Cannot open the selected file.");
+                byte[] buf = new byte[4096];
+                int n;
+                while ((n = in.read(buf)) >= 0) out.write(buf, 0, n);
+            } catch (IOException e) {
+                error = e.getMessage();
+            }
+            // Verify the written size as a sanity check.
+            if (error == null && dest.length() != CARD_SIZE) {
+                //noinspection ResultOfMethodCallIgnored
+                dest.delete();
+                error = "Copy failed: written size does not match.";
+            }
+            final String failure = error;
+            runOnUiThread(() -> {
+                if (failure != null) {
+                    showError(failure);
+                } else {
+                    new AlertDialog.Builder(this)
+                            .setTitle("Memory card imported")
+                            .setMessage("\"" + displayName + "\" was saved as card1.mcd.\n"
+                                    + "Start the game and your saves will be there.")
+                            .setPositiveButton("OK", null)
+                            .show();
+                }
+            });
+        }, "psx-card-import").start();
     }
 
     private Pick describe(Uri uri) throws IOException {
