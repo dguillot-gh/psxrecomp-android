@@ -294,6 +294,7 @@ static PFN_glBindBuffer        p_glBindBuffer;
 static PFN_glBufferData        p_glBufferData;
 static PFN_glVertexAttribPointer p_glVertexAttribPointer;
 static PFN_glEnableVertexAttribArray p_glEnableVertexAttribArray;
+static PFN_glEnableVertexAttribArray p_glDisableVertexAttribArray;   /* same signature */
 static PFN_glBindFragDataLocationIndexed p_glBindFragDataLocationIndexed;
 static PFN_glGenFramebuffers   p_glGenFramebuffers;
 static PFN_glDeleteFramebuffers p_glDeleteFramebuffers;
@@ -375,6 +376,8 @@ static int load_modern_gl(void) {
     /* Optional: only the debug presented-image ring maps pack buffers. */
     p_glMapBuffer           = (void *)SDL_GL_GetProcAddress("glMapBuffer");
     p_glUnmapBuffer         = (void *)SDL_GL_GetProcAddress("glUnmapBuffer");
+    /* Optional: client-array textured batches (Android) switch them off again. */
+    p_glDisableVertexAttribArray = (void *)SDL_GL_GetProcAddress("glDisableVertexAttribArray");
 #undef LOAD
     return ok;
 }
@@ -3286,6 +3289,26 @@ static void hiw_flush_queue(void) {
     s_hq_vn = 0;
 }
 
+#if defined(__ANDROID__)
+/* The textured vertex layout of s_tex_vao (TEXV floats per vertex, attributes
+ * 0..12) as client-side arrays on the default VAO; on = 0 disables them. */
+static void tex_client_arrays(const float *v, int on) {
+    static const int  comps[13] = { 2, 2, 4, 2, 2, 1, 1, 4, 1, 1, 1, 4, 1 };
+    static const int  offs[13]  = { 0, 2, 4, 8, 10, 12, 13, 14, 18, 19, 20, 21, 25 };
+    p_glBindVertexArray(0);
+    p_glBindBuffer(PSXGL_ARRAY_BUFFER, 0);
+    for (int a = 0; a < 13; a++) {
+        if (on) {
+            p_glVertexAttribPointer((GLuint)a, comps[a], GL_FLOAT, GL_FALSE,
+                                    TEXV * (GLsizei)sizeof(float), v + offs[a]);
+            p_glEnableVertexAttribArray((GLuint)a);
+        } else if (p_glDisableVertexAttribArray) {
+            p_glDisableVertexAttribArray((GLuint)a);
+        }
+    }
+}
+#endif
+
 static void flush_tex_batch(void) {
     if (s_tb_n == 0) return;
     int nverts = s_tb_n, semi = s_tb_semi;
@@ -3299,9 +3322,18 @@ static void flush_tex_batch(void) {
         s_tb_bank_tex && !s_tb_bank_live_clut ? s_tb_bank_tex : s_raw_tex, s_tb_hd_tex);
     p_glUniform1i(s_uMaskset, s_tb_mask);
     p_glUniform1i(s_uFilter, s_tb_filter);
+#if defined(__ANDROID__)
+    /* OpenGL ES: client-side vertex arrays on the default VAO. The driver copies
+     * the vertices into its command stream at draw time; glBufferData into the
+     * in-use s_tex_vbo made Adreno rename (allocate, zero, cache-flush) it on
+     * every batch (~150 us per flush on the LG V30). Disabled again below so
+     * other users of VAO 0 see no stale attributes. */
+    tex_client_arrays(s_tb, 1);
+#else
     p_glBindVertexArray(s_tex_vao);
     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_tex_vbo);
     p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)(nverts * TEXV * sizeof(float)), s_tb, PSXGL_STREAM_DRAW);
+#endif
 
     tex_batch_draw_passes(nverts, semi);
 
@@ -3327,6 +3359,9 @@ static void flush_tex_batch(void) {
         wide_target_end(s_tex_uXoff, s_tex_uXhalf);
         gl_perf_mirror_end();
     }
+#if defined(__ANDROID__)
+    tex_client_arrays(NULL, 0);
+#endif
     hr_end();
     if (--s_cw_flush_depth == 0) s_cw_flush_ms += cw_ms() - cw_t0;
 }
