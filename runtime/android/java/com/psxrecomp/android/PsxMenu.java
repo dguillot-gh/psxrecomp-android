@@ -7,6 +7,7 @@ import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
@@ -43,6 +44,8 @@ final class PsxMenu {
      * process) sees restart_pending and starts the game again, which loads the slot. */
     static final String RESTART_FLAG = "restart_pending";
     static final String AUTOLOAD_FILE = "autoload_slot";
+    /** Continue/Restart: how long to wait for the game to boot a disc, and how often to look. */
+    private static final long AUTOLOAD_WAIT_MS = 60000, AUTOLOAD_POLL_MS = 500;
 
     private final Activity activity;
     private final PadOverlay pad;
@@ -176,9 +179,12 @@ final class PsxMenu {
         toggle(list, "Anti-aliased (smooth edges)",
                 "On: draw big, shrink back (soft). Off: keep the full size (sharp, like DuckStation's upscale).",
                 smooth, on -> setVideo("antialiasing", on ? "true" : "false"));
-        toggle(list, "Smooth textures", "Bilinear filtering instead of blocky pixels.",
-                "\"bilinear\"".equals(video.get("texture_filtering")),
-                on -> setVideo("texture_filtering", on ? "\"bilinear\"" : "\"nearest\""));
+        /* "stable": smooth 3D models, sharp 2D sprites/backgrounds (plain bilinear
+         * outlines pre-rendered backgrounds' cutouts, FF7 2026-11-04). */
+        toggle(list, "Smooth textures", "Smooth 3D textures; 2D backgrounds and sprites stay sharp.",
+                "\"bilinear\"".equals(video.get("texture_filtering"))
+                        || "\"stable\"".equals(video.get("texture_filtering")),
+                on -> setVideo("texture_filtering", on ? "\"stable\"" : "\"nearest\""));
         toggle(list, "Perspective-correct textures", "Fixes textures that warp on floors and walls.",
                 "true".equals(video.get("perspective_texturing")),
                 on -> setVideo("perspective_texturing", on ? "true" : "false"));
@@ -282,19 +288,32 @@ final class PsxMenu {
         f.delete();
         if (slot < 0) return;
         final int s = slot, d = disc;
-        /* Give the runtime time to boot; the request waits for the next frame anyway. */
-        anyView.postDelayed(() -> {
-            if (d < 1 || d == PsxInput.nativeCurrentDisc()) {
-                PsxInput.nativeRequestState(s, true);
-                return;
+        /* Wait for the runtime to boot a disc (current disc > 0) before deciding: a slow
+         * phone (LG V30) takes ~15 s, and before boot the disc count is 0, so a swap
+         * request would be dropped. The state request itself waits for the next frame. */
+        final long deadline = SystemClock.uptimeMillis() + AUTOLOAD_WAIT_MS;
+        anyView.postDelayed(new Runnable() {
+            @Override public void run() {
+                int cur = PsxInput.nativeCurrentDisc();
+                if (cur < 1 && SystemClock.uptimeMillis() < deadline) {
+                    anyView.postDelayed(this, AUTOLOAD_POLL_MS);
+                    return;
+                }
+                if (d < 1 || d == cur) {
+                    PsxInput.nativeRequestState(s, true);
+                    return;
+                }
+                PsxInput.nativeRequestDiscSwap(d);
+                /* The swap runs between frames; then the slot list is the new disc's. */
+                anyView.postDelayed(new Runnable() {
+                    @Override public void run() {
+                        if (PsxInput.nativeCurrentDisc() == d) PsxInput.nativeRequestState(s, true);
+                        else if (SystemClock.uptimeMillis() < deadline) anyView.postDelayed(this, AUTOLOAD_POLL_MS);
+                        else Toast.makeText(activity, "Disc " + d + " could not be inserted, so the "
+                                + "save state was not loaded", Toast.LENGTH_LONG).show();
+                    }
+                }, AUTOLOAD_POLL_MS);
             }
-            PsxInput.nativeRequestDiscSwap(d);
-            /* The swap runs between frames; then the slot list is the new disc's. */
-            anyView.postDelayed(() -> {
-                if (PsxInput.nativeCurrentDisc() == d) PsxInput.nativeRequestState(s, true);
-                else Toast.makeText(activity, "Disc " + d + " could not be inserted, so the "
-                        + "save state was not loaded", Toast.LENGTH_LONG).show();
-            }, 1500);
         }, 3000);
     }
 

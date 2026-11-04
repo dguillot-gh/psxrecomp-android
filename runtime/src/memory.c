@@ -1062,6 +1062,10 @@ uint64_t g_mmio_access_count = 0;
  * ANY store is not a pure poll loop. CPU stores and in-flight DMA writes
  * both funnel through the psx_write_*_raw chokepoints. */
 uint64_t g_guest_store_count = 0;
+/* The last guest store, for the idle-loop skip's countdown-store gate
+ * (psx_cycles.c): word stores record address and value; half/byte stores set
+ * an odd address, which never matches. */
+uint32_t g_guest_last_store_addr = 1, g_guest_last_store_val = 0;
 
 /* ---- Card protocol trace: tracks I_MASK bit 7 transitions ---- */
 #define IMASK_TRACE_CAP 4096
@@ -1981,6 +1985,8 @@ void psx_write_word(uint32_t addr, uint32_t val) {
 }
 static void psx_write_word_raw(uint32_t addr, uint32_t val) {
     g_guest_store_count++;
+    g_guest_last_store_addr = addr;
+    g_guest_last_store_val = val;
     /* (pgxp) plain-store shadow invalidation retired: the PGXP engine
      * validates tracked words against the actual packet word on read, so an
      * overwritten word can never be believed (docs/ENHANCEMENTS.md G1). */
@@ -2191,6 +2197,7 @@ void psx_write_half(uint32_t addr, uint16_t val) {
 }
 static void psx_write_half_raw(uint32_t addr, uint16_t val) {
     g_guest_store_count++;
+    g_guest_last_store_addr = 1;
     if (cpu_store_isolated()) { isc_store(addr, val, 2); return; }
 
         /* KSEG2 guard — see psx_read_word_raw. */
@@ -2554,6 +2561,7 @@ void psx_host_write_byte(uint32_t addr, uint8_t val) {
 
 static void psx_write_byte_raw(uint32_t addr, uint8_t val) {
     g_guest_store_count++;
+    g_guest_last_store_addr = 1;
     if (cpu_store_isolated()) { isc_store(addr, val, 1); return; }
 
         /* KSEG2 guard — see psx_read_word_raw. */

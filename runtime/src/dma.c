@@ -81,6 +81,19 @@ typedef struct {
 static DMAAsyncChannel mdec_async[2];
 static DMAAsyncChannel cdrom_async;
 static DMAGPULinkedList gpu_linked_list;
+/* CPU-held linked-list walk (hold_cpu_for_gpu_linked_list): s_ll_ahead = list
+ * cycles already walked ahead of the device clock, which dma_advance skips so
+ * the catch-up does not walk them twice; s_ll_exclude hides the list's own
+ * events while the walk asks for the other devices' next event. */
+static uint32_t s_ll_ahead = 0;
+static int      s_ll_exclude = 0;
+
+/* The list's next event in device-clock terms (UINT32_MAX = none). */
+static uint32_t ll_cycles_to_event(void) {
+    if (s_ll_exclude || !gpu_linked_list.active) return UINT32_MAX;
+    uint32_t d = dma_gpu_ll_cycles_to_event(&gpu_linked_list);
+    return d > UINT32_MAX - s_ll_ahead ? UINT32_MAX : d + s_ll_ahead;
+}
 static DMAGpuOtStats gpu_ot_stats;
 static uint64_t gpu_ot_start_cycle;
 static uint32_t gpu_ot_polls_this_walk;
@@ -854,13 +867,47 @@ static void hold_cpu_for_gpu_linked_list(void) {
     const uint64_t host0 = hold_host_ticks();
     const uint32_t words0 = gpu_linked_list.total_words;
     uint32_t steps = 0;
+    /* Every payload word is a one-cycle list event, and stepping the clock to
+     * each one ran a full all-device service pass per word (FF7 on the LG V30:
+     * ~550k passes/s). While the CPU is held, nothing observes the list between
+     * the other devices' events, so the list now walks alone up to just before
+     * the next event of any other device, with the clock at each word's cycle
+     * and the service guard set exactly as inside a service pass; one service
+     * then catches the other devices up (dma_advance skips the walked span). */
+    extern int psx_in_device_service;
+    extern uint32_t psx_devices_cycles_to_next_internal_event(void);
+    psx_devices_service_to_now();          /* devices synced to the clock */
     while (gpu_linked_list.active && ((channels[2].chcr >> 24) & 1u) &&
            channel_enabled(2)) {
         const uint32_t moved = gpu_linked_list.total_words;
-        psx_advance_cycles(dma_gpu_ll_cycles_to_event(&gpu_linked_list));
+        s_ll_exclude = 1;
+        const uint32_t other = psx_devices_cycles_to_next_internal_event();
+        s_ll_exclude = 0;
+        uint32_t walked = 0;
+        psx_in_device_service = 1;
+        while (gpu_linked_list.active && ((channels[2].chcr >> 24) & 1u) &&
+               channel_enabled(2)) {
+            const uint32_t st = dma_gpu_ll_cycles_to_event(&gpu_linked_list);
+            if (st >= other - walked) break;   /* reaches another device's event */
+            psx_cycle_count += st;
+            walked += st;
+            g_dma_cur_ch = 2;
+            g_dma_cur_madr = gpu_linked_list.current_addr;
+            g_dma_cur_bcr = channels[2].bcr;
+            g_dma_initiator_pc = s_dma_ch_initiator_pc[2];
+            dma_gpu_ll_advance(&gpu_linked_list, st, &gpu_ll_ops, NULL);
+        }
+        psx_in_device_service = 0;
+        if (walked) {
+            psx_cycle_count -= walked;         /* hand the span to the catch-up */
+            s_ll_ahead = walked;
+            psx_advance_cycles(walked);
+        } else {
+            psx_advance_cycles(dma_gpu_ll_cycles_to_event(&gpu_linked_list));
+        }
         psx_devices_service_to_now();
         steps++;
-        if (gpu_linked_list.active && gpu_linked_list.total_words == moved) break;
+        if (!walked && gpu_linked_list.active && gpu_linked_list.total_words == moved) break;
     }
     const uint64_t host_us = (hold_host_ticks() - host0) * 1000000ull /
                              hold_host_ticks_per_sec();
@@ -1174,7 +1221,7 @@ uint32_t dma_cycles_to_irq(uint32_t i_mask) {
         if (est < best) best = est;
     }
     if (gpu_linked_list.active) {
-        uint32_t d = dma_gpu_ll_cycles_to_event(&gpu_linked_list);
+        uint32_t d = ll_cycles_to_event();
         if (d < best) best = d;
     }
     for (int ch = 0; ch < 7; ch++) {
@@ -1225,7 +1272,7 @@ uint32_t dma_cycles_to_internal_event(void) {
 
     if (gpu_linked_list.active && ((channels[2].chcr >> 24) & 1u) &&
         channel_enabled(2)) {
-        uint32_t d = dma_gpu_ll_cycles_to_event(&gpu_linked_list);
+        uint32_t d = ll_cycles_to_event();
         if (d < best) best = d;
     }
 
@@ -1253,7 +1300,7 @@ uint32_t dma_cycles_to_deliverable_irq(uint32_t i_mask) {
         if (est < best) best = est;
     }
     if (channel_irq_flag_armed(2) && gpu_linked_list.active) {
-        uint32_t d = dma_gpu_ll_cycles_to_event(&gpu_linked_list);
+        uint32_t d = ll_cycles_to_event();
         if (d < best) best = d;
     }
     for (int ch = 0; ch < 7; ch++) {
@@ -1269,13 +1316,19 @@ void dma_advance(uint32_t cycles) {
     g_dma_exec_depth++;   /* async to-RAM DMA writes below run through psx_write_word */
     advance_mdec_channel(0, cycles);
     advance_mdec_channel(1, cycles);
-    if (gpu_linked_list.active && ((channels[2].chcr >> 24) & 1u) &&
+    uint32_t ll_cycles = cycles;
+    if (s_ll_ahead) {                      /* walked ahead while the CPU was held */
+        uint32_t t = ll_cycles < s_ll_ahead ? ll_cycles : s_ll_ahead;
+        s_ll_ahead -= t;
+        ll_cycles -= t;
+    }
+    if (ll_cycles && gpu_linked_list.active && ((channels[2].chcr >> 24) & 1u) &&
         channel_enabled(2)) {
         g_dma_cur_ch = 2;
         g_dma_cur_madr = gpu_linked_list.current_addr;
         g_dma_cur_bcr = channels[2].bcr;
         g_dma_initiator_pc = s_dma_ch_initiator_pc[2];
-        dma_gpu_ll_advance(&gpu_linked_list, cycles, &gpu_ll_ops, NULL);
+        dma_gpu_ll_advance(&gpu_linked_list, ll_cycles, &gpu_ll_ops, NULL);
     }
     DMAAsyncChannel *a = &cdrom_async;
     if (dma_cdrom_transfer_active()) {

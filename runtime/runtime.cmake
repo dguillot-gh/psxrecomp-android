@@ -371,6 +371,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/gpu_sw_renderer.c
     ${PSXRECOMP_ROOT}/runtime/src/gpu_vram_dirty.c
     ${PSXRECOMP_ROOT}/runtime/src/gpu_render.c
+    ${PSXRECOMP_ROOT}/runtime/src/gl_thread.cpp
     ${PSXRECOMP_ROOT}/runtime/src/gpu_gl_renderer.c
     ${PSXRECOMP_ROOT}/runtime/src/gpu_hd_textures.cpp
     ${PSXRECOMP_ROOT}/runtime/src/hd_texture_pack.cpp
@@ -387,6 +388,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/interrupts.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_video_timing.c
     ${PSXRECOMP_ROOT}/runtime/src/frame_pacing.c
+    ${PSXRECOMP_ROOT}/runtime/src/psx_perfmark.c
     ${PSXRECOMP_ROOT}/runtime/src/frame_interpolation.c
     ${PSXRECOMP_ROOT}/runtime/src/render_pass.c
     ${PSXRECOMP_ROOT}/runtime/src/render_pass_plan.c
@@ -1956,6 +1958,7 @@ function(psxrecomp_add_runtime_target target)
     message(STATUS "psxrecomp ${target}: PSX_MAX_PLAYERS=${PSXRT_MAX_PLAYERS}")
 
     target_compile_definitions(${target} PRIVATE
+        PSX_PERFMARK=1  # perfmark hooks (psx_perfmark.c; tools in the phoneperf folder): off at run time unless ./perfmark exists
         DEFAULT_DEBUG_PORT=${PSXRT_DEBUG_PORT}
         PSX_DEFAULT_BIOS_PATH="${PSXRT_DEFAULT_BIOS_PATH}"
         # The retail stem this build pins. A setup host has no linked

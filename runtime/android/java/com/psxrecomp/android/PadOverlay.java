@@ -71,6 +71,23 @@ public final class PadOverlay extends View {
         float x, y, scale = 1.0f;
         String label;
         boolean visible;
+        /* This control's path shapes (d-pad body + 4 arrow heads, or the triangle
+         * symbol), rebuilt only when shapeX/Y/R change. Keeping the same Path
+         * objects lets hwui's path cache hit: a reset() path is a new path to it,
+         * re-rasterised by Skia and re-uploaded as a texture on every redraw. */
+        final Path[] shapes = new Path[5];
+        float shapeX = Float.NaN, shapeY, shapeR;
+
+        /** True when the shapes must be rebuilt for this position and size. */
+        boolean shapesStale(float x, float y, float r) {
+            if (x == shapeX && y == shapeY && r == shapeR) return false;
+            shapeX = x; shapeY = y; shapeR = r;
+            for (int i = 0; i < shapes.length; i++) {
+                if (shapes[i] == null) shapes[i] = new Path();
+                else shapes[i].reset();
+            }
+            return true;
+        }
 
         Control(String id, int kind, int bits, int stick, String label, int anchor,
                 float x, float y, float size, float aspect, boolean visible) {
@@ -110,8 +127,8 @@ public final class PadOverlay extends View {
     private final List<Control> controls = new ArrayList<>();
     private final SparseArray<Touch> touches = new SparseArray<>();
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Path path = new Path();
     private final RectF rect = new RectF();
+    private boolean lastStickHeld;
     private final float density;
     private final boolean stickDpad;
     private int heldBits = 0;
@@ -471,12 +488,14 @@ public final class PadOverlay extends View {
             case "triangle":
                 paint.setColor(COLOR_TRIANGLE);
                 paint.setAlpha(alpha);
-                path.reset();
-                path.moveTo(x, y - s);
-                path.lineTo(x + s * 0.95f, y + s * 0.65f);
-                path.lineTo(x - s * 0.95f, y + s * 0.65f);
-                path.close();
-                canvas.drawPath(path, paint);
+                if (c.shapesStale(x, y, s)) {
+                    Path tri = c.shapes[0];
+                    tri.moveTo(x, y - s);
+                    tri.lineTo(x + s * 0.95f, y + s * 0.65f);
+                    tri.lineTo(x - s * 0.95f, y + s * 0.65f);
+                    tri.close();
+                }
+                canvas.drawPath(c.shapes[0], paint);
                 break;
             case "circle":
                 paint.setColor(COLOR_CIRCLE);
@@ -542,19 +561,30 @@ public final class PadOverlay extends View {
         for (int i = 0; i < touches.size(); i++)
             if (touches.valueAt(i).control == c) mask |= touches.valueAt(i).dpadMask;
         float arm = r * 0.36f;  /* half-width of each arm */
-        /* Body: a plus shape. */
-        path.reset();
-        path.addRoundRect(new RectF(x - arm, y - r, x + arm, y + r), arm * 0.4f, arm * 0.4f, Path.Direction.CW);
-        path.addRoundRect(new RectF(x - r, y - arm, x + r, y + arm), arm * 0.4f, arm * 0.4f, Path.Direction.CW);
-        path.setFillType(Path.FillType.WINDING);
-        fillBody(canvas, false, alpha);
-        canvas.drawPath(path, paint);
-        /* Pressed arms. */
         int[] bits = { PsxInput.UP, PsxInput.DOWN, PsxInput.LEFT, PsxInput.RIGHT };
         float[][] dirs = { {0, -1}, {0, 1}, {-1, 0}, {1, 0} };
+        if (c.shapesStale(x, y, r)) {
+            /* shapes[0]: the body, a plus shape; shapes[1..4]: the arrow heads. */
+            Path body = c.shapes[0];
+            body.addRoundRect(new RectF(x - arm, y - r, x + arm, y + r), arm * 0.4f, arm * 0.4f, Path.Direction.CW);
+            body.addRoundRect(new RectF(x - r, y - arm, x + r, y + arm), arm * 0.4f, arm * 0.4f, Path.Direction.CW);
+            body.setFillType(Path.FillType.WINDING);
+            float t = arm * 0.55f;
+            for (int i = 0; i < 4; i++) {
+                float dx = dirs[i][0], dy = dirs[i][1];
+                float ax = x + dx * r * 0.62f, ay = y + dy * r * 0.62f;
+                Path head = c.shapes[1 + i];
+                head.moveTo(ax + dx * t, ay + dy * t);
+                head.lineTo(ax - dx * t * 0.5f + dy * t, ay - dy * t * 0.5f + dx * t);
+                head.lineTo(ax - dx * t * 0.5f - dy * t, ay - dy * t * 0.5f - dx * t);
+                head.close();
+            }
+        }
+        fillBody(canvas, false, alpha);
+        canvas.drawPath(c.shapes[0], paint);
+        /* Pressed arms. */
         for (int i = 0; i < 4; i++) {
             float dx = dirs[i][0], dy = dirs[i][1];
-            float ax = x + dx * r * 0.62f, ay = y + dy * r * 0.62f;
             if ((mask & bits[i]) != 0) {
                 paint.setStyle(Paint.Style.FILL);
                 paint.setColor(0xB0FFFFFF);
@@ -570,19 +600,10 @@ public final class PadOverlay extends View {
             paint.setStyle(Paint.Style.FILL);
             paint.setColor((mask & bits[i]) != 0 ? 0xFF000000 : 0xFFFFFFFF);
             paint.setAlpha(alpha);
-            float t = arm * 0.55f;
-            path.reset();
-            path.moveTo(ax + dx * t, ay + dy * t);
-            path.lineTo(ax - dx * t * 0.5f + dy * t, ay - dy * t * 0.5f + dx * t);
-            path.lineTo(ax - dx * t * 0.5f - dy * t, ay - dy * t * 0.5f - dx * t);
-            path.close();
-            canvas.drawPath(path, paint);
+            canvas.drawPath(c.shapes[1 + i], paint);
         }
         strokeEdge(alpha);
-        path.reset();
-        path.addRoundRect(new RectF(x - arm, y - r, x + arm, y + r), arm * 0.4f, arm * 0.4f, Path.Direction.CW);
-        path.addRoundRect(new RectF(x - r, y - arm, x + r, y + arm), arm * 0.4f, arm * 0.4f, Path.Direction.CW);
-        canvas.drawPath(path, paint);
+        canvas.drawPath(c.shapes[0], paint);
     }
 
     private void drawStick(Canvas canvas, Control c, int alpha) {
@@ -919,6 +940,7 @@ public final class PadOverlay extends View {
     private void update() {
         int bits = 0, mouse = 0;
         int s0 = 0x8080, s1 = 0x8080;
+        boolean stickHeld = false;   /* a held stick's knob follows the finger: redraw on every move */
         for (int i = 0; i < touches.size(); i++) {
             Touch t = touches.valueAt(i);
             Control c = t.control;
@@ -926,12 +948,17 @@ public final class PadOverlay extends View {
             bits |= c.bits | t.dpadMask;
             if (c.kind == KIND_MOUSE) mouse |= 1 << c.stick;
             if (c.kind == KIND_STICK) {
+                stickHeld = true;
                 float r = radius(c);
                 int v = axisByte(t.stickX, r) | (axisByte(t.stickY, r) << 8);
                 if (c.stick == 0) s0 = v;
                 else s1 = v;
             }
         }
+        /* Redraw only when the picture changes: a finger moving inside a button
+         * changes nothing, and each overlay redraw costs the RenderThread. */
+        boolean changed = stickHeld || stickHeld != lastStickHeld || bits != heldBits || mouse != mouseHeld;
+        lastStickHeld = stickHeld;
         if (bits != heldBits) {
             if ((bits & ~heldBits) != 0)
                 performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
@@ -954,7 +981,7 @@ public final class PadOverlay extends View {
             stickBytes1 = s1;
             PsxInput.nativeSetStick(1, s1 & 0xFF, s1 >> 8);
         }
-        invalidate();
+        if (changed) invalidate();
     }
 
     /** Let go of everything (focus lost, cancel, editor opened). */
