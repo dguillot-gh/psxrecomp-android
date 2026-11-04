@@ -131,6 +131,8 @@ void     cd_dma_log_get_entry(uint32_t idx, int *lba, uint32_t *dest, uint32_t *
 
 #define DMA_MDEC_IN_CYCLES_PER_WORD   1u
 #define DMA_MDEC_OUT_CYCLES_PER_WORD 14u
+/* [runtime] dma_word_batch (config_loader.h): MDEC words per device event. */
+uint32_t g_dma_word_batch = 1;
 #define DMA_GPU_CYCLES_PER_WORD       1u
 #define DMA_CDROM_CYCLES_PER_WORD     1u
 /* SPU DMA (ch4) per-word cost. Faithful to the Beetle/mednafen oracle, which
@@ -1251,7 +1253,12 @@ uint32_t dma_cycles_to_internal_event(void) {
             continue;
         uint32_t cpw = ch == 0 ? DMA_MDEC_IN_CYCLES_PER_WORD
                                : DMA_MDEC_OUT_CYCLES_PER_WORD;
-        uint32_t d = a->cycles_accum < cpw ? cpw - a->cycles_accum : 1u;
+        /* The next event is when a whole batch is due (advance_mdec_channel
+         * then moves the batch at once); never past the transfer's end. */
+        uint32_t batch = g_dma_word_batch > 1 ? g_dma_word_batch : 1u;
+        if (batch > a->remaining_words) batch = a->remaining_words;
+        uint32_t need = batch * cpw;
+        uint32_t d = a->cycles_accum < need ? need - a->cycles_accum : 1u;
         if (d < best) best = d;
     }
 

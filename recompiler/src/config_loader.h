@@ -355,6 +355,14 @@ struct RuntimeConfig {
     // debug command and PSX_IDLE_SKIP environment variable support live A/B.
     bool                  idle_skip = false;
 
+    // dma_word_batch: the MDEC DMA channels deliver words to/from RAM in
+    // batches of this many words, each batch when its last word is due, so a
+    // movie costs one device event per batch instead of one per word (FF7 on
+    // the LG V30: ~430,000 events/s, 15 cycles apart). 1 = per word (exact).
+    // Only for games that learn about transfers from the DMA IRQ / their own
+    // ring status, not by watching words arrive.
+    uint32_t              dma_word_batch = 1;
+
     // overlay_autocompile_cmd: variant-capture automation (step 2.8). A
     // shell command (run via cmd.exe /C, cwd = project root) that compiles
     // overlay_captures.json into the cache — normally the project's

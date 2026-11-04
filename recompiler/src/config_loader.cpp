@@ -540,6 +540,10 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
     if (runtime.contains("idle_skip")) {
         rt.idle_skip = toml::find<bool>(runtime, "idle_skip");
     }
+    if (runtime.contains("dma_word_batch")) {
+        const auto n = toml::find<int64_t>(runtime, "dma_word_batch");
+        rt.dma_word_batch = n < 1 ? 1u : (n > 256 ? 256u : (uint32_t)n);
+    }
     if (runtime.contains("overlay_autocompile_cmd")) {
         rt.overlay_autocompile_cmd =
             toml::find<std::string>(runtime, "overlay_autocompile_cmd");

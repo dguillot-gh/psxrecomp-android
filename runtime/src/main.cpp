@@ -61,6 +61,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
  * GL context returns to this thread before each SDL event pump, where SDL's
  * Android lifecycle code backs it up and restores it. */
 #include "gl_thread_route.h"
+extern "C" uint32_t g_dma_word_batch;   /* dma.c: [runtime] dma_word_batch */
 #include "gpu_hd_textures.h"   /* gpu_hd_textures_active: gates the GL render thread */
 #define SDL_PumpEvents() (glt_pump_handback(), SDL_PumpEvents())
 #define SDL_PollEvent(e) (glt_pump_handback(), SDL_PollEvent(e))
@@ -15313,6 +15314,12 @@ int main(int argc, char** argv) {
                     ? (idle_env[0] == '1' ? 1 : 0)
                     : (gc.runtime.idle_skip ? 1 : 0);
                 glt_configure(gc.runtime.video_gl_thread);
+                {
+                    g_dma_word_batch = gc.runtime.dma_word_batch;
+                    if (g_dma_word_batch > 1)
+                        std::fprintf(stdout, "psxrecomp: MDEC DMA in batches of %u words\n",
+                                     g_dma_word_batch);
+                }
                 std::fprintf(stdout, "psxrecomp: idle_skip %s%s\n",
                              g_idle_skip_enabled ? "enabled" : "disabled",
                              idle_env ? " (environment override)" : "");
