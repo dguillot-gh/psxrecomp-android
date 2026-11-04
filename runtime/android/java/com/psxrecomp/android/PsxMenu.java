@@ -131,9 +131,9 @@ final class PsxMenu {
         Map<String, String> video = readVideo();
         boolean gpu = "\"opengl\"".equals(video.get("renderer"));
         list.addView(label("Renderer", "GPU draws on the phone's graphics chip: higher resolutions cost "
-                + "much less. Experimental; switch back to Software if anything looks wrong."));
+                + "much less."));
         LinearLayout renderers = new LinearLayout(activity);
-        String[][] rchoices = { { "Software", "\"software\"" }, { "GPU (experimental)", "\"opengl\"" } };
+        String[][] rchoices = { { "Software", "\"software\"" }, { "GPU", "\"opengl\"" } };
         for (int i = 0; i < rchoices.length; i++) {
             final String value = rchoices[i][1];
             TextView b = chip(rchoices[i][0], (i == 1) == gpu);
