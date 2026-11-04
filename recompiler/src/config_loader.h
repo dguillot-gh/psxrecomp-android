@@ -566,6 +566,8 @@ struct RuntimeConfig {
     // tear), -1=adaptive. The wall-clock pacer holds 59.94Hz regardless.
     bool                  video_low_latency_input = true;
     int                   video_vsync             = 1;
+    /* [video] gl_thread: run the GL backend on its own render thread (gl_thread.h). */
+    bool                  video_gl_thread         = false;
     bool                  video_frame_interpolation = false;
     int                   video_frame_interpolation_fps = 0; // 0 = display refresh
     // offer_frame_interpolation: expose the generic interpolation controls

@@ -79,6 +79,7 @@
 #include "psx_perfmark.h"
 #include "gpu_sw_renderer.h"
 #include "gpu_gl_renderer.h"
+#include "gl_thread.h"
 #include "gpu_hd_textures.h"
 #include "mod_texture_banks.h"
 #include "frame_interpolation.h"
@@ -4162,8 +4163,27 @@ static inline void precise_consumed(void) { s_pc_valid = 0; s_pq_valid = 0; s_pr
 int gl_renderer_projective_supported(void) {
     return s_raster_ok && g_wide_cur && !cpu_vram_authoritative();
 }
+/* gpu.c calls these directly (not through the backend table): with the GL
+ * render thread running they run there, synchronously. */
+typedef struct { const PSXProjectedVertex *v; uint16_t tp, cx, cy; int raw, semi, persp; } PtriArgs;
+static void ptri_call(void *p) {
+    PtriArgs *a = (PtriArgs *)p;
+    gl_renderer_draw_projected_triangle(a->v, a->tp, a->cx, a->cy, a->raw, a->semi, a->persp);
+}
+typedef struct { uint16_t id; int live, r; } BankArgs;
+static void bank_call(void *p) {
+    BankArgs *a = (BankArgs *)p;
+    a->r = a->live ? gl_renderer_select_texture_bank_live_clut(a->id)
+                   : gl_renderer_select_texture_bank(a->id);
+}
+
 void gl_renderer_draw_projected_triangle(const PSXProjectedVertex vertices[3],
     uint16_t texpage, uint16_t cx, uint16_t cy, int raw, int semi, int perspective) {
+    if (glt_active() && !glt_on_render_thread()) {
+        PtriArgs a = { vertices, texpage, cx, cy, raw, semi, perspective };
+        glt_call(ptri_call, &a);
+        return;
+    }
     PSXProjectedVertex polygon[12];
     const double left=fmin(s_area_x1, -wide_dx())-1.0;
     const double right=fmax(s_area_x2+1, g_wide_w-wide_dx())+1.0;
@@ -5141,6 +5161,11 @@ int gl_renderer_read_display_hires(int x, int y, int w, int h, uint32_t *out,
 }
 
 int gl_renderer_select_texture_bank(uint16_t id) {
+    if (glt_active() && !glt_on_render_thread()) {
+        BankArgs a = { id, 0, 0 };
+        glt_call(bank_call, &a);
+        return a.r;
+    }
     uint32_t width, height;
     const uint16_t* pixels;
     GLint alignment, row_length;
@@ -5175,6 +5200,11 @@ int gl_renderer_select_texture_bank(uint16_t id) {
 }
 
 int gl_renderer_select_texture_bank_live_clut(uint16_t id) {
+    if (glt_active() && !glt_on_render_thread()) {
+        BankArgs a = { id, 1, 0 };
+        glt_call(bank_call, &a);
+        return a.r;
+    }
     if (!gl_renderer_select_texture_bank(id)) return 0;
     s_selected_bank_live_clut = id != 0;
     return 1;

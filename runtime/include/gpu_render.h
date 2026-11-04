@@ -137,6 +137,13 @@ int  gr_render_wide_display(uint32_t *out, int pitch, int base_x,
  * A backend supplies the same set of functions.  gpu_gl_renderer.c (Phase 2)
  * provides gl_backend_get(); until it does, requesting OpenGL falls back to
  * software.  Members mirror the gr_* / sw_* signatures 1:1. */
+/* GL render thread (gl_thread.h): route backend calls through it (1) or call
+ * directly (0). Ops >= 0x1000 posted by other modules replay through the
+ * external executor. */
+void gr_set_threaded(int on);
+int  gr_threaded(void);
+void gr_set_external_executor(void (*fn)(uint32_t op, const void *data, uint32_t len));
+
 typedef struct GpuRenderBackend {
     const char *name;
     void (*init)(uint16_t *vram);

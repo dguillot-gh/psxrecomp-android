@@ -781,6 +781,9 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
             rt.video_texture_window_batching =
                 toml::find<bool>(video, "texture_window_batching");
         }
+        if (video.contains("gl_thread")) {
+            rt.video_gl_thread = toml::find<bool>(video, "gl_thread");
+        }
         if (video.contains("vsync")) {
             const auto mode = toml::find<std::string>(video, "vsync");
             if      (mode == "on"  || mode == "vsync")     rt.video_vsync = 1;

@@ -57,6 +57,13 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "gpu_sw_renderer.h"
 #include "gpu_render.h"
 #include "gpu_gl_renderer.h"
+/* GL render thread: every gl_renderer_* call below runs on it (macros), and the
+ * GL context returns to this thread before each SDL event pump, where SDL's
+ * Android lifecycle code backs it up and restores it. */
+#include "gl_thread_route.h"
+#include "gpu_hd_textures.h"   /* gpu_hd_textures_active: gates the GL render thread */
+#define SDL_PumpEvents() (glt_handback(), SDL_PumpEvents())
+#define SDL_PollEvent(e) (glt_handback(), SDL_PollEvent(e))
 #include "render_pass.h"
 /* Declarations only: STB_IMAGE_IMPLEMENTATION lives in psx_window_icon.cpp. */
 #define STBI_NO_STDIO
@@ -1925,7 +1932,7 @@ static int           g_android_stretch_num = 0;
 static int           g_android_stretch_den = 0;
 /* gpu_gl_renderer.c; declared here rather than in gpu_gl_renderer.h, which is
  * mirrored into overlay_toolchain/include for overlay builds. */
-extern "C" void gl_renderer_set_present_stretch(int on);
+extern "C" void (gl_renderer_set_present_stretch)(int on);   /* (name): see gl_thread_route.h */
 #endif
 /* [video] fov_scale — VR perspective multiplier on the GTE projection distance
  * H (1.0 = faithful). env PSX_GTE_FOV_SCALE overrides it. */
@@ -4284,6 +4291,8 @@ static void teardown_game_session_keep_lobby(void) {
         g_vk_active = false;
     }
     if (g_gl_active) {
+        gr_set_threaded(0);
+        glt_stop();
         gl_renderer_shutdown();
         g_gl_active = false;
     }
@@ -8234,6 +8243,17 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
             } else {
                 std::fprintf(stderr, "[FPS] game: %.1f fps (%.2fx) | frames: %llu\n",
                              fps, speed, (unsigned long long)s_frame_count);
+            }
+            if (glt_active()) {
+                /* GL render thread per second: posted records, sync calls (game
+                 * thread waited), context handbacks (event pumps), full-ring waits. */
+                uint64_t t[4];
+                static uint64_t last_t[4];
+                glt_stats(t);
+                std::fprintf(stderr, "[GLT] posts %llu syncs %llu handbacks %llu full %llu\n",
+                             (unsigned long long)(t[0] - last_t[0]), (unsigned long long)(t[1] - last_t[1]),
+                             (unsigned long long)(t[2] - last_t[2]), (unsigned long long)(t[3] - last_t[3]));
+                for (int i = 0; i < 4; i++) last_t[i] = t[i];
             }
             if (psx_idle_skip_is_enabled()) {
                 char idle[512];
@@ -15289,6 +15309,7 @@ int main(int argc, char** argv) {
                 g_idle_skip_enabled = idle_env
                     ? (idle_env[0] == '1' ? 1 : 0)
                     : (gc.runtime.idle_skip ? 1 : 0);
+                glt_configure(gc.runtime.video_gl_thread);
                 std::fprintf(stdout, "psxrecomp: idle_skip %s%s\n",
                              g_idle_skip_enabled ? "enabled" : "disabled",
                              idle_env ? " (environment override)" : "");
@@ -18567,6 +18588,14 @@ session_reboot:
     /* Solo rollback resim self-check (PSX_RB_SELFCHECK=1, offline only). */
     psx_selfcheck_init(&cpu, memory_get_bios_checksum(), game_entry_pc);
 
+    /* GL render thread ([video] gl_thread): the GL backend moves to its own
+     * thread once every GL setup above is done. Not with frame interpolation,
+     * netplay or HD texture packs (they call the renderer from other paths). */
+    if (g_gl_active && gr_backend() == GR_BACKEND_OPENGL && glt_configured() &&
+        !g_frame_interpolation && !psx_netplay_active() && !gpu_hd_textures_active()) {
+        if (glt_start(sdl_window)) gr_set_threaded(1);
+    }
+
     /* Execute. */
     std::fprintf(stdout, "psxrecomp runtime: executing from PC=0x%08X\n", cpu.pc);
 
@@ -18827,7 +18856,7 @@ session_reboot:
                    g_slice_exit_in_text, g_slice_exit_want); }
 
     shutdown_runtime();
-    if (g_gl_active) gl_renderer_shutdown();
+    if (g_gl_active) { gr_set_threaded(0); glt_stop(); gl_renderer_shutdown(); }
     if (g_vk_active) vk_renderer_shutdown();
     SDL_DestroyTexture(sdl_texture);   /* NULL-safe in GL mode */
     SDL_DestroyRenderer(sdl_renderer); /* NULL-safe in GL mode */
