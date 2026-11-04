@@ -1091,11 +1091,24 @@ void savestate_poll(CPUState* cpu, uint32_t resume_pc) {
             loaded = boot_state_load_checked(path, s_bios_checksum, s_entry_pc,
                                              cpu, savestate_resume_pc_ok);
             if (!loaded) {
+                extern int g_boot_state_last_reject_foreign;
                 fprintf(stderr,
                         "savestate: LOAD FAILED slot %d %s\n",
                         slot, path);
                 s_load_failed = 1;
-                psx_frontend_on_savestate_notify(1, slot, 0);
+                if (g_boot_state_last_reject_foreign) {
+                    /* A state from an older engine build: its layout no longer
+                     * matches, so it cannot be applied. The game keeps running
+                     * (the rollback above restored it); memory-card saves are
+                     * unaffected. */
+                    char msg[160];
+                    snprintf(msg, sizeof msg,
+                             "Save state %d: older version\n"
+                             "can't load; use in-game Continue", slot + 1);   /* OSD: 63 chars */
+                    psx_frontend_on_savestate_refused(1, slot, msg);
+                } else {
+                    psx_frontend_on_savestate_notify(1, slot, 0);
+                }
             }
         } else {
             fprintf(stderr, "savestate: LOAD FAILED slot %d (no path)\n", slot);

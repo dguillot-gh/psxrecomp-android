@@ -1570,7 +1570,7 @@ extern "C" void psx_frontend_on_savestate_notify(int is_load, int slot, int ok) 
 extern "C" void psx_frontend_on_savestate_refused(int is_load, int slot,
                                                   const char *reason) {
     (void)is_load; (void)slot;
-    host_osd_push(reason, 3000);
+    host_osd_push(reason, reason && std::strchr(reason, '\n') ? 8000 : 3000);
 }
 
 extern "C" void psx_frontend_on_savestate_loaded(void) {

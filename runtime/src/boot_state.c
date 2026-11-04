@@ -1094,6 +1094,10 @@ static void boot_state_append_reason(char* reason, size_t reason_cap,
     snprintf(reason + n, reason_cap - n, "%s", part);
 }
 
+/* The last load refusal was for a state written by another engine build
+ * (layout cookie, version or magic): savestate.c says so on screen. */
+int g_boot_state_last_reject_foreign = 0;
+
 int boot_state_check_buffer(const uint8_t* file, size_t file_len,
                             uint32_t bios_checksum, uint32_t entry_pc,
                             char* reason, size_t reason_cap) {
@@ -1200,11 +1204,15 @@ static int boot_state_load_buffer_impl(const uint8_t* file, size_t file_len,
     const BsSection* host_section = NULL;
     uint32_t n_sections = 0;
 
+    g_boot_state_last_reject_foreign = 0;
     if (!psx_mod_snapshot_ready()) return 0;
     if (!boot_state_check_buffer(file, file_len, bios_checksum, entry_pc,
                                  reject, sizeof(reject))) {
         fprintf(stderr, "boot_state: reject — %s\n",
                 reject[0] ? reject : "unknown");
+        g_boot_state_last_reject_foreign =
+            strstr(reject, "enhancement_memory_layout") != NULL ||
+            strstr(reject, "version=") != NULL || strstr(reject, "magic=") != NULL;
         return 0;
     }
     if (!boot_state_parse_header(file, file_len, &h))
