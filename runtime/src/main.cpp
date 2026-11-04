@@ -11139,9 +11139,23 @@ static void host_look_apply_live(void) {
  * from this session's activation. Called at the renderer setup after
  * start_mod_session, before the PSX_INTERNAL_RESOLUTION / PSX_SUPERSAMPLE
  * env overrides and the scale resolution. */
+/* Android has no mod menu: the launcher and the in-game panel write the
+ * resolution as [video] supersampling into files/game.toml. An Internal
+ * Resolution mod that is not enabled therefore means the title's baseline
+ * (Game default) there, not the Native reference a desktop profile gets. */
+static void host_resolution_requests(PsxHostEnhRequests* req) {
+    psx_host_enh_requests(req);
+#if defined(__ANDROID__)
+    if (!req->resolution) {
+        req->resolution = 1;
+        req->resolution_value = PSX_IR_UNSET;
+    }
+#endif
+}
+
 static void session_internal_resolution(void) {
     PsxHostEnhRequests req;
-    psx_host_enh_requests(&req);
+    host_resolution_requests(&req);
     const PsxHostResolution r = psx_host_enh_resolve_resolution(&g_title_resolution, &req);
     g_video_internal_res = r.internal_resolution;
     g_video_dynres = r.dynamic_resolution;
@@ -11339,7 +11353,7 @@ static int host_resolution_apply_live(void) {
     video_res_refresh_capable();
     if (!g_video_res_live_capable.load()) return 0;
     PsxHostEnhRequests req;
-    psx_host_enh_requests(&req);
+    host_resolution_requests(&req);
     const PsxHostResolution r = psx_host_enh_resolve_resolution(&g_title_resolution, &req);
     return video_resolution_apply_live(r.internal_resolution, r.dynamic_resolution, 0);
 }
