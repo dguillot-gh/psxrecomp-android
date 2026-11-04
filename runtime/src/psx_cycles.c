@@ -689,7 +689,8 @@ void psx_idle_skip_set_store_tracker(int *gate, const uint32_t *addr, const uint
     s_last_addr = addr ? addr : &s_no_store;
     s_last_val = val ? val : &s_no_store;
 }
-enum { IDLE_EDGES_MAX = 8, IDLE_SITES_MAX = 16 };
+/* Inner edges per pass: 32 (was 8) for FF7's movie frame wait, 5-16 per pass. */
+enum { IDLE_EDGES_MAX = 32, IDLE_SITES_MAX = 16 };
 /* Audited sites. The detector proves the loop's shape over the passes it
  * sees; it cannot prove that no later counter-dependent exit exists (an exit
  * at counter == 500 would be skipped over). Only sites a developer audited
@@ -895,8 +896,13 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
     /* Several edges per pass are accepted only for the store-counter shape
      * (v_wait). Multi-edge loops with no counter store -- OpenBIOS's
      * 0xBFC057C0 poll, kernel 0x16BC -- moved R4's boot timing when skipped
-     * (frame 192, cyc +3857), so they keep running for real. */
-    if (s_idle_iter_edges && !s_idle_mem_progress) return;
+     * (frame 192, cyc +3857), so they keep running for real. An AUDITED
+     * site (idle_skip_store_counter_sites) is the exception: a developer
+     * read that loop and found it a pure wait with no counter-dependent exit
+     * (FF7's movie frame wait 0x80035DC8: 5-16 check boundaries per pass, no
+     * stores or MMIO; LG V30 opening movie 0.40x -> 0.74x with the old
+     * detector's equivalent). Unlisted multi-edge loops still run for real. */
+    if (s_idle_iter_edges && !s_idle_mem_progress && !idle_site_listed(check_pc)) return;
     uint32_t q = s_idle_quantum;
     uint32_t dist = devices_cycles_to_next_idle_event();
     /* The devices report distances from where they were last serviced
