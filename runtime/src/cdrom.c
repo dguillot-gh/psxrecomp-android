@@ -3062,8 +3062,14 @@ void cdrom_write(uint32_t addr, uint32_t value) {
 uint32_t cdrom_cycles_to_irq(uint32_t i_mask) {
     if (!(i_mask & (1u << 2))) return 0xFFFFFFFFu;   /* IRQ_CDROM masked */
     uint32_t best = 0xFFFFFFFFu;
-    /* Armed response awaiting presentation (raises bit2 at present_due). */
-    if (cdrom_irq_mask_matches_reason(irq_enable, irq_flag)) {
+    /* Armed response awaiting presentation (raises bit2 at present_due). Once
+     * presented (cdrom_intc_request_latched) nothing here happens on time:
+     * only the CPU's ack write (cdrom_write) or a new response (set_irq)
+     * clears the latch. Advertising it as due anyway made the scheduler
+     * re-service every device every ~4 cycles until the ack (FF7's opening
+     * movie on the LG V30: ~120,000 empty CD events/s). */
+    if (cdrom_irq_mask_matches_reason(irq_enable, irq_flag) &&
+        !cdrom_intc_request_latched) {
         int rem = irq_present_rem_cycles();
         uint32_t d = rem > 0 ? (uint32_t)rem : 0u;
         if (d < best) best = d;
