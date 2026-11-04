@@ -7264,6 +7264,15 @@ static void load_transition_note(int read_active, int load_active,
  * short-gap arming for MotK merges — MotK cutovers still arm via depth24
  * exit and long idle. */
 static void depth24_cutover_tick(int depth24) {
+    {   /* One log line per movie start / end (24-bit display with the MDEC
+         * decoding in the last ~0.5 s): test scripts wait for it. */
+        static int s_movie_logged = 0;
+        const int movie = depth24 && mdec_recently_active(30);
+        if (movie != s_movie_logged) {
+            s_movie_logged = movie;
+            std::fprintf(stdout, "psxrecomp: movie playback %s\n", movie ? "started" : "ended");
+        }
+    }
     const int mdec_on = depth24 && mdec_recently_active(3);
     /* ~0.5s @60Hz — longer than inter-frame MDEC idle in a live movie. */
     const int mdec_long_idle = depth24 && !mdec_recently_active(30);
