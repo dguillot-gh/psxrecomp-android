@@ -5375,9 +5375,17 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
         int gate = bd_prim_gate(xs, 3, 1); /* backdrop-stretch gate is also a batch key */
         /* Batch key and isolation come from the build's tier
          * (gl_batch_policy.h): LLE draws every semi prim alone; HLE keeps
-         * painter-ordered opaque + modes 0/1/3 runs in one dual-source draw. */
-        const GlBatchClass batch_class = gl_batch_classify(semi, s_mask_check,
-            mod_texture_bank_batchable(s_selected_bank_tex != 0, s_mask_check, semi));
+         * painter-ordered opaque + modes 0/1/3 runs in one dual-source draw.
+         * That draw needs dual-source blending (desktop GL 3.3); without it
+         * (OpenGL ES / Android) the two-pass fallback would blend every
+         * STP=1 texel of the run as mode 0 -- opaque sprites included (FF7's
+         * menu text came out 50% blended with the window) -- so the LLE
+         * classification applies there. */
+        const int bank_batch =
+            mod_texture_bank_batchable(s_selected_bank_tex != 0, s_mask_check, semi);
+        const GlBatchClass batch_class = s_dual_src_ok
+            ? gl_batch_classify(semi, s_mask_check, bank_batch)
+            : gl_batch_policy_lle(semi, s_mask_check, bank_batch);
         const int batch_semi = batch_class.key;
         const int isolate = batch_class.isolate;
         const int tdmode = pgxp_tri_depth_mode(semi);
@@ -6835,7 +6843,8 @@ static int init_gpu_raster(void) {
                 "mask-bit stencil, texture window, GPU copy/upload)\n", s_out_scale,
                 s_hiw ? " windowed" : "");
     }
-    fprintf(stdout, "psxrecomp: GL textured batching = %s\n", gl_batch_policy_name());
+    fprintf(stdout, "psxrecomp: GL textured batching = %s\n",
+            s_dual_src_ok ? gl_batch_policy_name() : "LLE (no dual-source blending)");
     return 1;
 }
 
