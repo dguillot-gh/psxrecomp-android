@@ -24,8 +24,37 @@ appears when the host advertises `GameInfo.netplay_supported`.
 ## Rollback netcode
 
 Titles that opt in with `[netplay] content_negotiation = true` (game.toml,
-default false) get content negotiation; every other title keeps vanilla
-netplay (mods cleared), the MOTK1 LAN protocol and plan-free lobby caps.
+default false) get content negotiation; titles without a trusted simulation
+profile keep vanilla netplay (simulation mods cleared), the MOTK1 LAN protocol
+and plan-free lobby caps.
+
+A statically linked title can register `PSXModNetplayProfile` from
+`runtime/include/mod_netplay.h` for a shared simulation such as experimental
+co-op. The profile forces its native simulation plugin and permitted fixed view
+without importing or saving offline package choices. Its compatibility revision
+pins lobby versioning and a SHA-256 profile identity joins the normal
+execution/content handshake on every transport. Unsupported rollback requests
+use delay-sync; unsupported user and synchronized save/load requests are refused.
+An optional read-only callback contributes canonical host-owned gameplay state
+to the existing core CRC; digest logs report this as `mod=`. The callback must
+exclude pointers, padding, rendering caches and local-only input state.
+
+`requires_retained_texture_banks` opts a trusted profile into retained GL
+textures during dual-raster netplay. It requires a working OpenGL backend;
+software/Vulkan selections and an unavailable bank implementation are rejected
+before guest boot. Software at 1x remains the authoritative VRAM/GPUREAD/CRC
+source, independent of GL presentation resolution/filter preferences. Retained
+bank pixels replace textures only on the GL image; the software authority still
+samples ordinary VRAM for those commands. This policy follows the X6 co-op
+renderer behavior and does not provide software retained-bank rendering or
+prove visual equivalence to authoritative VRAM. Validate gameplay state and
+GL presentation separately. The flag is part of the session content identity.
+
+For an offline mode whose host state is not serialized, a trusted plugin can
+call `psx_mod_set_savestate_blocked(1)` and `psx_mod_set_rewind_blocked(1)` during
+activation. These policies reset before each new session; save blocking also
+cancels already staged requests and in-memory load blobs. Memory-card saves
+and the user's persisted settings are separate and remain available.
 
 Online rooms can publish a host-selected mod plan: package versions, enabled
 features/options and a portable plan fingerprint. Every peer resolves and
@@ -56,6 +85,20 @@ prediction + resimulation), with **delay-sync** still available as an opt-out
 
 Rollback is the product default for titles that ship it (e.g. MotK). Delay-sync
 remains useful for debugging and for hosts that prefer fixed lag.
+
+- With three or more seats, a tick counts as confirmed (hash confirm, the
+  agreed watermark, a silently promoted button correction) only when every
+  other peer has committed the same digest for it
+  (`rnet_hc_set_peer_mask`). Peers that made the same wrong prediction for a
+  slow seat agree with each other, so confirming against whichever peer spoke
+  last let them skip a rollback the slow seat's real input needed.
+- A peer that falls behind the others' inputs sheds its own view first
+  (`psx_netplay_local_view_shed`, presentation only); its rollbacks then stay
+  short for everyone. `PSX_NET_LOCAL_VIEW_SHED=0` keeps the own view.
+- A match ends after `PSX_NET_ADMIT_STALL_MS` (default 20000) without any
+  progress; a remote input tip that advances is progress, so a slow peer is
+  waited for. A peer silent for `PSX_NET_LIVENESS_MS` (default 1500) counts as
+  gone.
 
 ---
 
@@ -153,27 +196,93 @@ Cost: extra CPU for the 1× SW pass. Benefit: peers can use different GL
 settings without desyncing the sim. SW-only netplay forces scale 1 for the
 whole path. Offline play keeps full supersampling with no dual-raster tax.
 
-**Internal resolution is a per-peer presentation setting.** Settings → Display →
-Internal resolution is not a mod, so it is not cleared for netplay: each peer
-keeps its own preset, clamped to its own GPU, and one peer at 4K next to another
-at Native is a supported match. Only the GL present surface changes; the 1×
+**Internal resolution is a per-peer presentation choice.** It is the built-in
+Internal Resolution mod (`psx.enhancement.internal-resolution`), a host-only
+mod (below), so it stays each player's own in netplay: each peer keeps its own
+preset, clamped to its own GPU, and one peer at 4K next to another at Native is
+a supported match. Its option does not change during a match (the scale is
+held); a change made then applies at the next session. Only the GL present surface changes; the 1×
 software authority, the digests and the rollback snapshots are the same on every
-peer. Widescreen and frame-rate mods, by contrast, are cleared for netplay.
+peer. Mods are cleared for netplay, except a player's own-view mods (below),
+which stay per player and never touch the shared game.
+
+### Each peer's own view (presentation only)
+
+Some titles draw every player's view into one frame (split screen, or a link
+mode that renders all seats). Online, every peer still renders and digests
+that identical frame; only what its window shows changes:
+
+- `game.toml [netplay] local_viewport = "vertical_split"`: during netplay, seat
+  0 or 1 presents its own half of a detected vertical split.
+- `psx_netplay_present_local_view(x, y, w, h)` (`psx_netplay.h`): a trusted
+  game plugin names this peer's rectangle of the display area (guest pixels,
+  relative to the GP1(05h) display start), usually from
+  `psx_netplay_local_slot()`. The present path shows that rectangle alone,
+  scaled to the window at 4:3, from the GL internal-resolution surface (or the
+  software frame). The request lasts a few simulation ticks
+  (`PSX_NETPLAY_LOCAL_VIEW_HOLD`), so the plugin renews it every frame its
+  multi-view screen is up and menus fall back to the full frame by
+  themselves. It wins over `local_viewport`, never reaches the guest or a
+  savestate, and is ignored offline. The headless present-image ring records
+  the same rectangle, which is how a harness checks it. Vulkan, which netplay
+  replaces with the software present, ignores it.
+- `psx_mod_render_local_view(cpu, rect, fn, user)` (`mod_plugins.h`): this
+  peer draws its *own* image of a display rect with the game's code, for
+  example its seat's single full-screen view, inside the render-pass sandbox
+  (docs/RENDER_PASSES.md, "Netplay local view"). The machine is restored
+  afterwards, so the canonical frame stays in the authoritative VRAM, rollback
+  snapshots and digests; only the OpenGL presenter's surface keeps the image.
+  A committed image cancels any `psx_netplay_present_local_view` crop
+  (`psx_netplay_local_view_clear`). Forward netplay frames only; a title falls
+  back to the crop when `psx_mod_render_local_view_status()` is not ready
+  (software present, Vulkan, resimulation, or `FAST_FORWARD` while this peer
+  is behind the match and sheds its own view).
 
 ---
 
 ## Connectivity: ICE, TURN, SFU, LAN
 
-### Online lobbies (WebSocket + SFU)
+### Online lobbies (WebSocket + host relay, SFU fallback)
 
 Online matches go through the lobby at **netplay.retcomm.net**
-(WebSocket control plane). Match **UDP pad traffic** for online rooms uses an
-**SFU star** (selective forwarding unit on the lobby server): every peer sends
-to the SFU; the SFU fans out to other seats. Peers do **not** mesh each other
-for game data online.
+(WebSocket control plane). Match **UDP pad traffic** is a star; who is the
+hub depends on the launch the server sends (`transport`, `relay_via`):
 
-Current lobby policy prefers **always SFU** for online starts so CGNAT /
-asymmetric NAT does not strand players on failed ICE attempts.
+| Launch | Hub | Transport in the engine |
+|--------|-----|-------------------------|
+| `transport "host"` + `relay_via "ice"` (default when the host's build has ICE) | **the host** | **ICE hub** — the ICE agents the waiting room already connected are adopted by the session (`rnet_session_start_ice_hub_adopt` on the host, `rnet_session_adopt_ice_agent` on a guest). No UDP port is bound or forwarded, nothing is dialled, no TURN. |
+| `transport "host"`, no `relay_via` (older server / host without ICE) | **the host** | LAN path on the host's advertised UDP port (UPnP / NAT-PMP / STUN, probed by guests). |
+| otherwise | the lobby server's **SFU** | LAN path to the server's relay endpoint. |
+
+Host relay is a preference of the hosting player (launcher toggles, default
+on): `psx_lobby_set_relay_host_pref` publishes `match_caps.relay = "host"`;
+`psx_lobby_set_relay_via_ice_pref` adds `relay_via = "ice"` (only when the
+build can run ICE). The server falls back to its SFU unless every guest proved
+its path to the host.
+
+**Host relay over ICE.** In the waiting room the host runs one ICE agent per
+seated guest (host = answerer, guests offer), signalled over the lobby
+`signal` op in its own type range (`130 + RNetSignalType`); a guest's proof is
+`path_report direct`. `psx_lobby_client.c` carries that glue (the proof logic
+is recomp-net's `RNetHostIce`). At launch the client captures the COMPLETED
+agents; `ae_np_clear_launch_pending` takes them (before the lobby launch is
+cleared) into `psx_netplay`'s stash and `psx_netplay_start` adopts them. A
+seat that is not connected, or a spectator in the room, **refuses the launch**:
+`join.last_error == "ice_not_connected"`, reason in
+`psx_lobby_ice_launch_error()`; a smaller room is never started.
+
+Slot mapping: the lobby seat of each agent is mapped to its **session slot**
+from the launch's `port_of_slot` table (`psx_ice_hub_map_seats`,
+`netplay_ice_hub.c`), which already folds in `host_spectates` (slot 0 is the
+silent host, players start at slot 1) and moved seats (slots follow ascending
+lobby seat, the host is always slot 0). Every non-host session slot must get
+exactly one agent. `psx_transport_decide` guarantees an ICE-hub launch is
+never routed to the single-agent ICE path or the SFU, whatever else the config
+carries. Covered ROM-free by `netplay_ice_hub_test`.
+
+Not on this path: spectators (gallery seats), and the waiting-room latency
+column in ICE mode (the per-pair RTT probe is disabled there so it cannot race
+the proof's `path_report`).
 
 ### ICE + TURN
 
@@ -186,7 +295,7 @@ libjuice is pulled as a **pinned URL tarball** (not `git clone`) so Retro
 AppImage / mismatched-libcurl hosts can still configure; offline builds can
 vendor `lib/recomp-net/third_party/libjuice` or set `-DRNET_LIBJUICE_ROOT`.
 “Force TURN” in the UI can raise delay floors for relay-heavy paths; it
-does not replace the SFU online architecture above.
+does not change which transport the launch selects (see Online lobbies).
 
 ### LAN / Direct IP (P2P star)
 
@@ -323,6 +432,62 @@ Generate & rebuild / prepare flows should point at the **`.cue`**, not a lone
   fingerprint before entering guest execution. Direct launches retain local
   choices and require matching plans. No assets or local paths are transferred;
   the guest's saved offline selection survives the session.
+### Own-view mods (per player)
+
+The shared simulation stays stock on every peer; a mod that only changes
+what one player sees runs for that player alone, inside the sandboxed own-view
+render (`psx_mod_render_local_view`). A package opts in per plugin:
+
+```toml
+[[plugin]]
+feature = "widescreen"
+id = "r4.widescreen"
+netplay = "local_view"
+```
+
+Two more plugin classes stay on per player. `netplay = "input"` transforms
+only this player's pad before it is staged (`psx_mod_set_pad_transform`).
+`netplay = "host_output"` only reads guest state to drive this player's host
+output (rumble, haptics): its function-entry hooks run in the shared
+simulation (including rollback resimulation) on a private copy of the CPU
+state, whose register changes are discarded; a completion request from them
+is ignored; and every guest-mutating mod service (`psx_mod_write_*`,
+`psx_mod_host_write_ram`, `psx_mod_call_guest*`, DMA / SPU / VRAM uploads,
+guest allocations, the cycle-scale gate) refuses while one runs
+(`psx_mod_host_output_scope()`), so the shared simulation is unchanged by
+them. This is a determinism contract for trusted plugins, not a sandbox. Host-side calls that must not
+repeat on a resim (e.g. `psx_mod_set_host_rumble`) check
+`psx_netplay_is_resimulating()` themselves.
+
+A fourth class, `netplay = "host_only"` (format 11), is for plugins that never
+touch guest execution at all -- the framework's CRT Filter, Image Filtering,
+Enhanced Audio, Rewind and Internal Resolution mods: they only set host
+presentation, audio output or host-tool state. Their features are no part of the plan fingerprint and stay
+each player's own in every mode, content negotiation included: a host never
+publishes them and a host's plan never switches them (docs/MOD_PACKAGES.md
+"Host-only plugins").
+
+At a netplay session start the runtime resolves the player's own selection
+and keeps only features whose every contribution is such a plugin (no EXE or
+disc write, overlay or derived disc; `mod_runtime_commit_netplay_view`). They
+activate as usual (presentation state: aspect, scene predicates), but:
+
+- their function-entry, filter, guest-function and instruction hooks run only
+  while `psx_mod_local_view_scope()` is 1, i.e. inside a local-view draw, whose
+  guest-side effects the sandbox discards; vblank and savestate callbacks do
+  not run in a match;
+- `gpu_ws_set_local_view_only(1)`: the widescreen cull margin
+  (`psx_ws_x_margin()`) is the stock 0 in the shared game and this peer's own
+  margin only inside the local-view draw; squash widescreen (which changes the
+  GTE projection) is not used.
+
+So the canonical frame, rollback snapshots and digests are identical on every
+peer whatever each player chose, there is nothing to negotiate or hash, and
+each player keeps their own aspect (Fit follows their own window). Nothing is
+written to `mods/state.toml`. A title without an own view simply shows its
+canonical frame. A plugin must not keep host state that feeds guest writes
+outside the scope; anything that persists guest state across frames is not an
+own-view mod.
 
 ---
 

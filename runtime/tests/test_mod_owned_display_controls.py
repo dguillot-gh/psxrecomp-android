@@ -74,8 +74,10 @@ assert re.findall(r"^static PSXModSessionBaseline g_mod_owned_baseline;$",
 assert MAIN.index("static PSXModSessionBaseline g_mod_owned_baseline;") < helper_start
 assert MAIN.count("PSXModSessionBaseline") == 1, \
     "no other session baseline may exist (every call would be a first call)"
-assert MAIN.count("g_mod_owned_baseline") == 2, \
-    "only reset_mod_owned_presentation() may use the session baseline"
+assert MAIN.count("g_mod_owned_baseline") == 5, \
+    "only reset, the VSync preference reader and launcher VSync Apply may use the baseline"
+assert MAIN.count("g_mod_owned_baseline.values.video_vsync = g_video_vsync;") == 1
+assert "ls.vsync = psx_vsync_to_launcher(launcher_vsync_preference());" in MAIN
 
 # The call: the persistent baseline, and the native-pacing flag as it stands
 # (a plugin's psx_mod_set_native_vblank_rate owns the frame periods only then).
@@ -89,8 +91,8 @@ assert "".join(helper[call_at:call_end].split()) == (
     "&g_mod_owned_baseline,&live,g_mod_native_vblank_rate?1:0);"
 ), "the helper must get the persistent baseline and the live native-pacing flag"
 
-# Before the call: only the copy-in, so nothing (such as clearing the native
-# pacing flag) can change what the helper sees.
+# Before the call: clear the session's local mouse accumulator and copy in
+# the scalars. Neither may change the native-pacing state the helper captures.
 COPIES = (
     ("video_vsync", "g_video_vsync"),
     ("frame_interpolation", "g_frame_interpolation"),
@@ -100,9 +102,11 @@ COPIES = (
     ("frame_period_ms", "g_frame_period_ms"),
 )
 before = c_statements(helper[len(HELPER_SIG):call_at])
-expected = ["PSXModSessionScalars live;"] + [f"live.{f} = {g};" for f, g in COPIES]
+expected = ["psx_local_mouse_clear();", "PSXModSessionScalars live;"] + [
+    f"live.{f} = {g};" for f, g in COPIES
+]
 assert sorted(before) == sorted(expected), \
-    f"only the scalar copy-in may precede the baseline call, got {before}"
+    f"only mouse reset and scalar copy-in may precede the baseline call, got {before}"
 
 # After the call: the copy-out, each once, then the native-pacing flag cleared.
 after = helper[call_end:]
@@ -177,7 +181,8 @@ order = [session.index(step) for step in (
     "g_mod_disc_speed_divisor = -1;",
     "g_mod_disc_instant_rate = -1;",
     "g_turbo_load_wall_multiplier = 0;",
-    "reset_mod_owned_presentation();\n        mod_runtime_activate_plugins();",
+    "reset_mod_owned_presentation();",
+    "mod_runtime_activate_plugins();",
     "apply_netplay_local_viewport_aspect(netplay);",
     "player_mode[i] = g_mod_controller_mode_override[i];",
     "g_turbo_load_wall_multiplier = g_mod_load_wall_multiplier;",
@@ -202,7 +207,9 @@ assert first_commit < session_start < first_start < first_disc < reboot, \
 # Soft return (rematch) re-enters below that block via `goto session_reboot`,
 # so the rematch path runs the same session start after its commit / netplay
 # clear, and mounts the disc the new plan selects.
-rematch = MAIN[MAIN.index('"psxrecomp: cannot clear mods for netplay "'):]
+rematch_start = MAIN.index('"psxrecomp: cannot apply netplay mods "',
+                           MAIN.index("soft_return_lobby:"))
+rematch = MAIN[rematch_start:]
 rematch = rematch[:rematch.index("goto session_reboot;")]
 commit = rematch.index("mod_runtime_commit(resolved_disc,")
 rematch_session = rematch.index("start_mod_session(net_cfg.enabled);")
@@ -222,7 +229,6 @@ assert rematch.count(clamp) == 1, "rematch must re-clamp the aspect to 4:3"
 clamp_at = rematch.index(clamp)
 assert commit < clamp_at < rematch_session, \
     "4:3 re-clamp must follow the commit and precede the session start"
-rematch_start = MAIN.index('"psxrecomp: cannot clear mods for netplay "')
 assert MAIN.rfind("case 1:  g_video_aspect_num = 16; g_video_aspect_den = 9; break;",
                   0, rematch_start) > MAIN.index("soft_return_lobby:"), \
     "the launcher's aspect must be applied before the rematch re-clamp"

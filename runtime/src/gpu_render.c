@@ -59,6 +59,7 @@ static const GpuRenderBackend SW_BACKEND = {
     .wide_clear_margins            = sw_wide_clear_margins,
     .render_wide_display           = sw_render_wide_display,
     .wide_dump_full                = sw_wide_dump_full,
+    .wide_feedback_rect            = sw_wide_feedback_rect,
 };
 
 /* Supplied by gpu_gl_renderer.c; returns NULL until the GL backend is ready. */
@@ -88,6 +89,16 @@ static void hd_observe_rect(int u0,int v0,int u1,int v1,uint16_t cx,uint16_t cy,
     gpu_hd_textures_observe_draw(tp,cx,cy,limits,g_hd_texture_window,g_hd_semi);
 }
 
+/* A backend that replays commands on another thread (the GL render thread)
+ * owns its VRAM copy there, so residency changes travel with its commands. */
+static void hd_note(int op, int x, int y, int w, int h, const uint16_t *words) {
+    if (!gpu_hd_textures_active()) return;
+    if (g_b->hd_texture_note) { g_b->hd_texture_note(op, x, y, w, h, 0, 0); return; }
+    if (op == GR_HD_NOTE_TRACK_UPLOAD) gpu_hd_textures_track_upload(x, y, w, h, words);
+    else if (op == GR_HD_NOTE_BEGIN_UPLOAD) gpu_hd_textures_begin_upload(x, y, w, h);
+    else gpu_hd_textures_invalidate(x, y, w, h);
+}
+
 /* Residency describes guest native words, so any draw/copy which can touch
  * an upload ends its identity. Run after submission: an overlapping texture
  * draw must resolve its source before the destination invalidates it. */
@@ -100,7 +111,7 @@ static void hd_invalidate_draw(int x0, int y0, int x1, int y1) {
     if (x0 < ax0) x0 = ax0; if (x1 > ax1) x1 = ax1;
     if (y0 < ay0) y0 = ay0; if (y1 > ay1) y1 = ay1;
     if (x0 <= x1 && y0 <= y1)
-        gpu_hd_textures_invalidate(x0, y0, x1 - x0 + 1, y1 - y0 + 1);
+        hd_note(GR_HD_NOTE_INVALIDATE, x0, y0, x1 - x0 + 1, y1 - y0 + 1, NULL);
 }
 static void hd_invalidate_triangle(int x0, int y0, int x1, int y1, int x2, int y2) {
     int xmin = x0, xmax = x0, ymin = y0, ymax = y0;
@@ -151,7 +162,8 @@ enum {
     GOP_GOURAUD_TRI, GOP_TEX_TRI, GOP_SHADED_TEX_TRI, GOP_FLAT_RECT, GOP_TEX_RECT,
     GOP_TEX_RECT_SCALED, GOP_LINE, GOP_SHADED_LINE, GOP_VRAM_WRITE, GOP_VRAM_IN,
     GOP_SET_AREA, GOP_SET_OFFSET, GOP_WIDE_CONFIGURE, GOP_WIDE_VIEW, GOP_WIDE_TARGET,
-    GOP_WIDE_NO_TARGET, GOP_WIDE_CLEAR, GOP_WIDE_CLEAR_MARGINS,
+    GOP_WIDE_NO_TARGET, GOP_WIDE_CLEAR, GOP_WIDE_CLEAR_MARGINS, GOP_SET_DITHER,
+    GOP_SET_DEPTH_TRI,
     GOP_EXTERNAL = 0x1000   /* gr_post_external: ops owned by other modules (gpu.c) */
 };
 static int g_thr = 0;
@@ -219,6 +231,10 @@ static void gr_exec(uint32_t op, const void *data, uint32_t len) {
     case GOP_WIDE_CLEAR_MARGINS:
         if (g_b->wide_clear_margins) g_b->wide_clear_margins(a[0], a[1], a[2], (uint16_t)a[3], a[4]);
         break;
+    case GOP_SET_DITHER: if (g_b->set_dither) g_b->set_dither(a[0]); break;
+    case GOP_SET_DEPTH_TRI:
+        if (g_b->set_depth_triangle) g_b->set_depth_triangle(a[0], i2f(a[1]), i2f(a[2]), i2f(a[3]));
+        break;
     default: break;
     }
 }
@@ -255,6 +271,16 @@ static void wf_call(void *v) { WfArgs *a = (WfArgs *)v;
     a->r = g_b->wide_dump_full ? g_b->wide_dump_full(a->out, a->cap, a->ow, a->oh, a->base_x) : 0; }
 static void init_call(void *v) { g_b->init((uint16_t *)v); }
 
+/* Re-fetch the OpenGL table after the render thread starts or stops
+ * (gl_backend_get then returns the recording table, or the direct one). The
+ * effective backend does not change. */
+void gr_refresh_backend(void) {
+    if (g_effective == GR_BACKEND_OPENGL) {
+        const GpuRenderBackend *gl = gl_backend_get();
+        if (gl) g_b = gl;
+    }
+}
+
 /* ---- Dispatch wrappers (forward to the active backend, or post/sync to the
  * render thread while g_thr) ---- */
 void gr_init(uint16_t *vram)                         { if (g_thr) glt_call(init_call, vram); else g_b->init(vram); gpu_hd_textures_set_vram(vram); g_hd_offset_x = g_hd_offset_y = 0; g_hd_texture_window = 0; g_hd_semi = g_hd_perspective = 0; }
@@ -282,8 +308,34 @@ void gr_set_perspective_triangle(int enabled, float q0, float q1, float q2) {
     if (g_b->set_perspective_triangle)
         g_b->set_perspective_triangle(enabled, q0, q1, q2);
 }
-void gr_fill_rect(int x, int y, int w, int h, uint16_t c)  { if (g_thr) POSTI(GOP_FILL, x, y, w, h, c); else g_b->fill_rect(x, y, w, h, c); gpu_hd_textures_invalidate(x, y, w, h); }
-void gr_copy_rect(int sx, int sy, int dx, int dy, int w, int h) { if (g_thr) POSTI(GOP_COPY, sx, sy, dx, dy, w, h); else g_b->copy_rect(sx, sy, dx, dy, w, h); gpu_hd_textures_invalidate(dx, dy, w, h); }
+void gr_set_dither(int enabled) {
+    if (g_thr) { POSTI(GOP_SET_DITHER, enabled); return; }
+    if (g_b->set_dither) g_b->set_dither(enabled);
+}
+void gr_set_depth_triangle(int enabled, float z0, float z1, float z2) {
+    if (g_thr) { POSTI(GOP_SET_DEPTH_TRI, enabled, f2i(z0), f2i(z1), f2i(z2)); return; }
+    if (g_b->set_depth_triangle)
+        g_b->set_depth_triangle(enabled, z0, z1, z2);
+}
+void gr_fill_rect(int x, int y, int w, int h, uint16_t c)  { if (g_thr) POSTI(GOP_FILL, x, y, w, h, c); else g_b->fill_rect(x, y, w, h, c); hd_note(GR_HD_NOTE_INVALIDATE, x, y, w, h, NULL); }
+void gr_copy_rect(int sx, int sy, int dx, int dy, int w, int h) {
+    if (!gpu_hd_textures_active()) {
+        if (g_thr) POSTI(GOP_COPY, sx, sy, dx, dy, w, h); else g_b->copy_rect(sx, sy, dx, dy, w, h);
+        return;
+    }
+    if (g_b->hd_texture_note) {
+        /* Pre/post copy observations against the backend's own VRAM. */
+        g_b->hd_texture_note(GR_HD_NOTE_BEGIN_COPY, dx, dy, w, h, sx, sy);
+        g_b->copy_rect(sx, sy, dx, dy, w, h);
+        g_b->hd_texture_note(GR_HD_NOTE_END_COPY, 0, 0, 0, 0, 0, 0);
+        return;
+    }
+    if (g_effective == GR_BACKEND_VULKAN) g_b->vram_read(0,0);
+    gpu_hd_textures_begin_copy(sx,sy,dx,dy,w,h);
+    g_b->copy_rect(sx, sy, dx, dy, w, h);
+    if (g_effective == GR_BACKEND_VULKAN) g_b->vram_read(0,0);
+    gpu_hd_textures_end_copy();
+}
 void gr_draw_flat_triangle(int x0, int y0, int x1, int y1, int x2, int y2, uint16_t c) {
     if (g_thr) POSTI(GOP_FLAT_TRI, x0, y0, x1, y1, x2, y2, c);
     else g_b->draw_flat_triangle(x0, y0, x1, y1, x2, y2, c);
@@ -349,8 +401,16 @@ int gr_render_display_hires(uint32_t *o, int p, int dx, int dy, int dw, int dh) 
     if (g_thr) { RdArgs a = {0, o, p, dx, dy, dw, dh, 1}; glt_call(rd_call, &a); return a.r; }
     return g_b->render_display_hires(o, p, dx, dy, dw, dh);
 }
-void gr_vram_upload_begin(int x, int y, int w, int h) { gpu_hd_textures_invalidate(x,y,w,h); }
-void gr_vram_write(int x, int y, uint16_t pixel)     { if (g_thr) POSTI(GOP_VRAM_WRITE, x, y, pixel); else g_b->vram_write(x, y, pixel); gpu_hd_textures_invalidate(x,y,1,1); }
+void gr_vram_upload_begin(int x, int y, int w, int h) {
+    if (g_b->vram_upload_open) g_b->vram_upload_open(1);
+    hd_note(GR_HD_NOTE_BEGIN_UPLOAD, x, y, w, h, NULL);
+}
+void gr_vram_upload_commit(int x, int y, int w, int h, const uint16_t *d) {
+    gr_vram_transfer_in(x, y, w, h, d);
+    if (g_b->vram_upload_open) g_b->vram_upload_open(0);
+}
+void gr_vram_upload_set_open(int open) { if (g_b->vram_upload_open) g_b->vram_upload_open(open ? 1 : 0); }
+void gr_vram_write(int x, int y, uint16_t pixel)     { if (g_thr) POSTI(GOP_VRAM_WRITE, x, y, pixel); else g_b->vram_write(x, y, pixel); hd_note(GR_HD_NOTE_INVALIDATE, x, y, 1, 1, NULL); }
 uint16_t gr_vram_read(int x, int y) {
     if (g_thr) { VrArgs a = {x, y, 0}; glt_call(vr_call, &a); return a.r; }
     return g_b->vram_read(x, y);
@@ -364,7 +424,7 @@ void gr_vram_transfer_in(int x, int y, int w, int h, const uint16_t *d)  {
     } else {
         g_b->vram_transfer_in(x, y, w, h, d);
     }
-    gpu_hd_textures_track_upload(x,y,w,h,d);
+    hd_note(GR_HD_NOTE_TRACK_UPLOAD, x, y, w, h, d);
 }
 void gr_vram_transfer_out(int x, int y, int w, int h, uint16_t *d)       {
     if (g_thr) { VoArgs a = {x, y, w, h, d}; glt_call(vo_call, &a); return; }
@@ -403,6 +463,12 @@ void gr_wide_clear_margins(int base_x, int y, int h, uint16_t color, int sides) 
     if (g_thr) { POSTI(GOP_WIDE_CLEAR_MARGINS, base_x, y, h, color, sides); return; }
     if (g_b->wide_clear_margins)
         g_b->wide_clear_margins(base_x, y, h, color, sides);
+}
+void gr_wide_feedback_rect(int src_base, int src_x, int src_y, int dst_x, int dst_y,
+                           int w, int h, int r, int g, int b, int raw, int semi) {
+    if (g_b->wide_feedback_rect)
+        g_b->wide_feedback_rect(src_base, src_x, src_y, dst_x, dst_y, w, h, r, g, b,
+                                raw, semi);
 }
 int gr_render_wide_display(uint32_t *out, int pitch, int base_x,
                            int disp_y, int disp_h) {

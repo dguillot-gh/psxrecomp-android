@@ -61,11 +61,36 @@
  *     and the window mode refuses them (PSX_MOD_RENDER_PASS_BACKEND), and
  *     gl_renderer_pass_begin opens nothing there: a pass backs up and restores
  *     only the authoritative surface, never the window's tiles.
+ *   - mode "steps" (dynamic resolution, argv: scale = the ceiling, then a
+ *     comma list of levels, then "fresh" or "chain"): the scale steps at run
+ *     time between the ceiling and 1x; the hr and native-wide surfaces are
+ *     reallocated at the new level at each step.
+ *     "fresh" steps before anything is drawn, then renders the scene: the
+ *     runner requires the native digest, the frame at S and the wide surface
+ *     to equal the fixed-scale run at the final level.
+ *     "chain" renders the scene and the native-wide margins at the ceiling,
+ *     then steps through the list. Every step must leave the native VRAM
+ *     bit-identical; the displayed rect and the draw area must come back as
+ *     the nearest rescale of their old pixels (each block's top-left exact);
+ *     everything else must be the old top-left samples (blocks of one
+ *     colour); the wide margins must be the nearest rescale of the old ones.
+ *     Then the scene is drawn again and must equal the fixed-scale run at the
+ *     final level. In the window mode steps are refused and the scale stays.
+ *   - mode "composite-steps": explicitly tagged backgrounds own the centre
+ *     of native-wide too. Two held buffer composites must survive 3x -> 5x ->
+ *     3x as the nearest rescale of all their pixels, before any redraw.
  * Original source-owned scene; no retail payload. */
 #include "gpu_gl_renderer.c"
+#include "gl_postfx_projection_fixture.h"
+#include "gl_fmv_fixture.h"
 #include "gpu_hd_texture_stubs.inc"
 #include "mod_texture_banks.c"
+#include "gl_batch_policy_lle.c"
+#include "gl_batch_policy_hle.c"
+#include "gl_batch_policy_select.c"
 uint32_t psx_mod_gpu_dma_memory_alloc(uint32_t n,uint32_t a){(void)n;(void)a;return 0;}
+/* mod_texture_banks.c refuses inside a netplay host-output hook (mod_runtime.cpp); none here. */
+int psx_mod_host_output_scope(void){return 0;}
 uint32_t psx_mod_read_word(uint32_t a){(void)a;return 0;}
 int g_psx_vram_dirty_tracking=0;
 uint64_t s_frame_count=0;
@@ -73,24 +98,66 @@ void gpu_vram_dirty_mark_row_impl(uint32_t y){(void)y;}
 void gpu_vram_dirty_mark_rect(int x,int y,int w,int h){(void)x;(void)y;(void)w;(void)h;}
 void gpu_vram_dirty_mark_all(void){}
 int psx_netplay_active(void){return 0;}
+/* The renderer's facade hooks (gpu_render.c) for the render thread, which
+ * these fixtures never start. The HD fixture links the real facade. */
+#ifndef PSX_TEST_HD_TEXTURE_PACK
+GrBackend gr_backend(void){return GR_BACKEND_OPENGL;}
+void gr_refresh_backend(void){}
+#endif
+/* These renderer-only fixtures have no frontend telemetry/menu consumer. */
+void psx_video_telemetry_compose(int r,int s,int sw,int sh,int dw,int dh,int vw,int vh) {
+    (void)r;(void)s;(void)sw;(void)sh;(void)dw;(void)dh;(void)vw;(void)vh;
+}
+void psx_video_telemetry_present(int result) {(void)result;}
+int psx_host_menu_overlay_image(const uint32_t **p,int *w,int *h) {
+    *p=NULL;*w=*h=0;return 0;
+}
+
 int gpu_display_is_depth24(void){return 0;}
 void gpu_get_display_info(GpuDisplayInfo *out){memset(out,0,sizeof(*out));out->width=320;out->height=240;}
-int psx_ws_prim_in_backdrop(void){return 0;}
-int gpu_ws_nw_flat_backdrop_enabled(void){return 0;}
+static int test_backdrop_phase, test_flat_backdrop;
+int psx_ws_prim_in_backdrop(void){return test_backdrop_phase;}
+int gpu_ws_nw_flat_backdrop_enabled(void){return test_flat_backdrop;}
+static int test_background_full_composite;
+int gpu_ws_background_requires_full_composite(void){return test_background_full_composite;}
+/* Fixtures embedding this source rename main and supply their own frontend /
+ * HD adapters. The standalone scale fixture has no overlays or external pack. */
+#ifndef main
+int host_osd_needs_present(void){return 0;}
+int psx_present_vsync_owns_cadence(void){return 0;}
+void latency_ring_mark(LatencyStage stage){(void)stage;}
+void psx_host_sleep_ms(unsigned ms){SDL_Delay(ms);}
+void psx_host_sleep_micros(unsigned us){SDL_Delay((us + 999u) / 1000u);}
+int present_shot_take(char *out,int n){(void)out;(void)n;return 0;}
+void present_shot_done(int ok){(void)ok;}
+int host_osd_image(const uint32_t **p,int *w,int *h){*p=NULL;*w=*h=0;return 0;}
+int host_osd_volume_image(const uint32_t **p,int *w,int *h){return host_osd_image(p,w,h);}
+void host_osd_present_done(void){}
+int psx_rewind_overlay_image(const uint32_t **p,int *w,int *h){return host_osd_image(p,w,h);}
+float psx_rewind_slide(void){return 0.0f;}
+int psx_savestate_menu_overlay_image(const uint32_t **p,int *w,int *h){return host_osd_image(p,w,h);}
+void gpu_hd_textures_track_upload(int x,int y,int w,int h,const uint16_t *words){
+    (void)x;(void)y;(void)w;(void)h;(void)words;
+}
+void gpu_hd_textures_begin_upload(int x,int y,int w,int h){(void)x;(void)y;(void)w;(void)h;}
+void gpu_hd_textures_begin_copy(int sx,int sy,int dx,int dy,int w,int h){
+    (void)sx;(void)sy;(void)dx;(void)dy;(void)w;(void)h;
+}
+void gpu_hd_textures_end_copy(void){}
+void gpu_hd_textures_invalidate(int x,int y,int w,int h){(void)x;(void)y;(void)w;(void)h;}
+#endif
+void gpu_timeline_note(uint8_t kind,uint32_t a,uint32_t b){(void)kind;(void)a;(void)b;}
 int g_ws_tex_edge_pct=0;
 int psx_ws_prim_is_tagged(void){return 0;}
 void psx_ws_dbg_gate_frame_snapshot(void){}
 void gpu_depth24_upload_span_reset(void){}
 /* Netplay unsplit view and forward-pass opt-in: off in these fixtures. */
 int gpu_ws_netplay_local_viewport_width(void){return 0;}
-int gpu_ws_background_requires_full_composite(void){return 0;}
-void gpu_timeline_note(uint8_t kind,uint32_t a,uint32_t b){(void)kind;(void)a;(void)b;}
 int render_pass_netplay_enabled(void){return 0;}
 /* Guest clock the renderer's stereo-pair freshness reads; test stand-ins, as
  * in test_gl_readback_region.c. */
 uint64_t psx_cycle_count=0;
 uint32_t g_psx_vblank_cycles=564480u;
-
 static uint16_t vram[1024*512], peek[1024*512];
 static int si_max_dim(void) { return s_gl_max_dim > 0 ? s_gl_max_dim : 1 << 30; }
 static int checks, failures;
@@ -272,12 +339,17 @@ static int lines_main(int scale, int window) {
     glb_draw_line(5, 160, 90, 190, 0x7fff);
     glb_set_draw_area(0, 0, 1023, 511);
     {
-        /* Windowed: the batches' native-wide mirrors wait in the window's
-         * queue (replayed in one pass per surface at the next sync point). */
+        /* The batches' native-wide mirrors wait in the queue (replayed in
+         * one pass per surface at the next sync point): in the window mode,
+         * and above 1x on the full-VRAM surface unless PSX_GL_WIDE_QUEUE=0
+         * (at 1x lines mirror as GL_LINES, at once). */
         int wq = 0;
+        const char *qe = getenv("PSX_GL_WIDE_QUEUE");
+        int qoff = !window && qe && qe[0] == '0';
         for (int i = 0; i < s_hq_n; i++) wq += s_hq[i].wfbo != 0;
-        if (window && wq < 3) fprintf(stderr, "queued wide mirrors=%d\n", wq);
-        check(window ? wq >= 3 : s_hq_n == 0, "windowed: native-wide mirrors queued");
+        if ((window || scale > 1) && !qoff && wq < 3) fprintf(stderr, "queued wide mirrors=%d\n", wq);
+        if (window || scale > 1)
+            check(qoff ? s_hq_n == 0 : wq >= 3, "native-wide mirrors queued");
     }
     gl_renderer_sync_cpu();
     check(gl_renderer_fbo_peek(0, 0, 1024, 512, peek), "native peek");
@@ -593,6 +665,92 @@ static int twin_main(int scale, int window, int on) {
     return failures ? 1 : 0;
 }
 
+/* ---- mode "wmask": the native-wide mask stencil ---------------------------
+ * argv[3] "0"/"1": the centre splice (gl_wide_fast) off/on. Set-mask draws
+ * into both native-wide margins, unchecked opaque draws over them (the
+ * stencil falls behind alpha), the mask check turned on (the stencil is
+ * rebuilt) and checked draws across the margins and the centre, a dump in
+ * between (the centre splice at a present), then the same again with a
+ * full-frame overlay rect. The runner checks the native VRAM, the frame at S
+ * and the wide surface are the same with the mirror queue and the stale-rect
+ * stencil rebuild off and on (PSX_GL_WIDE_QUEUE=0, PSX_GL_WIDE_STENCIL_FULL=1). */
+static void wmask_dump(int scale, uint64_t *wide) {
+    int ww = 426 * scale, wh = 512 * scale, gw = 0, gh = 0;
+    uint32_t *wb = (uint32_t *)malloc((size_t)ww * wh * 4);
+    int got = wb ? glb_wide_dump_full(wb, ww * wh, &gw, &gh, 0) : 0;
+    check(got == ww * wh && gw == ww && gh == wh, "wide surface dump size");
+    if (got && wide) *wide = fnv(wb, (size_t)ww * wh * 4, 0xcbf29ce484222325ull);
+    free(wb);
+}
+static int wmask_main(int scale, int window, int fast) {
+    static uint16_t page[64 * 64], clut[16];
+    for (int i = 0; i < 64 * 64; i++) page[i] = (uint16_t)((i * 0x2469u) ^ (i >> 2) ^ 0x1111u);
+    for (int i = 0; i < 16; i++) clut[i] = (uint16_t)(i ? (0x0421u * (uint16_t)i) | ((i & 3) == 3 ? 0x8000u : 0) : 0);
+    glb_vram_transfer_in(512, 0, 64, 64, page);
+    glb_vram_transfer_in(512, 256, 16, 1, clut);
+    gl_renderer_set_wide_fast(fast);
+    glb_set_draw_area(0, 0, 1023, 511);
+    glb_set_draw_offset(0, 0);
+    glb_set_mask_bits(0, 0);
+    glb_set_semi_transparency(0, 0);
+    glb_set_color_modulation(128, 128, 128, 0);
+    if (window) check(hiw_ensure(0, FRAME_W) != NULL, "window covers the frame");
+    glb_fill_rect(0, 0, FRAME_W, FRAME_H, 0x0c63);
+    glb_wide_configure(426, 53);
+    glb_wide_set_target(0);
+    glb_set_draw_area(0, 0, FRAME_W - 1, FRAME_H - 1);
+    for (int round = 0; round < 2; round++) {
+        int y = round * 110;
+        /* Set-mask draws reaching both margins. */
+        glb_set_mask_bits(1, 0);
+        glb_draw_flat_rect(-40, y + 10, 100, 40, 0x001f);
+        glb_draw_textured_rect(290, y + 20, 64, 30, 0, 0, 512, 256, 0x0008);
+        glb_draw_gouraud_triangle(-30, y + 60, 0x001f, 60, y + 55, 0x7c00, 10, y + 100, 0x03e0);
+        /* Unchecked opaque draws over part of them: stencil behind alpha. */
+        glb_set_mask_bits(0, 0);
+        glb_draw_flat_rect(-50, y + 30, 60, 10, 0x03e0);
+        glb_draw_textured_rect(320, y + 35, 40, 10, 8, 8, 512, 256, 0x0008);
+        glb_draw_flat_triangle(140, y + 5, 200, y + 5, 170, y + 40, 0x7c1f);
+        /* The check on: rebuilt; checked draws across margins and centre. */
+        glb_set_mask_bits(0, 1);
+        glb_draw_flat_rect(-45, y + 15, 380, 12, 0x7fff);
+        glb_draw_textured_rect(-20, y + 40, 360, 20, 4, 4, 512, 256, 0x0008);
+        glb_draw_line(-30, y + 70, 360, y + 80, 0x5ef7);
+        glb_set_semi_transparency(1, 1);
+        glb_draw_flat_triangle(-40, y + 85, 360, y + 90, 150, y + 105, 0x2108);
+        glb_set_semi_transparency(0, 0);
+        wmask_dump(scale, NULL);   /* a present: the centre splice */
+        glb_set_mask_bits(0, 0);
+        glb_draw_flat_rect(30, y + 45, 280, 8, 0x4210);   /* centre, unchecked */
+        glb_set_mask_bits(0, 1);
+        glb_draw_flat_rect(-50, y + 44, 420, 12, 0x7c00);
+        if (round == 1) {   /* a full-frame overlay rect, checked */
+            glb_set_semi_transparency(1, 0);
+            glb_draw_flat_rect(0, 0, FRAME_W, FRAME_H, 0x0842);
+            glb_set_semi_transparency(0, 0);
+        }
+    }
+    glb_set_mask_bits(0, 0);
+    glb_set_draw_area(0, 0, 1023, 511);
+    gl_renderer_sync_cpu();
+    check(gl_renderer_fbo_peek(0, 0, 1024, 512, peek), "native peek");
+    uint64_t digest = fnv(peek, sizeof peek, 0xcbf29ce484222325ull);
+    int fw = FRAME_W * scale, fh = FRAME_H * scale, ow = 0, oh = 0;
+    uint32_t *img = (uint32_t *)malloc((size_t)fw * fh * 4);
+    int n = img ? gl_renderer_read_display_hires(0, 0, FRAME_W, FRAME_H, img, fw * fh, &ow, &oh) : 0;
+    check(n == fw * fh && ow == fw && oh == fh, "hires readback size");
+    uint64_t hires = n ? fnv(img, (size_t)fw * fh * 4, 0xcbf29ce484222325ull) : 0;
+    free(img);
+    uint64_t wide = 0;
+    wmask_dump(scale, &wide);
+    check(glGetError() == GL_NO_ERROR, "GL error");
+    printf("digest=%016llx\n", (unsigned long long)digest);
+    printf("hires=%016llx\n", (unsigned long long)hires);
+    printf("wide=%016llx\n", (unsigned long long)wide);
+    printf("checks=%d failures=%d\n", checks, failures);
+    return failures ? 1 : 0;
+}
+
 #if defined(PSX_TEST_RENDER_PASSES)
 /* Mode "passes": see the header. */
 static int passes_main(int scale, int window) {
@@ -608,6 +766,56 @@ static int passes_main(int scale, int window) {
               "window mode: pass_begin opens nothing");
     } else {
         check(why == PSX_MOD_RENDER_PASS_READY, "full-VRAM surface offers render passes");
+        gl_renderer_set_hd_texture_mode(1);
+        check(s_hd_native_authority, "HD authority enabled");
+        check(gl_renderer_pass_unavailable() == PSX_MOD_RENDER_PASS_READY,
+              "HD presentation surface offers render passes");
+        s_interp_w = FRAME_W * scale;
+        s_interp_h = FRAME_H * scale;
+        s_interp_source_path = GL_PRES_VRAM;
+        s_pass_verify = 1;
+        uint64_t before = fnv(vram, sizeof vram, 0xcbf29ce484222325ull);
+        int fw = FRAME_W * scale, fh = FRAME_H * scale, ow = 0, oh = 0;
+        uint32_t *pixels = (uint32_t *)malloc((size_t)fw * fh * 4u);
+        int count = pixels ? gl_renderer_read_display_hires(0, 0, FRAME_W,
+                         FRAME_H, pixels, fw * fh, &ow, &oh) : 0;
+        check(count == fw * fh && ow == fw && oh == fh,
+              "HD pass baseline display readback");
+        uint64_t frame_before = count == fw * fh
+            ? fnv(pixels, (size_t)fw * fh * 4u, 0xcbf29ce484222325ull) : 0;
+        int opened = gl_renderer_pass_begin(0, 0, FRAME_W, FRAME_H, 1, 2, 0);
+        check(opened, "HD pass opens");
+        if (opened) {
+            glb_set_draw_area(0, 0, FRAME_W - 1, FRAME_H - 1);
+            glb_draw_flat_rect(10, 10, 40, 40, 0x7fff);
+            flush_flat_batch();
+            check(fnv(vram, sizeof vram, 0xcbf29ce484222325ull) == before,
+                  "HD pass draw leaves authoritative CPU VRAM untouched");
+            gl_renderer_pass_end(32768, 1);
+            check(gl_renderer_pass_verify_vram(), "HD pass restores GPU and CPU VRAM");
+            check(fnv(vram, sizeof vram, 0xcbf29ce484222325ull) == before,
+                  "HD pass leaves native VRAM identical");
+        }
+        opened = gl_renderer_pass_begin(0, 0, FRAME_W, FRAME_H, 1, 2, 0);
+        check(opened, "HD discard pass opens");
+        if (opened) {
+            glb_draw_flat_rect(20, 20, 32, 32, 0x03e0);
+            flush_flat_batch();
+            gl_renderer_pass_end(0, 0); /* callback failed: keep no image */
+            check(gl_renderer_pass_verify_vram(),
+                  "discarded HD pass restores GPU and CPU VRAM");
+            check(fnv(vram, sizeof vram, 0xcbf29ce484222325ull) == before,
+                  "discarded HD pass preserves authoritative CPU digest");
+            ow = oh = 0;
+            count = pixels ? gl_renderer_read_display_hires(0, 0, FRAME_W,
+                             FRAME_H, pixels, fw * fh, &ow, &oh) : 0;
+            check(count == fw * fh && ow == fw && oh == fh &&
+                  fnv(pixels, (size_t)fw * fh * 4u,
+                      0xcbf29ce484222325ull) == frame_before,
+                  "discarded HD pass restores presented pixel digest");
+        }
+        free(pixels);
+        gl_renderer_set_hd_texture_mode(0);
     }
     check(glGetError() == GL_NO_ERROR, "GL error");
     printf("checks=%d failures=%d\n", checks, failures);
@@ -781,11 +989,415 @@ static int sbs_main(int scale) {
     return failures ? 1 : 0;
 }
 
+/* ---- mode "steps": dynamic internal resolution -------------------------- */
+#define STEPS_BACK_Y 256      /* the "back buffer": the draw area during steps */
+static void steps_wide_part(void) {
+    /* The scene's native-wide part (see main). */
+    glb_wide_configure(426, 53);
+    glb_wide_set_target(0);
+    glb_set_draw_area(0, 0, 319, 239);
+    glb_draw_flat_rect(-40, 20, 90, 30, 0x5ad6);
+    glb_draw_gouraud_triangle(250, 60, 0x001f, 372, 90, 0x7c00, 280, 150, 0x03e0);
+    glb_draw_textured_rect(300, 160, 64, 40, 0, 0, 512, 256, 0x0008);
+    glb_draw_line(-30, 225, 350, 225, 0x7fff);
+    glb_set_draw_area(0, 0, 1023, 511);
+}
+
+static uint32_t *steps_read(int x, int y, int w, int h) {
+    int S = s_out_scale, ow = 0, oh = 0;
+    uint32_t *img = (uint32_t *)malloc((size_t)w * S * h * S * 4);
+    int n = img ? gl_renderer_read_display_hires(x, y, w, h, img, w * S * h * S, &ow, &oh) : 0;
+    if (!n) { free(img); return NULL; }
+    return img;
+}
+
+/* Pixels of `after` (w x h native at snew) that are not the nearest rescale of
+ * `before` (at sold): block b, offset r -> old b*sold + r*sold/snew. */
+static long steps_rescale_mismatch(const uint32_t *before, int sold, const uint32_t *after,
+                                   int snew, int w, int h) {
+    long bad = 0;
+    int ow = w * sold, nw = w * snew;
+    for (int Y = 0; Y < h * snew; Y++) {
+        int oy = (Y / snew) * sold + ((Y % snew) * sold) / snew;
+        for (int X = 0; X < nw; X++) {
+            int ox = (X / snew) * sold + ((X % snew) * sold) / snew;
+            if ((after[(size_t)Y * nw + X] & 0xFFFFFFu) != (before[(size_t)oy * ow + ox] & 0xFFFFFFu))
+                bad++;
+        }
+    }
+    return bad;
+}
+
+/* Blocks of `after` (at snew) that are not one colour equal to the top-left
+ * sample of the same block of `before` (at sold). */
+static long steps_seed_mismatch(const uint32_t *before, int sold, const uint32_t *after,
+                                int snew, int w, int h) {
+    long bad = 0;
+    int ow = w * sold, nw = w * snew;
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            uint32_t want = before[(size_t)y * sold * ow + (size_t)x * sold] & 0xFFFFFFu;
+            int same = 1;
+            for (int j = 0; j < snew && same; j++)
+                for (int i = 0; i < snew; i++)
+                    if ((after[((size_t)y * snew + j) * nw + (size_t)x * snew + i] & 0xFFFFFFu) != want) {
+                        same = 0; break;
+                    }
+            bad += !same;
+        }
+    return bad;
+}
+
+static uint64_t steps_native_digest(int mask_lines) {
+    gl_renderer_sync_cpu();
+    check(gl_renderer_fbo_peek(0, 0, 1024, 512, peek), "native peek");
+    if (mask_lines)
+        for (int y = LINE_Y0; y < LINE_Y1; y++)
+            for (int x = LINE_X0; x < LINE_X1; x++) peek[y * 1024 + x] = 0;
+    return fnv(peek, sizeof peek, 0xcbf29ce484222325ull);
+}
+
+static uint64_t steps_hires_digest(int x, int y, int w, int h) {
+    uint32_t *img = steps_read(x, y, w, h);
+    check(img != NULL, "hires readback");
+    uint64_t d = img ? fnv(img, (size_t)w * s_out_scale * h * s_out_scale * 4,
+                           0xcbf29ce484222325ull) : 0;
+    free(img);
+    return d;
+}
+
+static uint64_t steps_wide_digest_for(int base, uint32_t **keep) {
+    int ww = 426 * s_out_scale, wh = 512 * s_out_scale, gw = 0, gh = 0;
+    uint32_t *wb = (uint32_t *)malloc((size_t)ww * wh * 4);
+    int got = wb ? glb_wide_dump_full(wb, ww * wh, &gw, &gh, base) : 0;
+    check(got == ww * wh && gw == ww && gh == wh, "wide surface dump size");
+    uint64_t d = got ? fnv(wb, (size_t)ww * wh * 4, 0xcbf29ce484222325ull) : 0;
+    if (keep) *keep = got ? wb : (free(wb), (uint32_t *)NULL);
+    else free(wb);
+    return d;
+}
+
+static uint64_t steps_wide_digest(uint32_t **keep) {
+    return steps_wide_digest_for(0, keep);
+}
+
+static int composite_steps_main(int ceiling, int window) {
+    check(!window && ceiling == 5, "full composite fixture uses full VRAM with a 5x ceiling");
+    if (window || ceiling != 5) return 1;
+    check(gl_renderer_step_internal_scale_now(3) && s_out_scale == 3,
+          "initial 3x level applied before drawing");
+    test_background_full_composite = 1;
+    gl_renderer_set_wide_fast(1);
+    glb_wide_configure(426, 53);
+    check(!view_enabled && !wide_center_is_canonical(),
+          "explicit background owns the centre with fast mirroring and no shifted view");
+    glb_set_draw_offset(0, 0);
+    glb_set_mask_bits(0, 0);
+    glb_set_semi_transparency(0, 0);
+    for (int bank = 0; bank < 2; bank++) {
+        int base = bank * 512;
+        glb_wide_disable_target();
+        glb_set_draw_area(base, 0, base + FRAME_W - 1, FRAME_H - 1);
+        glb_fill_rect(base, 0, FRAME_W, FRAME_H, 0x03e0);
+        /* A background composite differs from canonical VRAM in its centre.
+         * Keep both banks distinct and cover the held rows, including margins. */
+        glb_wide_clear(base, 0, 512, bank ? 0x4210 : 0x2d6b);
+        glb_wide_set_target(base);
+        glb_draw_gouraud_triangle(base - 40, 20, 0x001f,
+                                  base + 360, 50, 0x7c00,
+                                  base + 100, 220, 0x03ff);
+        glb_draw_flat_rect(base + 90, 80, 90, 50, bank ? 0x7c1f : 0x7fff);
+    }
+    gl_renderer_sync_cpu();
+    uint32_t *before[2] = {NULL, NULL};
+    for (int bank = 0; bank < 2; bank++) {
+        (void)steps_wide_digest_for(bank * 512, &before[bank]);
+        check(before[bank] && (before[bank][400 * 3 * 426 * 3 + 160 * 3] & 0xFFFFFFu),
+              "held composite has nonzero centre pixels outside the canonical frame");
+    }
+    const int levels[2] = {5, 3};
+    for (int i = 0; i < 2; i++) {
+        int sold = s_out_scale, snew = levels[i];
+        uint64_t native_before = steps_native_digest(0);
+        check(gl_renderer_step_internal_scale_now(snew) && s_out_scale == snew,
+              "held full composite scale step applied");
+        check(steps_native_digest(0) == native_before,
+              "held full composite step preserves guest-visible VRAM");
+        /* Read both banks before submitting any draw. The dump uses present's
+         * centre-copy rule, so copying canonical pixels cannot hide a loss. */
+        for (int bank = 0; bank < 2; bank++) {
+            uint32_t *after = NULL;
+            (void)steps_wide_digest_for(bank * 512, &after);
+            long bad = before[bank] && after
+                ? steps_rescale_mismatch(before[bank], sold, after, snew, 426, 512) : -1;
+            char label[128];
+            snprintf(label, sizeof label, "bank %d held full composite %dx -> %dx: every pixel rescaled before redraw",
+                     bank, sold, snew);
+            check(bad == 0, label);
+            printf("full composite bank=%d %dx -> %dx mismatch=%ld\n", bank, sold, snew, bad);
+            free(before[bank]);
+            before[bank] = after;
+        }
+    }
+    free(before[0]); free(before[1]);
+    check(glGetError() == GL_NO_ERROR, "full composite scale steps: GL error");
+    printf("checks=%d failures=%d\n", checks, failures);
+    return failures ? 1 : 0;
+}
+
+/* The hr and native-wide surfaces are allocated at the level they render at
+ * (not the ceiling, whose size every render pass would load and store on
+ * GL-on-Metal), and a step reallocates them at the new level. */
+static void steps_check_wide_alloc(int level) {
+    GLint tw = 0, th = 0;
+    glBindTexture(GL_TEXTURE_2D, s_wide_tex[0]);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &tw);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &th);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    check(tw == 426 * level && th == 512 * level && s_wide_as[0] == level,
+          "wide surface allocated at the level");
+    glBindTexture(GL_TEXTURE_2D, s_hr_tex);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &tw);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &th);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    check(tw == 1024 * level && th == 512 * level && s_hr_alloc == level,
+          "hr surface allocated at the level");
+}
+
+static int steps_main(int ceiling, int window, const char *chain, int fresh) {
+    int levels[32], n = 0;
+    for (const char *c = chain; c && *c && n < 32;) {
+        levels[n++] = atoi(c);
+        while (*c && *c != ',') c++;
+        if (*c == ',') c++;
+    }
+    if (window) {
+        /* The window mode keeps a fixed scale. */
+        check(gl_renderer_dynamic_resolution_ceiling() == 0, "window mode: no steps");
+        check(!gl_renderer_step_internal_scale_now(n ? levels[0] : 1) &&
+              s_out_scale == ceiling, "window mode: a step is refused, the scale stays");
+        printf("checks=%d failures=%d\n", checks, failures);
+        return failures ? 1 : 0;
+    }
+    if (gl_renderer_dynamic_resolution_ceiling() != ceiling)
+        fprintf(stderr, "ceiling=%d want %d\n", gl_renderer_dynamic_resolution_ceiling(), ceiling);
+    check(gl_renderer_dynamic_resolution_ceiling() == ceiling, "steps up to the ceiling");
+    GlScaleInfo si;
+    gl_renderer_scale_info(&si);
+    check(si.alloc_scale == ceiling && si.fbo_w == 1024 * ceiling, "allocated at the ceiling");
+    if (fresh) {
+        for (int i = 0; i < n; i++)
+            check(gl_renderer_step_internal_scale_now(levels[i]) && s_out_scale == levels[i],
+                  "step applied");
+        scene();
+        uint64_t digest = steps_native_digest(1);
+        uint64_t hires = steps_hires_digest(0, 0, FRAME_W, FRAME_H);
+        steps_wide_part();
+        steps_check_wide_alloc(s_out_scale);   /* created below the ceiling */
+        uint64_t wide = steps_wide_digest(NULL);
+        check(glGetError() == GL_NO_ERROR, "GL error");
+        printf("level=%d\n", s_out_scale);
+        printf("digest=%016llx\n", (unsigned long long)digest);
+        printf("hires=%016llx\n", (unsigned long long)hires);
+        printf("wide=%016llx\n", (unsigned long long)wide);
+        printf("checks=%d failures=%d\n", checks, failures);
+        return failures ? 1 : 0;
+    }
+    scene();
+    steps_wide_part();
+    steps_check_wide_alloc(ceiling);   /* the level is the ceiling here */
+    /* A back buffer with its own content, the draw area while stepping. */
+    glb_set_draw_area(0, STEPS_BACK_Y, FRAME_W - 1, STEPS_BACK_Y + FRAME_H - 1);
+    glb_wide_disable_target();
+    glb_fill_rect(0, STEPS_BACK_Y, FRAME_W, FRAME_H, 0x0c63);
+    glb_draw_gouraud_triangle(10, STEPS_BACK_Y + 10, 0x7c00, 300, STEPS_BACK_Y + 40, 0x03e0,
+                              120, STEPS_BACK_Y + 220, 0x001f);
+    glb_draw_textured_rect(180, STEPS_BACK_Y + 100, 64, 48, 0, 0, 512, 256, 0x0008);
+    /* Outside both rects, with detail below one native pixel (sloped edges,
+     * shading): a step keeps only each block's top-left sample there. */
+    const int OX = 680, OY = 280, OW = 256, OH = 192;
+    glb_set_draw_area(0, 0, 1023, 511);
+    glb_draw_gouraud_triangle(OX + 10, OY + 5, 0x7c1f, OX + 250, OY + 60, 0x03ff,
+                              OX + 60, OY + 185, 0x7fe0);
+    glb_draw_flat_triangle(OX + 120, OY + 20, OX + 240, OY + 170, OX + 20, OY + 120, 0x2d6b);
+    glb_set_draw_area(0, STEPS_BACK_Y, FRAME_W - 1, STEPS_BACK_Y + FRAME_H - 1);
+    glb_wide_set_target(0);
+    for (int i = 0; i < n; i++) {
+        int sold = s_out_scale, snew = levels[i];
+        /* The last step runs with mask checking on: the stencil must follow
+         * the new scale at once (no GP0(E6h) will ask for it). */
+        if (i == n - 1) glb_set_mask_bits(0, 1);
+        uint64_t d0 = steps_native_digest(0);
+        uint32_t *disp0 = steps_read(0, 0, FRAME_W, FRAME_H);
+        uint32_t *back0 = steps_read(0, STEPS_BACK_Y, FRAME_W, FRAME_H);
+        uint32_t *out0 = steps_read(OX, OY, OW, OH);
+        uint32_t *wide0 = NULL;
+        (void)steps_wide_digest(&wide0);
+        int ok = gl_renderer_step_internal_scale_now(snew);
+        char label[128];
+        snprintf(label, sizeof label, "step %dx -> %dx applied", sold, snew);
+        check(ok && s_out_scale == snew && s_hr_scale == snew, label);
+        steps_check_wide_alloc(snew);
+        GlDynresStats st;
+        gl_renderer_dynres_stats(&st);
+        uint64_t d1 = steps_native_digest(0);
+        snprintf(label, sizeof label, "step %dx -> %dx: native VRAM unchanged", sold, snew);
+        check(d1 == d0, label);
+        uint32_t *disp1 = steps_read(0, 0, FRAME_W, FRAME_H);
+        uint32_t *back1 = steps_read(0, STEPS_BACK_Y, FRAME_W, FRAME_H);
+        uint32_t *out1 = steps_read(OX, OY, OW, OH);
+        uint32_t *wide1 = NULL;
+        (void)steps_wide_digest(&wide1);
+        long bd = (disp0 && disp1) ? steps_rescale_mismatch(disp0, sold, disp1, snew, FRAME_W, FRAME_H) : -1;
+        long bb = (back0 && back1) ? steps_rescale_mismatch(back0, sold, back1, snew, FRAME_W, FRAME_H) : -1;
+        long bo = (out0 && out1) ? steps_seed_mismatch(out0, sold, out1, snew, OW, OH) : -1;
+        long bw = -1;
+        if (wide0 && wide1) {
+            /* Margins only (the centre is the frame, spliced at present). */
+            long l = 0;
+            int ow = 426 * sold, nw = 426 * snew;
+            for (int Y = 0; Y < 512 * snew; Y++) {
+                int oy = (Y / snew) * sold + ((Y % snew) * sold) / snew;
+                for (int X = 0; X < nw; X++) {
+                    int nx = X / snew;
+                    if (nx >= 53 && nx < 53 + 320) continue;
+                    int ox = nx * sold + ((X % snew) * sold) / snew;
+                    if ((wide1[(size_t)Y * nw + X] & 0xFFFFFFu) != (wide0[(size_t)oy * ow + ox] & 0xFFFFFFu))
+                        l++;
+                }
+            }
+            bw = l;
+        }
+        printf("step %dx -> %dx: rects=%d display=%ld back=%ld outside=%ld wide=%ld (%.2f ms)\n",
+               sold, snew, st.last_rects, bd, bb, bo, bw, st.last_ms);
+        snprintf(label, sizeof label, "step %dx -> %dx: displayed rect rescaled from its pixels", sold, snew);
+        check(bd == 0, label);
+        snprintf(label, sizeof label, "step %dx -> %dx: draw area rescaled from its pixels", sold, snew);
+        check(bb == 0, label);
+        snprintf(label, sizeof label, "step %dx -> %dx: elsewhere the old top-left samples", sold, snew);
+        check(bo == 0, label);
+        snprintf(label, sizeof label, "step %dx -> %dx: wide margins rescaled", sold, snew);
+        check(bw == 0, label);
+        free(disp0); free(disp1); free(back0); free(back1); free(out0); free(out1);
+        free(wide0); free(wide1);
+        if (i == n - 1) {
+            /* Rows 150..159 around the mask-set rect (250..279) hold pixels
+             * with bit 15 (that rect, and masked texels of the textured
+             * triangle). A rect drawn over them with the check on must keep
+             * every masked pixel and cover every other one. */
+            static uint16_t pre[1024 * 512];
+            glb_set_draw_area(0, 0, 1023, 511);
+            glb_wide_disable_target();
+            gl_renderer_sync_cpu();
+            check(gl_renderer_fbo_peek(0, 0, 1024, 512, pre), "native peek");
+            glb_draw_flat_rect(240, 150, 50, 10, 0x7fff);
+            gl_renderer_sync_cpu();
+            check(gl_renderer_fbo_peek(0, 0, 1024, 512, peek), "native peek");
+            int kept = 0, drawn = 0, masked = 0, wrong = 0;
+            for (int y = 150; y < 160; y++)
+                for (int x = 240; x < 290; x++) {
+                    uint16_t a = pre[y * 1024 + x], b = peek[y * 1024 + x];
+                    if (a & 0x8000) { masked++; kept += b == a; }
+                    else drawn += b == 0x7fff;
+                }
+            wrong = (masked - kept) + (500 - masked - drawn);
+            int hk = 0;
+            uint32_t *img = steps_read(250, 150, 30, 10);
+            if (img) {
+                for (int k = 0; k < 30 * snew * 10 * snew; k++)
+                    hk += (img[k] & 0xFFFFFFu) != 0xFFFFFFu;   /* not the white rect */
+                free(img);
+            }
+            printf("mask after step: masked=%d kept=%d drawn=%d at S kept=%d\n",
+                   masked, kept, drawn, hk);
+            check(masked >= 300 && wrong == 0, "mask check right after a step: native VRAM");
+            check(hk == 300 * snew * snew, "mask check right after a step: frame at S");
+            glb_set_mask_bits(0, 0);
+        }
+    }
+    /* Draw everything again at the final level: a fresh render at that scale.
+     * The steps' own content goes first (VRAM there is 0 in the scene). */
+    glb_wide_disable_target();
+    glb_set_draw_area(0, 0, 1023, 511);
+    glb_fill_rect(0, STEPS_BACK_Y, FRAME_W, FRAME_H, 0);
+    glb_fill_rect(OX, OY, OW, OH, 0);
+    scene();
+    uint64_t digest = steps_native_digest(1);
+    uint64_t hires = steps_hires_digest(0, 0, FRAME_W, FRAME_H);
+    glb_wide_clear(0, 0, 512, 0);
+    steps_wide_part();
+    uint64_t wide = steps_wide_digest(NULL);
+    check(glGetError() == GL_NO_ERROR, "GL error");
+    printf("level=%d\n", s_out_scale);
+    printf("digest=%016llx\n", (unsigned long long)digest);
+    printf("hires=%016llx\n", (unsigned long long)hires);
+    printf("wide=%016llx\n", (unsigned long long)wide);
+    printf("checks=%d failures=%d\n", checks, failures);
+    return failures ? 1 : 0;
+}
+
+/* A rope must meet its textured prop under both backdrop heuristics. Read the
+ * actual wide surface, including the queued mirror and supersampled paths. */
+static int backdrop_lines_main(int scale) {
+    test_background_full_composite = 1;
+    glb_wide_configure(426, 53);
+    glb_wide_set_target(0);
+    glb_set_draw_area(0, 0, 319, 239);
+    glb_set_draw_offset(0, 0);
+    glb_set_mask_bits(0, 0);
+    glb_set_semi_transparency(0, 0);
+    g_ws_bd_stretch_on = 1;
+    g_ws_bd_phase_mode = 1;
+    g_ws_bd_stretch_pct = 0;
+    for (int policy = 0; policy < 2; ++policy) for (int order = 0; order < 3; ++order) {
+        glb_wide_clear(0, 0, 512, 0);
+        test_flat_backdrop = policy == 0;
+        test_backdrop_phase = policy == 1;
+        /* Cover both a pending backdrop batch and its key remaining after a
+         * flush. Supersampled lines expand to triangles, but must not join
+         * that backdrop batch or inherit its horizontal stretch. */
+        if (order) glb_draw_flat_triangle(4, 4, 20, 4, 4, 12, 0x4210);
+        if (order == 2) gl_renderer_sync_cpu();
+        glb_draw_line(64, 20, 64, 100, 0x7fff);
+        glb_draw_shaded_line(100, 20, 0x7fff, 100, 100, 0x7fff);
+        test_backdrop_phase = 0;
+        uint16_t texels[64];
+        for (int i = 0; i < 64; ++i) texels[i] = 0x7c00;
+        glb_vram_transfer_in(512, 0, 8, 8, texels);
+        glb_set_color_modulation(128, 128, 128, 1);
+        glb_draw_textured_rect(60, 100, 8, 8, 0, 0, 0, 0, 8 | (2 << 7));
+        glb_draw_textured_rect(96, 100, 8, 8, 0, 0, 0, 0, 8 | (2 << 7));
+        gl_renderer_sync_cpu();
+        int w = 0, h = 0, cap = 426 * 512 * scale * scale;
+        uint32_t *pixels = malloc((size_t)cap * sizeof(*pixels));
+        int got = pixels ? glb_wide_dump_full(pixels, cap, &w, &h, 0) : 0;
+        check(got == cap, "rope wide readback");
+        if (got == cap) for (int x = 64; x <= 100; x += 36) {
+            int col = (53 + x) * scale;
+            check((pixels[80 * scale * w + col] & 0xffffff) == 0xf8f8f8,
+                  "world rope remains at its projected X");
+            check((pixels[103 * scale * w + col] & 0xffffff) == 0x0000f8,
+                  "textured prop remains under the rope endpoint");
+        }
+        free(pixels);
+    }
+    check(glGetError() == GL_NO_ERROR, "rope GL errors");
+    printf("checks=%d failures=%d\n", checks, failures);
+    return failures ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
     int scale = argc > 1 ? atoi(argv[1]) : 1;
     const char *mode = argc > 2 ? argv[2] : "scene";
     int window = !strcmp(mode, "window");
-    if (SDL_Init(SDL_INIT_VIDEO) != 0) return 2;
+    /* No video device, window or GL context (a headless or non-interactive
+     * session, such as Windows over SSH) is "this host cannot run the test":
+     * exit 77, which the harness reports as a CTest skip. A context that
+     * exists but fails the renderer's init is a failure. */
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+        fprintf(stderr, "SKIP no video (%s)\n", SDL_GetError());
+        return 77;
+    }
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
@@ -794,11 +1406,24 @@ int main(int argc, char **argv) {
 #endif
     SDL_Window *win = SDL_CreateWindow("Scale invariance hidden test", 0, 0, 128, 128,
                                        SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);
-    if (!win) return 2;
+    if (!win) { fprintf(stderr, "SKIP no window (%s)\n", SDL_GetError()); return 77; }
+    /* Probe with the renderer's attributes: the renderer drops its context on
+     * any init failure, so only a probe tells "no context" from "broken". */
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
+    SDL_GLContext probe = SDL_GL_CreateContext(win);
+    if (!probe) {
+        fprintf(stderr, "SKIP no GL 3.3 core context (%s)\n", SDL_GetError());
+        return 77;
+    }
+    SDL_GL_MakeCurrent(win, NULL);
+    SDL_GL_DeleteContext(probe);
     for (int i = 0; i < 1024*512; i++) vram[i] = 0;
     glb_init(vram);
     glb_set_scale(scale);
     gl_renderer_set_swap_interval(0);
+    if (!strcmp(mode, "steps") || !strcmp(mode, "composite-steps"))
+        gl_renderer_set_dynamic_resolution(1);
     if (!gl_renderer_init_context(win)) { fprintf(stderr, "FAIL context\n"); return 2; }
     GlScaleInfo si;
     gl_renderer_scale_info(&si);
@@ -829,6 +1454,22 @@ int main(int argc, char **argv) {
     }
 
     check(si.effective == scale, "requested scale allocated");
+    if (!strcmp(mode, "backdrop-lines")) {
+        int rc = backdrop_lines_main(scale);
+        gl_renderer_shutdown(); SDL_DestroyWindow(win); SDL_Quit();
+        return rc;
+    }
+    if (!strcmp(mode, "composite-steps")) {
+        int rc = composite_steps_main(scale, si.windowed);
+        gl_renderer_shutdown(); SDL_DestroyWindow(win); SDL_Quit();
+        return rc;
+    }
+    if (!strcmp(mode, "steps")) {
+        int rc = steps_main(scale, si.windowed, argc > 3 ? argv[3] : "",
+                            argc > 4 && !strcmp(argv[4], "fresh"));
+        gl_renderer_shutdown(); SDL_DestroyWindow(win); SDL_Quit();
+        return rc;
+    }
     if (!strcmp(mode, "sbs")) {
         int rc = sbs_main(scale);
         gl_renderer_shutdown(); SDL_DestroyWindow(win); SDL_Quit();
@@ -857,6 +1498,12 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "twin")) {
         if (si.windowed) check(si.hr_scale == 1, "window mode engaged");
         int rc = twin_main(scale, si.windowed, argc > 3 && argv[3][0] == '1');
+        gl_renderer_shutdown(); SDL_DestroyWindow(win); SDL_Quit();
+        return rc;
+    }
+    if (!strcmp(mode, "wmask")) {
+        if (si.windowed) check(si.hr_scale == 1, "window mode engaged");
+        int rc = wmask_main(scale, si.windowed, argc > 3 && argv[3][0] == '1');
         gl_renderer_shutdown(); SDL_DestroyWindow(win); SDL_Quit();
         return rc;
     }

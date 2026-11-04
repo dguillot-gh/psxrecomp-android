@@ -1,17 +1,45 @@
 #include "mod_runtime.h"
+#include "host_launch_timing.h"
+#include "host_overlay.h"
 #include "cpu_state.h"
+#include "spu.h"
 
 #include "disc_path.h"
+#include "disc_content_hash.h"
+#include "host_file_identity.h"
+#include "func_override.h"
+#include "host_sha256.h"
 #include "iso_reader.h"
+#include "mod_disc_read_session.h"
 #include "mod_packages.h"
 #include "mod_plugins.h"
+#include "mod_netplay.h"
+#include "mod_immediate.h"
+#include "psx_netplay.h"
 #include "gpu.h"
 #include "gpu_hd_textures.h"
 #include "psx_memory.h"
 #include "render_pass_projection.h"
 #include "psx_sha256.h"
+#include "psx_sha256_file.h"
 #include "cpu_state.h"
 #include "psx_lobby_client.h"
+
+extern "C" uint32_t host_launch_timing_snapshot(HostLaunchTimingEvent* out,
+    uint32_t cap, uint64_t* total, uint64_t* overwritten) {
+    return PSXRecompV4::host_launch_timing_ring().snapshot(out, cap, total, overwritten);
+}
+
+extern "C" const char* host_launch_timing_stage_name(uint32_t stage) {
+    static const char* const names[] = {
+        "provider_commit", "runtime_commit", "commit", "disc_hash",
+        "prepare_resources", "media_provider", "resolve", "overlay_verify",
+        "derived_disc", "save_state", "build_disc_index", "overlay_worker",
+        "overlay_join", "plugin_activation", "plugin_callback",
+        "provider_netplay_commit"
+    };
+    return stage < sizeof(names) / sizeof(names[0]) ? names[stage] : "unknown";
+}
 
 #if defined(RECOMP_LAUNCHER)
 #include "recomp_launcher.h"
@@ -23,6 +51,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <optional>
 #include <fstream>
 #include <iomanip>
@@ -31,6 +60,7 @@
 #include <string>
 #include <system_error>
 #include <vector>
+#include <type_traits>
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -40,6 +70,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
+
+static PSXModDiscRequestProvider g_disc_request_provider;
+static const PSXRecompV4::ModResolution::Plugin* g_disc_request_owner;
 
 extern "C" uint8_t psx_read_byte(uint32_t addr);
 extern "C" void psx_write_byte(uint32_t addr, uint8_t value);
@@ -63,13 +96,31 @@ uint32_t g_psx_mod_guest_functions = 0;
 uint32_t g_psx_mod_instruction_hooks = 0;
 /* Guest vblanks seen by the mod runtime: the plugin counters' time base. */
 static uint64_t g_mod_vblanks = 0;
+static void (*g_progress_hook)(void) = nullptr;
+
+extern "C" void mod_runtime_set_progress_hook(void (*hook)(void)) {
+    g_progress_hook = hook;
+}
 
 namespace PSXRecompV4 {
 namespace {
+thread_local const ModPrepareProgress* active_prepare_progress = nullptr;
+
+bool preparation_continues(float fraction, const char* text, std::string* error) {
+    if (!active_prepare_progress || !*active_prepare_progress ||
+        (*active_prepare_progress)(fraction,text)) return true;
+    if (error) *error = "Preparation canceled.";
+    return false;
+}
+
+bool netplay_lobby_view;
 
 struct RuntimeMods {
     struct DiscExtent { uint32_t lba, count; const uint8_t* data; };
     std::vector<DiscExtent> disc_extents;
+    struct DerivedDiscPatch { uint64_t offset; std::vector<uint8_t> bytes; };
+    std::vector<DerivedDiscPatch> derived_disc_patches;
+    std::vector<std::vector<uint8_t>> derived_disc_storage;
     struct AudioTrack { uint32_t lba, count, source_lba; const uint8_t* data; };
     std::vector<AudioTrack> audio_tracks;
     uint32_t extent_start = 0;
@@ -88,10 +139,23 @@ struct RuntimeMods {
     std::filesystem::path disc_path;
     std::filesystem::path effective_disc_path;
     uint32_t entry_phys = 0;
+    uint64_t preparation_revision = 1;
+    uint64_t ticket_revision = 0;
+    std::map<std::filesystem::path, std::string> ticket_files;
+    bool ticket_disc_independent = false;
+    bool ticket_ready = false;
+    bool catalog_stamped = false;
+    std::map<std::filesystem::path, std::string> loaded_catalog;
+    bool cached_prepare = false;
+    bool provider_preparing = false;
     bool initialized = false;
+    bool plan_committed = false;
     bool main_applied = false;
     bool disc_enabled = false;
     bool disc_guard_failed = false;
+    /* The plan is a netplay match's own-view set: its hooks run only inside
+     * psx_mod_render_local_view, its vblank/savestate callbacks not at all. */
+    bool netplay_view_plan = false;
     const ModResolution::Plugin* current_plugin = nullptr;
     CPUState* current_function_cpu = nullptr;
     bool current_function_finished = false;
@@ -102,32 +166,193 @@ RuntimeMods& state() {
     return value;
 }
 
-/* Guest calls made from an entry hook can deliver VBlank callbacks before
- * returning. Every callback owns its resource/completion context; restoring
- * only entry hooks would let VBlank erase the interrupted plugin or complete
- * a function that belongs to another callback. */
-class PluginCallbackScope {
-    RuntimeMods& runtime;
-    const ModResolution::Plugin* previous_plugin;
-    CPUState* previous_cpu;
-    bool previous_finished;
+/* "package/feature" of every feature whose plugin forced driver vsync off in
+ * this process (mod_runtime_note_vsync_forced_off), declared or not. The
+ * launcher's mod provider reports these as forcing vsync off alongside the
+ * features whose manifest says vsync = "off". */
+std::map<std::string, bool>& vsync_forced_features() {
+    static std::map<std::string, bool> value;
+    return value;
+}
+
+std::filesystem::path media_cache_root() {
+    std::filesystem::path root;
+#if defined(_WIN32)
+    if (const char* local = std::getenv("LOCALAPPDATA")) root = local;
+#else
+    if (const char* cache = std::getenv("XDG_CACHE_HOME")) root = cache;
+    else if (const char* home_dir = std::getenv("HOME")) root = std::filesystem::path(home_dir) / ".cache";
+#endif
+    if (root.empty()) root = std::filesystem::temp_directory_path();
+    return root / "psxrecomp/imports";
+}
+
+bool sha256_file(const std::filesystem::path&, std::string&, std::string*);
+
+/* A declarative offline selection with no disc target or source-backed
+ * contributions does not consume a whole-disc identity. Native plugins still
+ * validate their own runtime inputs; netplay always takes the full path. */
+bool offline_disc_independent(const RuntimeMods& s) {
+    if (!required_disc_sha256().empty()) return false;
+    for (const auto& entry : s.manager.packages()) {
+        const auto& id = entry.first;
+        const auto* package = s.manager.selected_package(id);
+        if (!package) continue;
+        bool matches_game = false;
+        for (const auto& target : package->targets) {
+            if (target.game_id != "*" && target.game_id != s.game_id) continue;
+            if (!target.disc_sha256.empty()) return false;
+            matches_game = true;
+        }
+        if (!matches_game) continue;
+        auto active = [&](const std::string& feature) {
+            return s.manager.feature_enabled(id, feature) ||
+                   s.manager.feature_implicitly_enabled(id, feature);
+        };
+        bool enabled = false;
+        for (const auto& feature : package->features) enabled |= active(feature.id);
+        if (!enabled) continue;
+        if (package->resolver != "declarative" || !package->prepare.empty() ||
+            !package->derived_discs.empty()) return false;
+        for (const auto& resource : package->resources)
+            if (active(resource.feature_id) && s.manager.feature_resource_active(
+                    id, resource.feature_id, resource.id)) return false;
+        for (const auto& overlay : package->overlays)
+            if (active(overlay.feature_id)) return false;
+        for (const auto& patch : package->patches)
+            if (active(patch.feature_id) && patch.target != ModPatchTarget::MainExe)
+                return false;
+    }
+    return true;
+}
+
+bool catalog_files(RuntimeMods&, std::map<std::filesystem::path, std::string>&);
+
+bool dependency_files(RuntimeMods& s, const std::filesystem::path& disc,
+                      std::map<std::filesystem::path, std::string>& files,
+                      bool disc_independent = false) {
+    files.clear();
+    if (disc_independent) return catalog_files(s, files);
+    auto add = [&](const std::filesystem::path& path) {
+        if (path.empty()) return true;
+        std::string stamp;
+        if (!host_file_identity(path, stamp)) return false;
+        files[path] = std::move(stamp);
+        return true;
+    };
+    if (!add(disc) || !add(resolve_disc_path(disc).data)) return false;
+    std::error_code ec;
+    size_t entries = 0;
+    for (std::filesystem::recursive_directory_iterator it(s.manager.root(), ec), end;
+         !ec && it != end; it.increment(ec)) {
+        if (++entries > 4096) return false;
+        if (it->is_regular_file(ec) && !add(it->path())) return false;
+    }
+    if (ec) return false;
+    for (const auto& [id, versions] : s.manager.packages()) {
+        (void)versions;
+        const auto* package = s.manager.selected_package(id);
+        if (!package) continue;
+        for (const auto& resource : package->resources) {
+            if (!s.manager.feature_enabled(id, resource.feature_id) &&
+                !s.manager.feature_implicitly_enabled(id, resource.feature_id)) continue;
+            if (!s.manager.feature_resource_active(id, resource.feature_id, resource.id)) continue;
+            const auto path = s.manager.feature_resource_path(id, resource.feature_id, resource.id);
+            if (!add(path)) return false;
+        }
+    }
+    return add(s.effective_disc_path);
+}
+
+bool record_selection_file(RuntimeMods& s,
+                           std::map<std::filesystem::path, std::string>& files) {
+    const auto path = s.manager.root() / "state.toml";
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) {
+        files.erase(path);
+        return !ec;
+    }
+    std::string hash;
+    if (!sha256_file(path, hash, nullptr)) return false;
+    files[path] = "sha256:" + hash;
+    return true;
+}
+
+bool catalog_files(RuntimeMods& s, std::map<std::filesystem::path, std::string>& files) {
+    files.clear();
+    std::error_code ec;
+    if (!std::filesystem::exists(s.manager.root(), ec)) return !ec;
+    size_t entries = 0;
+    for (std::filesystem::recursive_directory_iterator it(s.manager.root(), ec), end;
+         !ec && it != end; it.increment(ec)) {
+        if (++entries > 4096) return false;
+        if (it->path().filename() != "manifest.toml") continue;
+        std::string stamp;
+        if (!host_file_identity(it->path(), stamp)) {
+            if (!sha256_file(it->path(), stamp, nullptr)) return false;
+            stamp = "sha256:" + stamp;
+        }
+        files[it->path()] = std::move(stamp);
+    }
+    return !ec && record_selection_file(s, files);
+}
+
+bool prepared_ticket_matches(const std::filesystem::path& disc) {
+    auto& s = state();
+    if (!s.ticket_ready || s.main_applied || psx_mod_netplay_is_active() ||
+        !mod_runtime_session_plan_fp().empty() ||
+        disc != s.disc_path || s.ticket_revision != s.preparation_revision) return false;
+    std::map<std::filesystem::path, std::string> files;
+    if (s.ticket_disc_independent && !offline_disc_independent(s)) return false;
+    if (!dependency_files(s, disc, files, s.ticket_disc_independent) || files != s.ticket_files) return false;
+    auto manager = s.manager;
+    if (!manager.prepare_resources(s.game_id, disc, media_cache_root(), nullptr, true)) return false;
+    for (const auto& [id, versions] : s.manager.packages()) {
+        (void)versions;
+        const auto* package = s.manager.selected_package(id);
+        if (!package) continue;
+        for (const auto& resource : package->resources)
+            if (manager.feature_resource_path(id, resource.feature_id, resource.id) !=
+                s.manager.feature_resource_path(id, resource.feature_id, resource.id)) return false;
+    }
+    return true;
+}
+
+class ScopedFlag {
+    bool& flag;
+    const bool previous;
 public:
-    PluginCallbackScope(RuntimeMods& s, const ModResolution::Plugin* plugin,
-                        CPUState* cpu = nullptr)
-        : runtime(s), previous_plugin(s.current_plugin),
-          previous_cpu(s.current_function_cpu), previous_finished(s.current_function_finished) {
-        s.current_plugin = plugin;
-        s.current_function_cpu = cpu;
-        s.current_function_finished = false;
-    }
-    ~PluginCallbackScope() {
-        runtime.current_plugin = previous_plugin;
-        runtime.current_function_cpu = previous_cpu;
-        runtime.current_function_finished = previous_finished;
-    }
-    PluginCallbackScope(const PluginCallbackScope&) = delete;
-    PluginCallbackScope& operator=(const PluginCallbackScope&) = delete;
+    explicit ScopedFlag(bool& value) : flag(value), previous(value) { flag = true; }
+    ~ScopedFlag() { flag = previous; }
+    ScopedFlag(const ScopedFlag&) = delete;
+    ScopedFlag& operator=(const ScopedFlag&) = delete;
 };
+
+/* Guest scheduling can longjmp out of callback frames. Keep only trivial
+ * saved state alive across invocation: a destructor-based owner scope makes
+ * that escape undefined in C++. Normal returns and C++ exceptions restore
+ * immediately; the scheduler restores its saved context after a longjmp. */
+unsigned function_entry_depth;
+template <typename Callback>
+bool invoke_plugin_callback(RuntimeMods& s, const ModResolution::Plugin* plugin,
+                            CPUState* cpu, bool entry, Callback callback) {
+    static_assert(std::is_trivially_destructible<Callback>::value,
+                  "escape-capable callback adapter must have no destructor");
+    ModFunctionEntryContext previous;
+    mod_runtime_function_entry_context_save(&previous);
+    s.current_plugin = plugin;
+    s.current_function_cpu = cpu;
+    s.current_function_finished = false;
+    if (entry) ++function_entry_depth;
+    try {
+        const bool result = callback();
+        mod_runtime_function_entry_context_restore(&previous);
+        return result;
+    } catch (...) {
+        mod_runtime_function_entry_context_restore(&previous);
+        throw;
+    }
+}
 
 /* Function-entry hooks of the ACTIVE plan, flattened at plugin activation into
  * one table sorted by code key (address with the segment bits stripped, so a
@@ -147,7 +372,21 @@ std::vector<ActiveFunctionEntryHook>& active_function_entry_hooks() {
     static std::vector<ActiveFunctionEntryHook> value;
     return value;
 }
-unsigned function_entry_depth;
+
+
+struct ActivePCMHook {
+    PSXModPCMCallback callback;
+    const ModResolution::Plugin* plugin;
+};
+std::vector<ActivePCMHook> pcm_hooks;
+void mix_plugin_pcm(int16_t* stereo, uint32_t frames) {
+    for (const auto& hook : pcm_hooks) {
+        invoke_plugin_callback(state(), hook.plugin, nullptr, false, [&]() {
+            hook.callback(stereo, frames);
+            return false;
+        });
+    }
+}
 
 std::vector<ActiveFunctionEntryHook>& active_guest_functions() {
     static std::vector<ActiveFunctionEntryHook> value;
@@ -158,6 +397,7 @@ struct ActiveInstructionHook {
     uint32_t key, expected;
     PSXModFunctionEntryCallback callback;
     const ModResolution::Plugin* plugin;
+    PSXModMemoryAddressCallback memory_address;
 };
 std::vector<ActiveInstructionHook>& active_instruction_hooks() {
     static std::vector<ActiveInstructionHook> value;
@@ -168,9 +408,24 @@ inline uint32_t function_entry_key(uint32_t address) {
     return address & 0x1FFFFFFFu;
 }
 
+/* Game-owned netplay hooks are compiled into the executable. Keep them apart
+ * from the user mod plan, which every online match clears, so clearing that
+ * plan cannot disable the game's own netplay support. */
+std::vector<ActiveFunctionEntryHook>& game_netplay_entry_hooks() {
+    static std::vector<ActiveFunctionEntryHook> value;
+    return value;
+}
+
+void update_function_entry_count() {
+    g_psx_mod_function_entry_hooks = (uint32_t)(
+        active_function_entry_hooks().size() + game_netplay_entry_hooks().size());
+}
+
 void clear_function_entry_hooks() {
+    spu_set_pcm_overlay(nullptr);
+    pcm_hooks.clear();
     active_function_entry_hooks().clear();
-    g_psx_mod_function_entry_hooks = 0;
+    update_function_entry_count();
     active_guest_functions().clear();
     g_psx_mod_guest_functions = 0;
     active_instruction_hooks().clear();
@@ -189,7 +444,7 @@ void build_function_entry_hooks(const RuntimeMods& s) {
     std::stable_sort(table.begin(), table.end(),
                      [](const ActiveFunctionEntryHook& a,
                         const ActiveFunctionEntryHook& b) { return a.key < b.key; });
-    g_psx_mod_function_entry_hooks = (uint32_t)table.size();
+    update_function_entry_count();
     auto& functions = active_guest_functions();
     for (const auto& plugin : s.plan.plugins)
         for (const auto& function : mod_guest_functions(plugin.id))
@@ -200,10 +455,35 @@ void build_function_entry_hooks(const RuntimeMods& s) {
     auto& instructions = active_instruction_hooks();
     for (const auto& plugin : s.plan.plugins)
         for (const auto& hook : mod_instruction_hooks(plugin.id))
-            instructions.push_back({hook.address, hook.expected, hook.callback, &plugin});
+            instructions.push_back({hook.address, hook.expected, hook.callback, &plugin, hook.memory_address});
     std::stable_sort(instructions.begin(), instructions.end(),
                     [](const auto& a, const auto& b) { return a.key < b.key; });
     g_psx_mod_instruction_hooks = (uint32_t)instructions.size();
+    for (const auto& plugin : s.plan.plugins)
+        if (auto callback = mod_pcm_callback(plugin.id))
+            pcm_hooks.push_back({callback, &plugin});
+    if (!pcm_hooks.empty()) spu_set_pcm_overlay(mix_plugin_pcm);
+}
+
+/* Function overrides queue here at constructor time and are ARMED into the
+ * func_override tier only for plugins the resolved package plan selects —
+ * the same gating as vblank/activation callbacks. `id` is the full
+ * registered name (may carry a ":label" suffix, kept for diagnostics);
+ * `plugin` is the manifest-facing part gating matches on. */
+struct FunctionOverridePlugin {
+    std::string id;
+    std::string plugin;
+    uint32_t address = 0;
+    PSXModFunctionOverrideFn fn = nullptr;
+    uint32_t guard[FO_MAX_GUARD_WORDS] = {0, 0, 0, 0};
+    int n_guard = 0;
+    int32_t credit = 0;
+    bool armed = false;
+};
+
+std::vector<FunctionOverridePlugin>& function_override_plugins() {
+    static std::vector<FunctionOverridePlugin> value;
+    return value;
 }
 
 const ModPackage* selected_package(const std::string& id) {
@@ -348,64 +628,78 @@ bool restored_main_matches_plan(const RuntimeMods& s, uint32_t& failed_at) {
 
 bool sha256_file(const std::filesystem::path& path, std::string& out,
                  std::string* error) {
-    out.clear();
-    if (path.empty()) return true;
-    const DiscPathResolution resolved = resolve_disc_path(path);
-    const std::filesystem::path input = resolved.data;
-    psx_sha256_ctx hash;
-    psx_sha256_init(&hash);
-    std::string extension = resolved.mount.extension().string();
-    std::transform(extension.begin(), extension.end(), extension.begin(),
-        [](unsigned char c) { return (char)std::tolower(c); });
-    if (extension == ".chd") {
-        PS1::ISOReader disc;
-        if (!disc.Open(resolved.mount.string())) {
-            if (error) *error =
-                "cannot decode image fingerprint: " + resolved.mount.string();
-            return false;
-        }
-        std::array<uint8_t, 2352> sector{};
-        for (uint32_t lba = 0; lba < disc.GetSectorCount(); ++lba) {
-            if (!disc.ReadRawSector(lba, sector.data())) {
-                if (error) *error =
-                    "cannot finish decoding image fingerprint: " +
-                    resolved.mount.string();
-                return false;
-            }
-            psx_sha256_update(&hash, sector.data(), sector.size());
-        }
-        uint8_t digest[32];
-        psx_sha256_final(&hash, digest);
-        std::ostringstream text;
-        for (uint8_t byte : digest)
-            text << std::hex << std::setw(2) << std::setfill('0')
-                 << (unsigned)byte;
-        out = text.str();
-        return true;
-    }
+    return disc_content_sha256(path, out, error);
+}
 
-    std::vector<uint8_t> buffer(1024 * 1024);
-    std::ifstream file(input, std::ios::binary);
-    if (!file) {
-        if (error) *error = "cannot fingerprint image: " + input.string();
-        return false;
-    }
-    while (file) {
-        file.read((char*)buffer.data(), (std::streamsize)buffer.size());
-        const std::streamsize got = file.gcount();
-        if (got > 0) psx_sha256_update(&hash, buffer.data(), (size_t)got);
-    }
-    if (!file.eof()) {
-        if (error) *error =
-            "cannot finish fingerprinting image: " + input.string();
-        return false;
-    }
-    uint8_t digest[32];
-    psx_sha256_final(&hash, digest);
+bool measured_disc_digest(const std::filesystem::path& path, std::string& digest, std::string* error) {
+    HostLaunchTimingScope timing(HOST_LAUNCH_DISC_HASH);
+    if (!path.empty()) psx_mod_counter_add("startup.disc_hash", 1);
+    const bool ok = sha256_file(path, digest, error);
+    if (ok) timing.success();
+    return ok;
+}
+
+std::string sha256_text(const std::string& value) {
+    psx_sha256_ctx hash; psx_sha256_init(&hash);
+    psx_sha256_update(&hash, reinterpret_cast<const uint8_t*>(value.data()), value.size());
+    uint8_t bytes[32]; psx_sha256_final(&hash, bytes);
     std::ostringstream text;
-    for (uint8_t byte : digest)
-        text << std::hex << std::setw(2) << std::setfill('0') << (unsigned)byte;
-    out = text.str();
+    for (uint8_t byte : bytes) text << std::hex << std::setw(2) << std::setfill('0') << unsigned(byte);
+    return text.str();
+}
+
+// Offline only: semantics match sha256_file (CUE data / CHD raw sectors).
+bool offline_disc_digest(const std::filesystem::path& path, std::string& digest,
+                         std::string* error, bool cached_only) {
+    digest.clear();
+    if (path.empty()) return true;
+    const auto resolved = resolve_disc_path(path);
+    std::string stamp, mount_stamp;
+    const bool reliable = host_file_identity(resolved.data, stamp) &&
+        host_file_identity(resolved.mount, mount_stamp);
+    const std::string key = "disc-sha-v2\n" + resolved.mount.generic_string() + "\n" +
+        resolved.data.generic_string() + "\n" + stamp + "\n" + mount_stamp + "\n";
+    const bool cacheable = reliable && key.size() <= 4096;
+    const auto directory = media_cache_root() / "disc-digests-v2";
+    const auto receipt = directory / (sha256_text(key) + ".txt");
+    if (cacheable) {
+        std::ifstream file(receipt, std::ios::binary);
+        std::array<char, 4227> buffer{};
+        file.read(buffer.data(), buffer.size());
+        const std::string record(buffer.data(), size_t(file.gcount()));
+        if (file.eof() && record.size() == key.size() + 130 &&
+            record.compare(0, key.size(), key) == 0) {
+            const std::string value = record.substr(key.size(), 64);
+            const std::string body = key + value + "\n";
+            if (std::all_of(value.begin(), value.end(), [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); }) &&
+                record == body + sha256_text(body) + "\n") {
+                digest = value;
+                psx_mod_counter_add("startup.disc_digest_hit", 1);
+                return true;
+            }
+        }
+    }
+    if (cached_only) return false;
+    if (!measured_disc_digest(path, digest, error)) return false;
+    std::string after, mount_after;
+    if (!cacheable || !host_file_identity(resolved.data, after) || after != stamp ||
+        !host_file_identity(resolved.mount, mount_after) || mount_after != mount_stamp) return true;
+    std::error_code ec;
+    std::filesystem::create_directories(directory, ec);
+    if (ec) return true;
+#if defined(_WIN32)
+    const auto temporary = receipt.string() + "." + std::to_string(GetCurrentProcessId()) + ".tmp";
+#else
+    const auto temporary = receipt.string() + "." + std::to_string(getpid()) + ".tmp";
+#endif
+    const std::string body = key + digest + "\n";
+    { std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+      if (!(file << body << sha256_text(body) << '\n')) return true; }
+#if defined(_WIN32)
+    MoveFileExW(std::filesystem::path(temporary).c_str(), receipt.c_str(), MOVEFILE_REPLACE_EXISTING);
+#else
+    std::filesystem::rename(temporary, receipt, ec);
+#endif
     return true;
 }
 
@@ -513,8 +807,14 @@ bool sha256_disc_range(const std::filesystem::path& image,
     std::array<uint8_t, 2048> bytes{};
     size_t remaining = size;
     uint64_t at = location;
-    const bool raw_source = file_size > 0 &&
-        ((uint64_t)file_size % 2352u) == 0;
+    // Same geometry rule as the mount (cue TRACK mode, else sector-0 sync):
+    // a raw dump whose length happens to be a multiple of 2048 is still raw.
+    bool raw_source = false;
+    if (target == ModPatchTarget::DiscUser &&
+        !PS1::ISOReader::FirstFileIsRaw(image.string(), &raw_source)) {
+        if (error) *error = "cannot determine stock image sector geometry: " + image.string();
+        return false;
+    }
     while (remaining != 0) {
         uint64_t physical = at;
         size_t chunk = remaining;
@@ -720,6 +1020,93 @@ bool materialize_derived_disc(RuntimeMods& s, const ModResolution& plan,
     return true;
 }
 
+template <typename Callback>
+int mutate(Callback callback) {
+    state().ticket_ready = false;
+    ++state().preparation_revision;
+    std::string error;
+    if (!callback(error)) {
+        set_error(error);
+        return 0;
+    }
+    /* Preferences survive closing the launcher, independently of whether the
+     * selected content can be prepared or the player chooses PLAY. This saves
+     * only the selection; the running simulation keeps its committed plan. */
+    if (!state().manager.save_state(&error)) {
+        set_error(error);
+        return 0;
+    }
+    if (!record_selection_file(state(), state().loaded_catalog))
+        state().catalog_stamped = false;
+    if (!state().disc_path.empty())
+        state().validation = state().manager.resolve(
+            state().game_id, state().exe_sha256, state().disc_sha256, true);
+    else
+        state().validation = {};
+    state().error.clear();
+    return 1;
+}
+
+// Cache expensive image checks while drawing the launcher. Explicit folder
+// selection refreshes the result; activation always validates again.
+static std::map<std::string, std::pair<bool,std::string>> texture_install_status;
+static bool texture_install_check(const ModPackage& package,const std::string& feature,
+    std::string& error, bool fresh=false) {
+    if(state().manager.feature_option_value(package.id,feature,"replacements")=="false")return true;
+    for(const auto& resource:package.resources) {
+        if(resource.feature_id!=feature||resource.texture_game_id.empty())continue;
+        auto path=state().manager.feature_resource_path(package.id,feature,resource.id);
+        char resolved[4096]{},message[1024]{};
+        const std::string key=resource.texture_game_id+"\n"+path.u8string();
+        auto found=texture_install_status.find(key);
+        if(fresh||found==texture_install_status.end()) {
+            bool ok=gpu_hd_textures_validate_install(path.u8string().c_str(),resource.texture_game_id.c_str(),resolved,sizeof resolved,message,sizeof message)!=0;
+            found=texture_install_status.insert_or_assign(key,std::make_pair(ok,std::string(message))).first;
+        }
+        if(!found->second.first){error=found->second.second;return false;}
+    }
+    return true;
+}
+
+/* Feature switch / option edits shared by the launcher ABI provider and the
+ * in-game menu host (psx_mod_feature_enable / psx_mod_feature_set_option). */
+int feature_enable_impl(const char* package_id, const char* feature_id, int enabled) {
+    if (!package_id || !feature_id) return 0;
+    return mutate([&](std::string& error) {
+        const ModFeature* feature =
+            state().manager.selected_feature(package_id, feature_id);
+        const auto* package=selected_package(package_id);
+        if(enabled && package && !texture_install_check(*package,feature_id,error))return false;
+        if (feature && feature->legacy)
+            return state().manager.set_enabled(
+                package_id, enabled != 0, &error);
+        return state().manager.set_feature_enabled(
+            package_id, feature_id, enabled != 0, &error);
+    });
+}
+
+int feature_set_option_impl(const char* package_id, const char* feature_id,
+                            const char* option_id, const char* value) {
+    if (!package_id || !feature_id || !option_id || !value) return 0;
+    return mutate([&](std::string& error) {
+        const ModFeature* feature =
+            state().manager.selected_feature(package_id, feature_id);
+        if (feature && feature->legacy)
+            return state().manager.set_option(
+                package_id, option_id, value, &error);
+        if(std::strcmp(option_id,"replacements")==0 && std::strcmp(value,"true")==0) {
+            const auto* package=selected_package(package_id);
+            if(package)for(const auto& r:package->resources)if(r.feature_id==feature_id&&!r.texture_game_id.empty()) {
+                auto path=state().manager.feature_resource_path(package_id,feature_id,r.id);
+                char resolved[4096]{},message[1024]{};
+                if(!gpu_hd_textures_validate_install(path.u8string().c_str(),r.texture_game_id.c_str(),resolved,sizeof resolved,message,sizeof message)){error=message;return false;}
+            }
+        }
+        return state().manager.set_feature_option(
+            package_id, feature_id, option_id, value, &error);
+    });
+}
+
 #if defined(RECOMP_LAUNCHER)
 void copy_text(char* out, size_t capacity, const std::string& value) {
     if (!out || capacity == 0) return;
@@ -805,6 +1192,12 @@ int provider_choice_get(void*, const char* package_id, const char* option_id,
 template <typename Callback>
 int mutate(Callback callback);
 
+bool title_lobby_feature(const std::string& package, const std::string& feature) {
+    const auto* profile = psx_mod_netplay_profile();
+    return !netplay_lobby_view || !profile || !profile->loading_plugin_id ||
+        psx_mod_netplay_loading_feature(package.c_str(), feature.c_str());
+}
+
 bool provider_feature_at(int index, const ModPackage*& package,
                          const ModFeature*& feature) {
     if (index < 0) return false;
@@ -813,6 +1206,7 @@ bool provider_feature_at(int index, const ModPackage*& package,
         const ModPackage* selected = selected_package(package_id);
         if (!selected) continue;
         for (const ModFeature& candidate : selected->features) {
+            if (!title_lobby_feature(package_id, candidate.id)) continue;
             if (index-- == 0) {
                 package = selected;
                 feature = &candidate;
@@ -845,7 +1239,8 @@ int provider_feature_count(void*) {
     for (const auto& [package_id, versions] : state().manager.packages()) {
         (void)versions;
         const ModPackage* package = selected_package(package_id);
-        if (package) count += (int)package->features.size();
+        if (package) for (const auto& feature : package->features)
+            if (title_lobby_feature(package_id, feature.id)) ++count;
     }
     return count;
 }
@@ -876,6 +1271,9 @@ int provider_feature_get(void*, int index, RecompLauncherCModFeature* out) {
     copy_text(out->source_url, sizeof(out->source_url), package->source_url);
     copy_text(out->group, sizeof(out->group), feature->group);
     out->hidden = feature->hidden ? 1 : 0;
+#if defined(RECOMP_LAUNCHER_HAS_QUICK_MODS)
+    out->quick = state().manager.quick_visible(package->id, feature->id) ? 1 : 0;
+#endif
     switch (feature->channel) {
         case ModChannel::Experimental:
             out->channel = RECOMP_MOD_CHANNEL_EXPERIMENTAL;
@@ -891,6 +1289,11 @@ int provider_feature_get(void*, int index, RecompLauncherCModFeature* out) {
     }
     out->enabled =
         state().manager.feature_enabled(package->id, feature->id) ? 1 : 0;
+#if defined(RECOMP_LAUNCHER_HAS_MOD_VSYNC_OFF)
+    out->forces_vsync_off =
+        (feature->vsync_off ||
+         vsync_forced_features().count(package->id + "/" + feature->id)) ? 1 : 0;
+#endif
     out->option_count =
         (int)provider_feature_options(*package, feature->id).size();
     for (const ModResolution::Diagnostic& diagnostic :
@@ -959,33 +1362,30 @@ int provider_feature_choice_get(void*, const char* package_id,
 
 int provider_feature_enable(void*, const char* package_id,
                             const char* feature_id, int enabled) {
-    if (!package_id || !feature_id) return 0;
-    return mutate([&](std::string& error) {
-        const ModFeature* feature =
-            state().manager.selected_feature(package_id, feature_id);
-        if (feature && feature->legacy)
-            return state().manager.set_enabled(
-                package_id, enabled != 0, &error);
-        return state().manager.set_feature_enabled(
-            package_id, feature_id, enabled != 0, &error);
-    });
+    return feature_enable_impl(package_id, feature_id, enabled);
 }
 
 int provider_feature_set_option(void*, const char* package_id,
                                 const char* feature_id,
                                 const char* option_id,
                                 const char* value) {
-    if (!package_id || !feature_id || !option_id || !value) return 0;
-    return mutate([&](std::string& error) {
-        const ModFeature* feature =
-            state().manager.selected_feature(package_id, feature_id);
-        if (feature && feature->legacy)
-            return state().manager.set_option(
-                package_id, option_id, value, &error);
-        return state().manager.set_feature_option(
-            package_id, feature_id, option_id, value, &error);
-    });
+    return feature_set_option_impl(package_id, feature_id, option_id, value);
 }
+
+#if defined(RECOMP_LAUNCHER_HAS_QUICK_MODS)
+/* Quick Mods card membership only: saved to state.toml without touching
+ * activation, the preparation ticket or the execution fingerprint. */
+int provider_feature_set_quick(void*, const char* package_id,
+                               const char* feature_id, int quick) {
+    if (!package_id || !feature_id) return 0;
+    std::string error;
+    if (!state().manager.set_quick_visible(package_id, feature_id, quick != 0, &error)) {
+        set_error(error);
+        return 0;
+    }
+    return 1;
+}
+#endif
 
 int provider_feature_resource_count(void*, const char* package_id,
                                     const char* feature_id) {
@@ -995,7 +1395,8 @@ int provider_feature_resource_count(void*, const char* package_id,
     return (int)std::count_if(
         package->resources.begin(), package->resources.end(),
         [&](const ModResource& resource) {
-            return resource.feature_id == feature_id && !resource.hidden;
+            return resource.feature_id == feature_id && !resource.hidden &&
+                state().manager.feature_resource_active(package_id, feature_id, resource.id);
         });
 }
 
@@ -1006,7 +1407,8 @@ int provider_feature_resource_get(void*, const char* package_id,
     const ModPackage* package = selected_package(package_id);
     if (!package) return 0;
     for (const ModResource& resource : package->resources) {
-        if (resource.feature_id != feature_id || resource.hidden) continue;
+        if (resource.feature_id != feature_id || resource.hidden ||
+            !state().manager.feature_resource_active(package_id, feature_id, resource.id)) continue;
         if (index-- != 0) continue;
         const std::filesystem::path path =
             state().manager.feature_resource_path(
@@ -1014,7 +1416,7 @@ int provider_feature_resource_get(void*, const char* package_id,
         std::error_code ec;
         const bool directory =
             resource.format == "directory" || resource.format == "folder";
-        const bool verified = !path.empty() &&
+        bool verified = !path.empty() &&
             (directory ? std::filesystem::is_directory(path, ec)
                        : std::filesystem::is_regular_file(path, ec));
         std::memset(out, 0, sizeof(*out));
@@ -1030,6 +1432,17 @@ int provider_feature_resource_get(void*, const char* package_id,
                   resource.file_patterns);
         copy_text(out->file_description, sizeof(out->file_description),
                   resource.file_description);
+        if(!resource.texture_game_id.empty()) {
+            const std::string key=resource.texture_game_id+"\n"+path.u8string();
+            auto found=texture_install_status.find(key);
+            if(found==texture_install_status.end()) {
+                char resolved[4096]{},message[1024]{};
+                bool ok=gpu_hd_textures_validate_install(path.u8string().c_str(),resource.texture_game_id.c_str(),resolved,sizeof resolved,message,sizeof message)!=0;
+                found=texture_install_status.emplace(key,std::make_pair(ok,std::string(message))).first;
+            }
+            verified=found->second.first;
+            copy_text(out->status,sizeof(out->status),found->second.second);
+        }
         out->required = resource.required ? 1 : 0;
         out->verified = verified ? 1 : 0;
         copy_text(out->format, sizeof(out->format), resource.format);
@@ -1044,9 +1457,19 @@ int provider_feature_resource_set_path(void*, const char* package_id,
                                        const char* path) {
     if (!package_id || !feature_id || !resource_id || !path) return 0;
     return mutate([&](std::string& error) {
+        std::string selected=path;
+        const auto* package=selected_package(package_id);
+        if(package && path[0])for(const auto& resource:package->resources) {
+            if(resource.feature_id!=feature_id||resource.id!=resource_id||resource.texture_game_id.empty())continue;
+            texture_install_status.clear();
+            if(state().manager.feature_option_value(package_id,feature_id,"replacements")=="false")continue;
+            char resolved[4096]{},message[1024]{};
+            if(!gpu_hd_textures_validate_install(path,resource.texture_game_id.c_str(),resolved,sizeof resolved,message,sizeof message)){error=message;return false;}
+            selected=resolved;
+        }
         return state().manager.set_feature_resource_path(
             package_id, feature_id, resource_id,
-            std::filesystem::u8path(path), &error);
+            std::filesystem::u8path(selected), &error);
     });
 }
 
@@ -1110,21 +1533,6 @@ int provider_version_get(void*, const char* package_id, int index,
     return 1;
 }
 
-template <typename Callback>
-int mutate(Callback callback) {
-    std::string error;
-    if (!callback(error)) {
-        set_error(error);
-        return 0;
-    }
-    if (!state().disc_path.empty())
-        state().validation = state().manager.resolve(
-            state().game_id, state().exe_sha256, state().disc_sha256, true);
-    else
-        state().validation = {};
-    state().error.clear();
-    return 1;
-}
 
 int provider_install(void*, const char* path) {
     if (!path) return 0;
@@ -1132,6 +1540,9 @@ int provider_install(void*, const char* path) {
         std::string id, version;
         if (!state().manager.install_archive(path, &id, &version, &error)) return false;
         if (!state().manager.scan(&error)) return false;
+#if defined(PSX_LAUNCHER_MOD_COMMIT_WORKER_SAFE)
+        state().catalog_stamped = catalog_files(state(), state().loaded_catalog);
+#endif
         return state().manager.select_version(id, version, &error);
     });
 }
@@ -1139,7 +1550,11 @@ int provider_install(void*, const char* path) {
 int provider_remove(void*, const char* id, const char* version) {
     if (!id || !version) return 0;
     return mutate([&](std::string& error) {
-        return state().manager.remove_version(id, version, &error);
+        if (!state().manager.remove_version(id, version, &error)) return false;
+#if defined(PSX_LAUNCHER_MOD_COMMIT_WORKER_SAFE)
+        state().catalog_stamped = catalog_files(state(), state().loaded_catalog);
+#endif
+        return true;
     });
 }
 
@@ -1165,20 +1580,32 @@ int provider_set_option(void*, const char* id, const char* option, const char* v
 }
 
 int provider_commit(void*, const char* image_path) {
+    HostLaunchTimingScope timing(HOST_LAUNCH_PROVIDER_COMMIT);
     std::string error;
-    if (!mod_runtime_commit(image_path ? std::filesystem::path(image_path) :
-                                      std::filesystem::path(), &error)) {
+    const bool ok = mod_runtime_prepare_for_launcher(
+        image_path ? std::filesystem::path(image_path) : std::filesystem::path(), &error);
+    if (!ok) {
         set_error(error);
         return 0;
     }
     state().error.clear();
+    timing.success();
     return 1;
 }
 
 int provider_commit_netplay(void*, const char* image_path) {
+    HostLaunchTimingScope timing(HOST_LAUNCH_PROVIDER_NETPLAY_COMMIT);
     std::string error;
-    /* Without [netplay] content_negotiation every netplay session is vanilla. */
-    if (!(mod_runtime_netplay_content_negotiation()
+    if (!required_original_disc_matches(image_path ? std::filesystem::path(image_path) :
+            std::filesystem::path(), &error)) {
+        set_error(error);
+        return 0;
+    }
+    /* Trusted title profiles take precedence over optional package negotiation. */
+    if (!(psx_mod_netplay_profile()
+            ? mod_runtime_commit_netplay(image_path ? std::filesystem::path(image_path) :
+                                         std::filesystem::path(), &error)
+            : mod_runtime_netplay_content_negotiation()
             ? mod_runtime_commit_for_netplay(image_path ? std::filesystem::path(image_path) :
                                              std::filesystem::path(), &error)
             : mod_runtime_clear_for_netplay(&error))) {
@@ -1186,6 +1613,7 @@ int provider_commit_netplay(void*, const char* image_path) {
         return 0;
     }
     state().error.clear();
+    timing.success();
     return 1;
 }
 
@@ -1216,7 +1644,7 @@ RecompLauncherCModProvider provider = {
     provider_feature_set_option,
     provider_diagnostic_count,
     provider_diagnostic_get,
-    nullptr, /* archive_extension — PSX defaults */
+    nullptr, /* archive_extension â€” PSX defaults */
     nullptr, /* archive_description */
     provider_commit_netplay,
     provider_feature_resource_count,
@@ -1230,6 +1658,31 @@ RecompLauncherCModProvider provider = {
 static std::optional<ModPackageManager> offline_manager_before_netplay;
 static bool netplay_content_negotiation_enabled = false;
 
+void mod_runtime_set_netplay_lobby_view(bool active) { netplay_lobby_view = active; }
+
+static ModPackageManager title_loading_selection(const ModPackageManager& source) {
+    auto selected = source;
+    const auto* profile = psx_mod_netplay_profile();
+    for (const auto& [id, versions] : source.packages()) {
+        (void)versions;
+        const auto* package = source.selected_package(id);
+        if (!package) continue;
+        if (!profile || id != profile->loading_package_id) selected.set_enabled(id, false);
+        for (const auto& feature : package->features)
+            if (!psx_mod_netplay_loading_feature(id.c_str(), feature.id.c_str()))
+                selected.set_feature_enabled(id, feature.id, false);
+    }
+    return selected;
+}
+
+static bool verify_title_loading_disc(RuntimeMods& s,
+                                      const std::filesystem::path& disc_path,
+                                      std::string* error) {
+    s.disc_path = disc_path;
+    s.disc_sha256.clear();
+    return measured_disc_digest(disc_path, s.disc_sha256, error);
+}
+
 void mod_runtime_set_netplay_content_negotiation(bool enabled) {
     netplay_content_negotiation_enabled = enabled;
 }
@@ -1238,20 +1691,37 @@ bool mod_runtime_netplay_content_negotiation() {
     return netplay_content_negotiation_enabled;
 }
 
+/* Live option overrides (psx_mod_set_option_live) belong to one session's
+ * plan: initialising the runtime, committing a plan or switching to the
+ * netplay plan drops them, so a new plan's committed values are what the
+ * API answers (defined with the overrides below). */
+void reset_live_option_overrides();
+
 bool mod_runtime_initialize(const std::filesystem::path& root,
                             const std::string& game_id,
                             uint32_t game_entry_pc,
                             const std::filesystem::path& exe_path,
                             std::string* error) {
+    psx_mod_set_disc_request_provider(nullptr);
+    mod_runtime_set_mounted_disc_resolver(nullptr, nullptr);
+    psx_mod_netplay_set_active(0);
+    (void)psx_mod_netplay_set_options_identity("");
     RuntimeMods& s = state();
+    s.ticket_ready = false;
+    ++s.preparation_revision;
     offline_manager_before_netplay.reset();
     mod_runtime_set_session_plan_fp({});
     s.manager.set_root({});
     clear_function_entry_hooks();
     s.disc_extents.clear();
+    s.derived_disc_patches.clear();
+    s.derived_disc_storage.clear();
     s.audio_tracks.clear();
     s.extent_start = 0;
+    psx_mod_clear_function_replacements();
     s.plan = {};
+    s.plan_committed = false;
+    reset_live_option_overrides();  /* a new plan ends the last session's live values */
     s.validation = {};
     s.raw_disc_index.clear();
     s.user_disc_index.clear();
@@ -1269,8 +1739,23 @@ bool mod_runtime_initialize(const std::filesystem::path& root,
     s.disc_enabled = false;
     s.disc_guard_failed = false;
     s.manager.set_root(root);
+    // Optional comma-separated trusted title policy, stronger than omitting
+    // bundled manifests: stale/installed copies cannot reactivate these ids.
+#ifdef PSX_MOD_DISABLED_PACKAGES
+    std::vector<std::string> disabled_packages;
+    std::istringstream disabled_stream(PSX_MOD_DISABLED_PACKAGES);
+    for (std::string id; std::getline(disabled_stream, id, ','); )
+        if (!id.empty()) disabled_packages.push_back(id);
+    s.manager.set_disabled_packages(std::move(disabled_packages));
+#else
+    s.manager.set_disabled_packages({});
+#endif
     s.game_id = game_id;
     s.entry_phys = game_entry_pc & 0x1FFFFFFFu;
+#if defined(PSX_LAUNCHER_MOD_COMMIT_WORKER_SAFE)
+    std::map<std::filesystem::path, std::string> catalog_before;
+    const bool catalog_before_stamped = catalog_files(s, catalog_before);
+#endif
     if (!s.manager.scan(&s.error) || !s.manager.load_state(&s.error)) {
         if (error) *error = s.error;
         return false;
@@ -1313,15 +1798,19 @@ bool mod_runtime_initialize(const std::filesystem::path& root,
                 });
             if (resource == package->resources.end()) continue;
             std::error_code ec;
-            const auto pack = std::filesystem::absolute(
-                root / "texture-packs" / texture_game_id, ec);
+            std::string directory_error;
+            if (!s.manager.set_generated_feature_resource_default(package->id,
+                    plugin.feature_id, "pack", std::filesystem::path("texture-packs") / texture_game_id,
+                    &directory_error)) {
+                std::fprintf(stderr, "psxrecomp: texture pack folder: %s\n", directory_error.c_str());
+                continue;
+            }
+            const auto pack = s.manager.feature_resource_path(package->id, plugin.feature_id, "pack");
             if (!ec) std::filesystem::create_directories(pack / "replacements", ec);
             if (!ec) std::filesystem::create_directories(pack / "dumps", ec);
-            std::string directory_error;
-            if (ec || !s.manager.set_feature_resource_path(package->id,
-                    plugin.feature_id, "pack", pack, &directory_error)) {
+            if (ec) {
                 std::fprintf(stderr, "psxrecomp: texture pack folder: %s\n",
-                    ec ? ec.message().c_str() : directory_error.c_str());
+                    ec.message().c_str());
             }
         }
     }
@@ -1331,11 +1820,21 @@ bool mod_runtime_initialize(const std::filesystem::path& root,
         s.exe_sha256.clear();
         s.error.clear();
     }
+#if defined(PSX_LAUNCHER_MOD_COMMIT_WORKER_SAFE)
+    s.catalog_stamped = catalog_before_stamped && catalog_files(s, s.loaded_catalog) &&
+        catalog_before == s.loaded_catalog;
+#endif
     s.initialized = true;
     return true;
 }
 
 bool mod_runtime_clear_for_netplay(std::string* error) {
+    mod_reset_plugin_sessions();
+    psx_mod_netplay_set_active(0);
+    psx_mod_netplay_set_loading(0);
+    (void)psx_mod_netplay_set_options_identity("");
+    state().ticket_ready = false;
+    ++state().preparation_revision;
     RuntimeMods& s = state();
     if (!s.initialized) {
         if (error) error->clear();
@@ -1343,9 +1842,14 @@ bool mod_runtime_clear_for_netplay(std::string* error) {
     }
     clear_function_entry_hooks();
     s.disc_extents.clear();
+    s.derived_disc_patches.clear();
+    s.derived_disc_storage.clear();
     s.audio_tracks.clear();
     s.extent_start = 0;
     s.plan = {};
+    s.plan_committed = true; // Explicit vanilla session, not unresolved preparation.
+    reset_live_option_overrides();  /* a new plan ends the last session's live values */
+    psx_mod_clear_function_replacements();
     s.validation = {};
     s.raw_disc_index.clear();
     s.user_disc_index.clear();
@@ -1355,9 +1859,226 @@ bool mod_runtime_clear_for_netplay(std::string* error) {
     s.main_applied = false;
     s.disc_enabled = false;
     s.disc_guard_failed = false;
+    s.netplay_view_plan = false;
     s.error.clear();
+    /* Clearing s.plan is enough for activation/vblank callbacks — they only
+     * run while something iterates the plan. Function overrides are armed
+     * into func_override.c's own table with the dispatcher hook installed,
+     * so they survive a cleared plan and keep firing unless explicitly
+     * disarmed. That matters most on the rematch path (main.cpp jumps to
+     * session_reboot, which is PAST mod_runtime_activate_plugins and
+     * func_override_install), where a modded session entering netplay would
+     * otherwise print the vanilla banner and still run its overrides —
+     * diverging from a peer without the mod. Also re-arm-able: dropping the
+     * armed flag lets a later plan register the same override again. */
+    const int disarmed = func_override_reset_package_armed();
+    (void)disarmed;
+    for (FunctionOverridePlugin& pending : function_override_plugins())
+            pending.armed = false;
     if (error) error->clear();
     std::fprintf(stdout, "psxrecomp: mods cleared for netplay (vanilla session)\n");
+    return true;
+}
+
+static void feat_token_split(const std::string& token, std::string& name,
+                             std::string& opts);
+static bool feat_csv_apply_options(ModPackageManager& mgr,
+                                   const std::string& package_id,
+                                   const std::string& feature_id,
+                                   const char* csv, std::string* error);
+
+static bool prepare_profile_settings(const PSXModNetplayProfile* profile,
+                                      const PsxLobbyMatchCaps* caps,
+                                      ModResolution& plan,
+                                      std::string& options_identity,
+                                      std::string* error) {
+    RuntimeMods& s = state();
+    if (!s.initialized) {
+        if (error) *error = "Title netplay settings catalog is not initialized";
+        return false;
+    }
+    options_identity.clear();
+    if (profile->settings_package_id) {
+        const ModPackage* package = s.manager.selected_package(profile->settings_package_id);
+        if (!package || std::none_of(package->features.begin(), package->features.end(),
+                [&](const ModFeature& feature) { return feature.id == profile->settings_feature_id; })) {
+            if (error) *error = "Title netplay settings feature is not installed";
+            return false;
+        }
+        ModPackageManager settings = s.manager;
+        if (!settings.set_feature_enabled(package->id, profile->settings_feature_id, true, error))
+            return false;
+        const bool host_options = caps && caps->valid && caps->mod_count != 0;
+        if (host_options) {
+            if (caps->mod_count != 1 || package->id != caps->mods[0].id ||
+                package->version != caps->mods[0].ver) {
+                if (error) *error = "Title netplay profile accepts only its declared settings package";
+                return false;
+            }
+            std::string feature, options;
+            const std::string token = caps->mods[0].feats;
+            feat_token_split(token, feature, options);
+            if (feature != profile->settings_feature_id || token.find(',') != std::string::npos) {
+                if (error) *error = "Title netplay profile accepts only its declared settings feature";
+                return false;
+            }
+        }
+        for (const ModOption& option : package->options) {
+            if (option.feature_id != profile->settings_feature_id) continue;
+            const std::string value = host_options ? option.default_value :
+                s.manager.feature_option_value(package->id, option.feature_id, option.id);
+            if (!settings.set_feature_option(package->id, option.feature_id, option.id, value, error))
+                return false;
+        }
+        if (host_options && !feat_csv_apply_options(settings, package->id,
+                profile->settings_feature_id, caps->mods[0].feats, error)) return false;
+        ModSelection selection;
+        selection.version = package->version;
+        ModFeatureSelection& feature = selection.features[profile->settings_feature_id];
+        feature.enabled = feature.has_enabled = true;
+        for (const ModOption& option : package->options)
+            if (option.feature_id == profile->settings_feature_id)
+                feature.values[option.id] = settings.feature_option_value(
+                    package->id, option.feature_id, option.id);
+        plan.selections[package->id] = std::move(selection);
+        std::string identity = "psx-trusted-settings-v1\n" + package->id + "\n" +
+            package->version + "\n" + profile->settings_feature_id + "\n";
+        for (const auto& value : plan.selections[package->id].features[profile->settings_feature_id].values)
+            identity += value.first + "=" + value.second + "\n";
+        uint8_t digest[32];
+        psx_sha256_compute(reinterpret_cast<const uint8_t*>(identity.data()), identity.size(), digest);
+        static const char hex[] = "0123456789abcdef";
+        for (uint8_t value : digest) {
+            options_identity += hex[value >> 4];
+            options_identity += hex[value & 15];
+        }
+    }
+    return true;
+}
+
+/* Loader-only profiles use the existing lobby's one optional package offer.
+ * Settings-only profiles below retain their established canonical codec. */
+static bool prepare_profile_loader(const PSXModNetplayProfile* profile,
+                                    const PsxLobbyMatchCaps* caps,
+                                    const std::filesystem::path& disc_path,
+                                    ModResolution& plan, std::string& identity,
+                                    ModPackageManager& selected, bool& loading,
+                                    std::string* error) {
+    RuntimeMods& s = state();
+    selected = title_loading_selection(s.manager);
+    if (caps && caps->valid) {
+        if (caps->mod_count < 0 || caps->mod_count > 1 ||
+            (caps->mod_count == 1 &&
+             (std::strcmp(caps->mods[0].id, profile->loading_package_id) ||
+              std::strcmp(caps->mods[0].feats, profile->loading_feature_id)))) {
+            if (error) *error = "Unsupported mod in the title netplay loading plan";
+            return false;
+        }
+        if (caps->mod_count == 1 && !selected.select_version(profile->loading_package_id,
+                caps->mods[0].ver, error)) return false;
+        if (!selected.set_feature_enabled(profile->loading_package_id,
+                profile->loading_feature_id, caps->mod_count == 1, error)) return false;
+    }
+    loading = selected.feature_enabled(profile->loading_package_id, profile->loading_feature_id);
+    if (!verify_title_loading_disc(s, disc_path, error)) return false;
+    plan = selected.resolve(s.game_id, s.exe_sha256, s.disc_sha256);
+    if (!plan.ok || !plan.writes.empty() || !plan.overlays.empty() ||
+        !plan.derived_discs.empty() || !plan.resources.empty() ||
+        plan.plugins.size() != (loading ? 1u : 0u) ||
+        (loading && (plan.plugins[0].id != profile->loading_plugin_id ||
+                     !mod_plugin_registered(profile->loading_plugin_id)))) {
+        if (error) *error = "Title loading option must resolve to its native plugin";
+        return false;
+    }
+    if (caps && caps->valid && caps->mod_count == 1 && plan.fingerprint != caps->mod_plan_fp) {
+        if (error) *error = "Title loading option differs from the host's verified plan";
+        return false;
+    }
+    identity = plan.fingerprint;
+    return true;
+}
+
+bool mod_runtime_netplay_settings_fingerprint(const PsxLobbyMatchCaps& caps,
+                                               std::string& fingerprint,
+                                               std::string* error) {
+    fingerprint.clear();
+    const PSXModNetplayProfile* profile = psx_mod_netplay_profile();
+    if (!profile || !profile->settings_package_id || !caps.valid || caps.mod_count != 1) {
+        if (error) *error = "Title netplay settings offer is missing";
+        return false;
+    }
+    ModResolution plan;
+    return prepare_profile_settings(profile, &caps, plan, fingerprint, error);
+}
+
+bool mod_runtime_commit_netplay(const std::filesystem::path& disc_path,
+                                std::string* error) {
+    if (!mod_runtime_clear_for_netplay(error)) return false;
+    const PSXModNetplayProfile* profile = psx_mod_netplay_profile();
+    if (!profile) return true;
+    RuntimeMods& s = state();
+    if (!s.initialized || !mod_plugin_registered(profile->plugin_id)) {
+        if (error) *error = "Title netplay simulation plugin is not registered";
+        return false;
+    }
+    ModResolution plan;
+    std::string options_identity;
+    const PsxLobbyMatchCaps* caps = psx_lobby_match_caps();
+    ModPackageManager loader_selection;
+    bool loading = false;
+    if (profile->loading_plugin_id) {
+        if (!prepare_profile_loader(profile, caps, disc_path, plan, options_identity,
+                                    loader_selection, loading, error)) return false;
+    } else if (!prepare_profile_settings(profile, caps, plan, options_identity, error)) return false;
+    if (profile->settings_package_id && caps && caps->valid && caps->mod_count != 0 &&
+        options_identity != caps->mod_plan_fp) {
+        if (error) *error = "Title netplay settings fingerprint does not match the host offer";
+        return false;
+    }
+    const bool option_renderer = profile->renderer_option_id &&
+        s.manager.feature_option_value(plan, profile->settings_package_id,
+            profile->settings_feature_id, profile->renderer_option_id) == profile->renderer_option_value;
+    const char* renderer = psx_mod_netplay_aspect() || option_renderer
+        ? profile->widescreen_plugin_id : nullptr;
+    if (renderer && !mod_plugin_registered(renderer)) {
+        if (error) *error = "Title netplay renderer plugin is not registered";
+        return false;
+    }
+    if (!profile->settings_package_id && !profile->loading_plugin_id &&
+        caps && caps->valid && caps->mod_count != 0) {
+        if (error) *error = "Title netplay profile does not accept package mod plans";
+        return false;
+    }
+    if (!psx_mod_netplay_set_options_identity(options_identity.c_str())) {
+        if (error) *error = "Title netplay settings identity is invalid";
+        return false;
+    }
+    if (profile->loading_plugin_id) psx_mod_netplay_set_loading(loading);
+    plan.ok = true;
+    plan.fingerprint = profile->compatibility_id;
+    if (!options_identity.empty()) {
+        char identity[65];
+        if (!psx_mod_netplay_content_identity("", identity)) return false;
+        plan.fingerprint = identity;
+    }
+    plan.plugins.push_back({profile->plugin_id,
+        profile->settings_package_id ? profile->settings_package_id : "",
+        profile->settings_feature_id ? profile->settings_feature_id : ""});
+    if (renderer) plan.plugins.push_back({renderer, "", ""});
+    s.disc_path = disc_path;
+    s.plan = std::move(plan);
+    s.plan_committed = true;
+    reset_live_option_overrides();  /* a new plan ends the last session's live values */
+    if (profile->loading_plugin_id) {
+        if (!offline_manager_before_netplay) offline_manager_before_netplay = s.manager;
+        s.manager = std::move(loader_selection);
+        mod_runtime_set_session_plan_fp(options_identity);
+        std::fprintf(stdout, "psxrecomp: title netplay loading = %s\n",
+                     loading ? "resident assets" : "original disc loader");
+    } else mod_runtime_set_session_plan_fp({});
+    psx_mod_netplay_set_active(1);
+    std::fprintf(stdout, "psxrecomp: title netplay profile %s (%s)\n",
+                 profile->compatibility_id, profile->plugin_id);
     return true;
 }
 
@@ -1498,6 +2219,9 @@ static bool apply_host_mod_plan(const PsxLobbyMatchCaps& caps, std::string* erro
                 continue;
             }
             for (const ModFeature& feature : package->features) {
+                /* The player's own, in every netplay mode: a host's plan
+                 * neither carries nor switches it. */
+                if (feature.host_only) continue;
                 const bool want = required >= 0 &&
                     feat_csv_wants(caps.mods[required].feats, feature.id);
                 const bool have = s.manager.feature_enabled(package_id, feature.id);
@@ -1536,6 +2260,7 @@ static bool apply_host_mod_plan(const PsxLobbyMatchCaps& caps, std::string* erro
             continue;
         }
         for (const ModFeature& feature : package->features) {
+            if (feature.host_only) continue;
             const bool want = feat_csv_wants(pkg.feats, feature.id);
             if (!s.manager.set_feature_enabled(pkg.id, feature.id, want, &err) && want) {
                 if (error) *error = err;
@@ -1568,39 +2293,60 @@ static bool netplay_resources_verified(const ModResolution& plan,
     return true;
 }
 
-bool mod_runtime_prepare_resources(const std::filesystem::path& disc_path, std::string* error) {
+static bool prepare_resources(const std::filesystem::path& disc_path, std::string* error,
+                              bool require_disc_identity) {
+    HostLaunchTimingScope timing(HOST_LAUNCH_PREPARE_RESOURCES);
     RuntimeMods& s = state();
-    if (!s.initialized) return true;
-    std::filesystem::path media_cache;
-#if defined(_WIN32)
-    if (const char* local = std::getenv("LOCALAPPDATA")) media_cache = local;
-#else
-    if (const char* cache = std::getenv("XDG_CACHE_HOME")) media_cache = cache;
-    else if (const char* home_dir = std::getenv("HOME")) media_cache = std::filesystem::path(home_dir) / ".cache";
-#endif
-    if (media_cache.empty()) media_cache = std::filesystem::temp_directory_path();
-    media_cache /= "psxrecomp/imports";
-    if (!s.manager.prepare_resources(s.game_id, disc_path, media_cache, &s.error)) {
+    if (!s.initialized) { timing.success(); return true; }
+    // Cold lobby offers prepare without committing a plan. Establish their
+    // selected disc identity too; final commit independently revalidates it.
+    if (require_disc_identity && !disc_path.empty() &&
+        (disc_path != s.disc_path || s.disc_sha256.empty())) {
+        std::string digest;
+        if (!measured_disc_digest(disc_path, digest, &s.error)) {
+            if (error) *error = s.error;
+            return false;
+        }
+        s.disc_path = disc_path;
+        s.disc_sha256 = std::move(digest);
+    }
+    const auto media_cache = media_cache_root();
+    if (!s.manager.prepare_resources(s.game_id, disc_path, media_cache, &s.error, s.cached_prepare,
+            active_prepare_progress ? *active_prepare_progress : ModPrepareProgress{})) {
         if (error) *error = s.error;
         return false;
     }
+    timing.success();
     return true;
+}
+
+bool mod_runtime_prepare_resources(const std::filesystem::path& disc_path, std::string* error) {
+    return prepare_resources(disc_path, error, true);
 }
 
 bool mod_runtime_verify_session_plan_fp(std::string* error);
 
-bool mod_runtime_commit(const std::filesystem::path& disc_path, std::string* error, bool save_selection) {
-    RuntimeMods& s = state();
-    if (!s.initialized) return true;
-    if (disc_path != s.disc_path) {
-        std::string hash_error, digest;
-        if (!sha256_file(disc_path, digest, &hash_error)) digest.clear();
-        s.disc_path = disc_path;
-        s.disc_sha256 = std::move(digest);
-    }
-    if (!mod_runtime_prepare_resources(disc_path, error)) return false;
-    ModResolution plan =
-        s.manager.resolve(s.game_id, s.exe_sha256, s.disc_sha256);
+static void note_disc(RuntimeMods& s, const std::filesystem::path& disc_path) {
+    if (disc_path == s.disc_path && !s.disc_sha256.empty()) return;
+    std::string hash_error, digest;
+    if (!sha256_file(disc_path, digest, &hash_error)) digest.clear();
+    s.disc_path = disc_path;
+    s.disc_sha256 = std::move(digest);
+}
+
+/* Capture before resolution: a resolver may mutate a resource while running. */
+struct PreparedPlanInputs {
+    std::filesystem::path disc_path;
+    std::string disc_identity, data_identity;
+    std::map<std::filesystem::path, std::string> dependencies;
+    bool disc_stamped = false, stable = false;
+    bool disc_independent = false;
+};
+
+static bool install_plan(RuntimeMods& s, ModResolution plan,
+                         bool save_selection, bool verify_netplay,
+                         std::string* error,
+                         const PreparedPlanInputs* inputs = nullptr) {
     s.validation = plan;
     /* A derived activation is not in state.toml, so name it: a player (or a
      * test) reading the log can see why a hidden feature is running. */
@@ -1620,49 +2366,226 @@ bool mod_runtime_commit(const std::filesystem::path& disc_path, std::string* err
         if (error) *error = s.error;
         return false;
     }
-    if (!save_selection && (!netplay_resources_verified(plan, &s.error) ||
+    for(const auto& plugin:plan.plugins) {
+        if(plugin.id!="psx.hd-textures")continue;
+        const auto* package=s.manager.selected_package(plugin.package_id);
+        if(package&&!texture_install_check(*package,plugin.feature_id,s.error,true)) {
+            if(error)*error=s.error;return false;
+        }
+    }
+    if (verify_netplay && (!netplay_resources_verified(plan, &s.error) ||
                            !mod_runtime_verify_session_plan_fp(&s.error))) {
         if (error) *error = s.error;
         return false;
     }
-    for (const ModResolution::Overlay& overlay : plan.overlays) {
-        if (overlay.expected_sha256.empty()) continue;
-        std::string actual;
-        if (!sha256_disc_range(
-                s.disc_path, overlay.target, overlay.location,
-                overlay.payload.size(), actual, &s.error) ||
-            actual != overlay.expected_sha256) {
-            if (s.error.empty())
-                s.error = overlay.package_id + "/" + overlay.feature_id +
-                    ": stock overlay range checksum failed";
+    {
+        HostLaunchTimingScope overlay_timing(HOST_LAUNCH_OVERLAY_VERIFY);
+        for (const ModResolution::Overlay& overlay : plan.overlays) {
+            if (overlay.expected_sha256.empty()) continue;
+            std::string actual;
+            if (!sha256_disc_range(
+                    s.disc_path, overlay.target, overlay.location,
+                    overlay.payload.size(), actual, &s.error) ||
+                actual != overlay.expected_sha256) {
+                if (s.error.empty())
+                    s.error = overlay.package_id + "/" + overlay.feature_id +
+                        ": stock overlay range checksum failed";
+                if (error) *error = s.error;
+                return false;
+            }
+        }
+        overlay_timing.success();
+    }
+    std::filesystem::path effective_disc;
+    {
+        HostLaunchTimingScope derived_timing(HOST_LAUNCH_DERIVED_DISC);
+        if (!materialize_derived_disc(s, plan, effective_disc, &s.error)) {
             if (error) *error = s.error;
             return false;
         }
+        derived_timing.success();
     }
-    std::filesystem::path effective_disc;
-    if (!materialize_derived_disc(s, plan, effective_disc, &s.error)) {
+#if defined(PSX_LAUNCHER_MOD_COMMIT_WORKER_SAFE)
+    std::map<std::filesystem::path, std::string> after_resolve;
+    std::string disc_after, data_after;
+    const bool unchanged_disc = inputs && (inputs->disc_independent || inputs->disc_path.empty() ||
+        (inputs->disc_stamped && host_file_identity(inputs->disc_path, disc_after) &&
+         inputs->disc_identity == disc_after &&
+         host_file_identity(resolve_disc_path(inputs->disc_path).data, data_after) &&
+         inputs->data_identity == data_after));
+    const bool unchanged_inputs = unchanged_disc && inputs->stable &&
+        dependency_files(s, inputs->disc_path, after_resolve, inputs->disc_independent) &&
+        inputs->dependencies == after_resolve;
+#endif
+    if (!preparation_continues(1.0f,"Content ready",&s.error)) {
         if (error) *error = s.error;
         return false;
     }
-    if (save_selection && !s.manager.save_state(&s.error)) {
-        if (error) *error = s.error;
-        return false;
+    if (save_selection) {
+        HostLaunchTimingScope save_timing(HOST_LAUNCH_SAVE_STATE);
+        if (!s.manager.save_state(&s.error)) {
+            if (error) *error = s.error;
+            return false;
+        }
+        if (!record_selection_file(s, s.loaded_catalog)) s.catalog_stamped = false;
+        save_timing.success();
     }
+    psx_mod_set_disc_request_provider(nullptr);
     /* Hooks follow activation, never a bare commit: a new plan runs none of
      * its function-entry hooks until mod_runtime_activate_plugins(). */
     clear_function_entry_hooks();
     s.disc_extents.clear();
+    s.derived_disc_patches.clear();
+    s.derived_disc_storage.clear();
     s.audio_tracks.clear();
     s.extent_start = 0;
     s.plan = std::move(plan);
-    build_disc_index(s);
+    s.plan_committed = true;
+    reset_live_option_overrides();  /* a new plan ends the last session's live values */
+    psx_mod_clear_function_replacements();
+    {
+        HostLaunchTimingScope index_timing(HOST_LAUNCH_BUILD_DISC_INDEX);
+        build_disc_index(s);
+        index_timing.success();
+    }
     s.effective_disc_path = std::move(effective_disc);
     s.main_applied = false;
     s.error.clear();
+#if defined(PSX_LAUNCHER_MOD_COMMIT_WORKER_SAFE)
+    if (save_selection && (s.provider_preparing || s.cached_prepare) &&
+        s.catalog_stamped && unchanged_inputs && session_plan_fp().empty()) {
+        s.ticket_revision = s.preparation_revision;
+        s.ticket_disc_independent = inputs->disc_independent;
+        s.ticket_ready = dependency_files(s, inputs->disc_path, s.ticket_files,
+                                         s.ticket_disc_independent);
+    }
+#endif
     return true;
 }
 
+bool mod_runtime_commit(const std::filesystem::path& disc_path, std::string* error, bool save_selection) {
+    HostLaunchTimingScope timing(HOST_LAUNCH_COMMIT);
+    RuntimeMods& s = state();
+    // Base-disc policy cannot be bypassed by disabling every package.
+    if (!required_original_disc_matches(disc_path, error)) return false;
+    s.netplay_view_plan = false;
+    if (!s.initialized) { timing.success(); return true; }
+    if (!preparation_continues(-1.0f,"Checking selected content",error)) return false;
+#if defined(PSX_LAUNCHER_MOD_COMMIT_WORKER_SAFE)
+    std::map<std::filesystem::path, std::string> catalog;
+    if (s.catalog_stamped && (!catalog_files(s, catalog) || catalog != s.loaded_catalog)) {
+        s.ticket_ready = false;
+        s.error = "Mod catalog or saved selections changed after loading; reopen the launcher to reload them.";
+        if (error) *error = s.error;
+        return false;
+    }
+    if (save_selection && prepared_ticket_matches(disc_path)) {
+        if (!s.provider_preparing) s.ticket_ready = false;
+        clear_function_entry_hooks();
+        s.disc_extents.clear();
+        s.derived_disc_patches.clear();
+        s.derived_disc_storage.clear();
+        s.audio_tracks.clear();
+        s.extent_start = 0;
+        s.main_applied = false;
+        s.error.clear();
+        psx_mod_counter_add("startup.plan_reuse", 1);
+        timing.success();
+        return true;
+    }
+#endif
+    s.ticket_ready = false;
+    PreparedPlanInputs inputs;
+    inputs.disc_path = disc_path;
+#if defined(PSX_LAUNCHER_MOD_COMMIT_WORKER_SAFE)
+    inputs.disc_independent = save_selection && !psx_mod_netplay_is_active() &&
+        session_plan_fp().empty() && offline_disc_independent(s);
+    inputs.disc_stamped = disc_path.empty() ||
+        (host_file_identity(disc_path, inputs.disc_identity) &&
+         host_file_identity(resolve_disc_path(disc_path).data, inputs.data_identity));
+#endif
+#if !defined(PSX_LAUNCHER_MOD_COMMIT_WORKER_SAFE)
+    // Offline legacy commits retain path-based digest reuse. A netplay commit
+    // must remeasure even after a same-path lobby offer was prepared.
+    const bool need_hash = !save_selection || disc_path != s.disc_path;
+#else
+    const bool need_hash = !inputs.disc_independent;
+#endif
+    if (need_hash) {
+        std::string hash_error, digest;
+#if defined(PSX_LAUNCHER_MOD_COMMIT_WORKER_SAFE)
+        const bool hashed = save_selection
+            ? offline_disc_digest(disc_path, digest, &hash_error, s.cached_prepare)
+            : measured_disc_digest(disc_path, digest, &hash_error);
+#else
+        const bool hashed = measured_disc_digest(disc_path, digest, &hash_error);
+#endif
+        if (!hashed && s.cached_prepare) return false;
+        if (!hashed) digest.clear();
+        s.disc_path = disc_path;
+        s.disc_sha256 = std::move(digest);
+    } else if (inputs.disc_independent) {
+        s.disc_path = disc_path;
+        s.disc_sha256.clear();
+    }
+    if (!prepare_resources(disc_path, error, !inputs.disc_independent)) return false;
+#if defined(PSX_LAUNCHER_MOD_COMMIT_WORKER_SAFE)
+    inputs.stable = dependency_files(s, disc_path, inputs.dependencies, inputs.disc_independent);
+#else
+    inputs.stable = false;
+#endif
+    ModResolution plan;
+    {
+        HostLaunchTimingScope resolve_timing(HOST_LAUNCH_RESOLVE);
+        plan = s.manager.resolve(s.game_id, s.exe_sha256, s.disc_sha256);
+        if (plan.ok) resolve_timing.success();
+    }
+    const bool ok = install_plan(s, std::move(plan), save_selection,
+                                 !save_selection, error, &inputs);
+    if (ok) timing.success();
+    return ok;
+}
+
+bool mod_runtime_prepare_for_launcher(const std::filesystem::path& disc_path, std::string* error,
+                                      const ModPrepareProgress& progress) {
+    struct Scope {
+        const ModPrepareProgress* previous;
+        explicit Scope(const ModPrepareProgress& current) : previous(active_prepare_progress) {
+            active_prepare_progress = &current;
+        }
+        ~Scope() { active_prepare_progress = previous; }
+    } scope(progress);
+    ScopedFlag flag(state().provider_preparing);
+    return mod_runtime_commit(disc_path, error, true);
+}
+
+bool mod_runtime_try_prepare_cached(const std::filesystem::path& disc_path) {
+#if defined(PSX_LAUNCHER_MOD_COMMIT_WORKER_SAFE)
+    try {
+        auto& s = state();
+        if (!s.initialized || s.main_applied || psx_mod_netplay_is_active() ||
+            !session_plan_fp().empty()) return false;
+        auto probe = s.manager;
+        if (!probe.prepare_resources(s.game_id, disc_path, media_cache_root(), nullptr, true)) return false;
+        ScopedFlag flag(s.cached_prepare);
+        const bool ok = mod_runtime_commit(disc_path, nullptr, true);
+        if (ok && s.ticket_ready) psx_mod_counter_add("startup.preload_hit", 1);
+        return ok && s.ticket_ready;
+    } catch (...) {
+        // Preload is best effort before the launcher exists. The ordinary
+        // provider path reports full-preparation errors once UI is available.
+        state().ticket_ready = false;
+        return false;
+    }
+#else
+    (void)disc_path;
+    return false;
+#endif
+}
+
 void mod_runtime_set_session_plan_fp(const std::string& fp) {
+    state().ticket_ready = false;
+    ++state().preparation_revision;
     session_plan_fp() = fp;
 }
 
@@ -1670,12 +2593,32 @@ const std::string& mod_runtime_session_plan_fp() {
     return session_plan_fp();
 }
 
-std::string mod_runtime_plan_fingerprint_portable() {
+std::string mod_runtime_plan_fingerprint_portable(const std::filesystem::path& disc_path,
+                                                 std::string* error) {
     RuntimeMods& s = state();
     if (!s.initialized) return {};
-    ModResolution plan = s.manager.resolve(s.game_id, s.exe_sha256, std::string());
+    // Portable means path-independent, never independent of exact disc identity.
+    const auto* profile = psx_mod_netplay_profile();
+    const bool title_loading = profile && profile->loading_plugin_id;
+    if (title_loading && !verify_title_loading_disc(s, disc_path, error)) return {};
+    // An offline disc-independent plan deliberately has no whole-disc hash.
+    // A requested portable/netplay fingerprint still binds the actual disc.
+    if (!title_loading && !disc_path.empty() &&
+        (s.disc_path != disc_path || s.disc_sha256.empty())) {
+        std::string digest;
+        if (!measured_disc_digest(disc_path, digest, error)) return {};
+        s.disc_path = disc_path;
+        s.disc_sha256 = std::move(digest);
+    }
+    auto manager = title_loading ? title_loading_selection(s.manager) : s.manager;
+    ModResolution plan = manager.resolve(s.game_id, s.exe_sha256,
+                                         s.disc_sha256);
     if (!plan.ok || !netplay_resources_verified(plan)) return {};
     return plan.fingerprint;
+}
+
+std::string mod_runtime_plan_fingerprint_portable() {
+    return mod_runtime_plan_fingerprint_portable(state().disc_path);
 }
 
 bool mod_runtime_verify_session_plan_fp(std::string* error) {
@@ -1690,15 +2633,22 @@ bool mod_runtime_verify_session_plan_fp(std::string* error) {
     return false;
 }
 
+static bool commit_netplay_own_features(const std::filesystem::path& disc_path,
+                                        std::string* error, bool host_only_features);
+
 bool mod_runtime_commit_for_netplay(const std::filesystem::path& disc_path,
                                     std::string* error) {
+    if (psx_mod_netplay_profile()) return mod_runtime_commit_netplay(disc_path, error);
     RuntimeMods& s = state();
     const PsxLobbyMatchCaps* caps = psx_lobby_match_caps();
     if (!caps || !caps->valid)
         return mod_runtime_commit_for_direct_netplay(disc_path, error);
     if (caps->mod_count <= 0) {
         session_plan_fp().clear();
-        return mod_runtime_clear_for_netplay(error);
+        /* The host published no mods: the shared game is vanilla. The
+         * player's host-only features (presentation, audio output, host
+         * tools) are no part of it and stay theirs, as in every mode. */
+        return commit_netplay_own_features(disc_path, error, true);
     }
     if (!caps->mod_plan_fp[0]) {
         if (error) *error = "Netplay mod plan is missing its fingerprint.";
@@ -1720,6 +2670,7 @@ bool mod_runtime_commit_for_netplay(const std::filesystem::path& disc_path,
 
 bool mod_runtime_commit_for_direct_netplay(const std::filesystem::path& disc_path,
                                            std::string* error) {
+    if (psx_mod_netplay_profile()) return mod_runtime_commit_netplay(disc_path, error);
     RuntimeMods& s = state();
     /* No mod runtime (no mods root): vanilla on every peer, no content gate. */
     if (!s.initialized) {
@@ -1750,6 +2701,7 @@ bool mod_runtime_commit_for_direct_netplay(const std::filesystem::path& disc_pat
 }
 
 void mod_runtime_end_netplay() {
+    if (psx_mod_netplay_is_active()) mod_runtime_clear_for_netplay();
     if (!offline_manager_before_netplay) return;
     RuntimeMods& s = state();
     mod_runtime_clear_for_netplay();
@@ -1759,8 +2711,156 @@ void mod_runtime_end_netplay() {
     s.validation = s.manager.resolve(s.game_id, s.exe_sha256, s.disc_sha256, true);
 }
 
+bool mod_runtime_feature_host_only(const std::string& package_id,
+                                   const std::string& feature_id) {
+    const RuntimeMods& s = state();
+    if (!s.initialized) return false;
+    const ModPackage* package = s.manager.selected_package(package_id);
+    if (!package) return false;
+    for (const ModFeature& feature : package->features)
+        if (feature.id == feature_id) return feature.host_only;
+    return false;
+}
+
+std::vector<std::string> mod_runtime_netplay_view_features(const ModResolution& plan) {
+    /* A feature stays on online only when everything it contributes is a
+     * local-view plugin: no EXE/disc write, overlay or derived disc (those
+     * change the shared game) and no plugin without netplay = "local_view". */
+    std::map<std::string, bool> ok;
+    for (const ModResolution::Plugin& p : plan.plugins) {
+        const std::string key = p.package_id + "/" + p.feature_id;
+        auto it = ok.find(key);
+        const bool good = p.netplay_local_view || p.netplay_input ||
+                          p.netplay_host_output || p.netplay_host_only;
+        ok[key] = it == ok.end() ? good : (it->second && good);
+    }
+    for (const ModResolution::Write& w : plan.writes)
+        ok[w.package_id + "/" + w.feature_id] = false;
+    for (const ModResolution::Overlay& o : plan.overlays)
+        ok[o.package_id + "/" + o.feature_id] = false;
+    for (const ModResolution::DerivedDisc& d : plan.derived_discs)
+        ok[d.package_id + "/*"] = false;
+    std::vector<std::string> out;
+    for (const auto& [key, good] : ok) {
+        if (!good) continue;
+        const std::string pkg = key.substr(0, key.find('/'));
+        if (ok.count(pkg + "/*")) continue;
+        out.push_back(key);
+    }
+    return out;
+}
+
+bool mod_runtime_netplay_input_active() {
+    const RuntimeMods& s = state();
+    if (!s.netplay_view_plan || !s.plan.ok) return false;
+    for (const ModResolution::Plugin& p : s.plan.plugins)
+        if (p.netplay_input) return true;
+    return false;
+}
+
+bool mod_runtime_netplay_view_active() {
+    const RuntimeMods& s = state();
+    return s.netplay_view_plan && s.plan.ok && !s.plan.plugins.empty();
+}
+
+/* Netplay with the shared game vanilla: install the player's own selection
+ * reduced to the features that stay per player -- every own-view feature
+ * (mod_runtime_netplay_view_features), or with host_only_features only the
+ * host-only ones (ModFeature::host_only). */
+static bool commit_netplay_own_features(const std::filesystem::path& disc_path,
+                                        std::string* error, bool host_only_features) {
+    RuntimeMods& s = state();
+    std::string why;
+    (void)mod_runtime_clear_for_netplay(&why);
+    if (!s.initialized) return true;
+    note_disc(s, disc_path);
+    const ModResolution full =
+        s.manager.resolve(s.game_id, s.exe_sha256, s.disc_sha256);
+    if (!full.ok) return true; /* the player's set does not resolve: vanilla */
+    std::vector<std::string> keep = mod_runtime_netplay_view_features(full);
+    if (host_only_features)
+        keep.erase(std::remove_if(keep.begin(), keep.end(), [](const std::string& key) {
+            const size_t slash = key.find('/');
+            return !mod_runtime_feature_host_only(key.substr(0, slash), key.substr(slash + 1));
+        }), keep.end());
+    if (keep.empty()) return true;
+    /* The player's selection with every other feature off. */
+    std::map<std::string, ModSelection> reduced = s.manager.selections();
+    for (const auto& [id, versions] : s.manager.packages()) {
+        (void)versions;
+        const ModPackage* package = s.manager.selected_package(id);
+        if (!package) continue;
+        for (const ModFeature& f : package->features) {
+            if (f.legacy) continue;
+            const bool on = std::find(keep.begin(), keep.end(),
+                                      id + "/" + f.id) != keep.end();
+            ModFeatureSelection& fs = reduced[id].features[f.id];
+            if (!on) { fs.enabled = false; fs.has_enabled = true; }
+        }
+    }
+    std::map<std::string, ModSelection> player =
+        s.manager.exchange_selections(std::move(reduced));
+    ModResolution plan = s.manager.resolve(s.game_id, s.exe_sha256, s.disc_sha256);
+    (void)s.manager.exchange_selections(std::move(player));
+    if (!install_plan(s, std::move(plan), /*save*/ false, /*verify_netplay*/ false, &why)) {
+        std::fprintf(stderr, "psxrecomp: netplay own-view mods unavailable (%s)\n",
+                     why.c_str());
+        return mod_runtime_clear_for_netplay(error);
+    }
+    s.netplay_view_plan = true;
+    for (const std::string& k : keep)
+        std::fprintf(stdout, "psxrecomp: netplay keeps %s for this player's own "
+                     "view only\n", k.c_str());
+    if (error) error->clear();
+    return true;
+}
+
+bool mod_runtime_commit_netplay_view(const std::filesystem::path& disc_path,
+                                     std::string* error) {
+    if (psx_mod_netplay_profile()) return mod_runtime_commit_netplay(disc_path, error);
+    return commit_netplay_own_features(disc_path, error, false);
+}
 const std::string& mod_runtime_fingerprint() {
     return state().plan.fingerprint;
+}
+
+bool mod_runtime_savestate_scope(std::string& scope, std::string* error) {
+    scope.clear();
+    if (error) error->clear();
+    const RuntimeMods& s = state();
+    if (!s.initialized) {
+        if (s.manager.root().empty()) return true;
+        if (error) *error = "Save-state mod catalog is unavailable";
+        return false;
+    }
+    if (!s.plan_committed) {
+        if (error) *error = "Save-state content plan has not been committed";
+        return false;
+    }
+    const bool isolated = std::any_of(s.plan.ordered.begin(), s.plan.ordered.end(),
+        [](const ModPackage* package) { return package->save_compatibility == "isolated"; });
+    if (isolated) {
+        const std::string& fingerprint = s.plan.fingerprint;
+        if (!s.plan.ok || fingerprint.size() != 64 ||
+            !std::all_of(fingerprint.begin(), fingerprint.end(), [](char c) {
+                return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+            }) || !netplay_resources_verified(s.plan)) {
+            if (error && error->empty()) *error = "Isolated save states require a verified content plan";
+            return false;
+        }
+        scope = fingerprint;
+    }
+    if (g_psx_mod_immediate_live) {
+        std::string identity = "psxrecomp/fixed-immediates/v1\n" + scope + "\n";
+        for (uint32_t group = 0; group < PSX_MOD_IMMEDIATE_GROUPS; ++group)
+            identity += std::to_string(psx_mod_immediate_select(group)) + ",";
+        scope = sha256_text(identity);
+    }
+    return true;
+}
+
+const std::filesystem::path& mod_runtime_root() {
+    return state().manager.root();
 }
 
 const std::filesystem::path& mod_runtime_effective_disc_path() {
@@ -1769,6 +2869,33 @@ const std::filesystem::path& mod_runtime_effective_disc_path() {
 
 #if defined(RECOMP_LAUNCHER)
 const RecompLauncherCModProvider* mod_runtime_launcher_provider() {
+#if defined(RECOMP_LAUNCHER_HAS_QUICK_MODS)
+    provider.feature_set_quick = provider_feature_set_quick;
+#endif
+#if defined(RECOMP_LAUNCHER_HAS_WORKER_MOD_COMMIT) && defined(PSX_LAUNCHER_MOD_COMMIT_WORKER_SAFE)
+    provider.commit_worker_safe = 1;
+#if defined(RECOMP_LAUNCHER_HAS_PREPARED_MOD_COMMIT)
+    provider.try_commit = [](void*, const char* path) -> int {
+        return prepared_ticket_matches(path ? std::filesystem::path(path) : std::filesystem::path()) ? 1 : 0;
+    };
+    provider.preparation_revision = [](void*) -> unsigned long long { return state().preparation_revision; };
+#endif
+#if defined(RECOMP_LAUNCHER_HAS_MOD_PREPARATION_PROGRESS)
+    provider.commit_with_progress = [](void*, const char* path,
+        int (*report)(void*,float,const char*), void* ctx) -> int {
+        ModPrepareProgress progress;
+        if (report) progress=[=](float fraction,const std::string& text) {
+            return report(ctx,fraction,text.c_str())!=0;
+        };
+        std::string reason;
+        if (!mod_runtime_prepare_for_launcher(path ? std::filesystem::path(path) :
+                std::filesystem::path(), &reason, progress)) {
+            set_error(reason); return 0;
+        }
+        state().error.clear(); return 1;
+    };
+#endif
+#endif
     return &provider;
 }
 
@@ -1810,10 +2937,25 @@ extern "C" void mod_runtime_on_dispatch(uint32_t target) {
                      s.plan.fingerprint.c_str());
 }
 
+extern "C" int mod_runtime_snapshot_package_active(const char *package_id) {
+    using namespace PSXRecompV4;
+    const RuntimeMods& s = state();
+    if (!package_id || !s.initialized || !s.plan.ok || s.netplay_view_plan) return 0;
+    /* A forced executable-owned netplay profile need not have a catalog
+     * package in plan.ordered. Its host state still belongs in the initial
+     * complete-machine transfer, independently of user-save permissions. */
+    const PSXModNetplayProfile *profile = psx_mod_netplay_profile();
+    if (psx_mod_netplay_is_active() && profile)
+        return profile->plugin_id && !std::strcmp(profile->plugin_id, package_id);
+    for (const ModPackage *package : s.plan.ordered)
+        if (package && package->id == package_id) return 1;
+    return 0;
+}
+
 extern "C" void mod_runtime_on_savestate_loaded(void) {
     using namespace PSXRecompV4;
     RuntimeMods& s = state();
-    if (!s.initialized || !s.plan.ok) return;
+    if (!s.initialized || !s.plan.ok || s.netplay_view_plan) return;
 
     if (!s.main_applied) {
         uint32_t failed_at = 0;
@@ -2004,6 +3146,12 @@ static constexpr uint32_t kMaxDiscFileBytes = 360000u * 2048u;
  * raw and user-data writes/overlays applied. Form 2 (XA) sectors are refused. */
 static bool read_effective_user_sector(PS1::ISOReader& reader, uint32_t lba,
                                        uint8_t* sector) {
+    for (const auto& extent : PSXRecompV4::state().disc_extents)
+        if (lba >= extent.lba && lba-extent.lba < extent.count) {
+            std::memcpy(sector, extent.data+uint64_t(lba-extent.lba)*2336+8, 2048);
+            patch_committed_disc_sector(lba, 0, sector, 2048);
+            return !PSXRecompV4::state().disc_guard_failed;
+        }
     uint8_t raw[2352];
     if (reader.ReadRawSector(lba, raw)) {
         if (raw[15] != 1 && (raw[15] != 2 || (raw[18] & 0x20u))) return false;
@@ -2023,7 +3171,8 @@ static bool read_effective_user_sector(PS1::ISOReader& reader, uint32_t lba,
  * patched records, so host reads must resolve paths through them too. Names
  * compare case-insensitively without the ";1" version suffix. */
 static bool find_effective_file(PS1::ISOReader& reader, const std::string& path,
-                                uint32_t& lba, uint32_t& bytes, bool& directory) {
+                                uint32_t& lba, uint32_t& bytes, bool& directory,
+                                uint64_t* record_offset = nullptr) {
     uint8_t sector[2048];
     auto le32 = [](const uint8_t* p) {
         return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
@@ -2060,6 +3209,7 @@ static bool find_effective_file(PS1::ISOReader& reader, const std::string& path,
                 if (sector[p + 32] == 1 && (sector[p + 33] == 0 || sector[p + 33] == 1))
                     name.clear();
                 if (!name.empty() && name == want) {
+                    if (record_offset) *record_offset = uint64_t(lba+i)*2048+p;
                     lba = le32(sector + p + 2);
                     bytes = le32(sector + p + 10);
                     directory = (sector[p + 25] & 2u) != 0;
@@ -2073,6 +3223,86 @@ static bool find_effective_file(PS1::ISOReader& reader, const std::string& path,
     return true;
 }
 
+/* Host queries are installed after mounting and cleared at session teardown.
+ * A mounted drive with no readable image must never fall back to the boot CD. */
+static const char* (*g_mounted_disc_path)(void) = nullptr;
+static int (*g_mounted_disc_index)(void) = nullptr;
+extern "C" void mod_runtime_set_mounted_disc_resolver(const char* (*path)(void),
+                                                      int (*index)(void)) {
+    g_mounted_disc_path = path;
+    g_mounted_disc_index = index;
+}
+extern "C" int psx_mod_mounted_disc(void) {
+    return g_mounted_disc_index ? g_mounted_disc_index() : 0;
+}
+static std::filesystem::path mounted_disc_path(const PSXRecompV4::RuntimeMods& s) {
+    if (g_mounted_disc_path) {
+        const char* p = g_mounted_disc_path();
+        if (!p || !*p) return {};
+        // Keep the prepared boot image only while that disc is still mounted.
+        std::error_code ec;
+        if (!s.effective_disc_path.empty() && std::filesystem::equivalent(p, s.disc_path, ec))
+            return s.effective_disc_path;
+        return p;
+    }
+    return s.effective_disc_path.empty() ? s.disc_path : s.effective_disc_path;
+}
+
+extern "C" int psx_mod_replace_disc_file(const char* path, const void* bytes,
+                                         uint32_t size, uint32_t* first_lba) {
+    using namespace PSXRecompV4;
+    if (first_lba) *first_lba=0;
+    auto& s=state();
+    if (!s.activating || !s.current_plugin || !path || !*path || !bytes ||
+        !size || size>kMaxDiscFileBytes || !first_lba) return 0;
+    try {
+        PS1::ISOReader reader;
+        const auto& mount=s.effective_disc_path.empty()?s.disc_path:s.effective_disc_path;
+        uint32_t old_lba=0, old_size=0; bool directory=false; uint64_t record=0;
+        if (mount.empty() || !reader.Open(mount.string()) ||
+            !find_effective_file(reader,path,old_lba,old_size,directory,&record) || directory) return 0;
+        const uint32_t start=s.disc_extents.empty()?reader.GetSectorCount():s.extent_start;
+        const uint32_t lba=s.disc_extents.empty()?start:s.disc_extents.back().lba+s.disc_extents.back().count;
+        const uint32_t count=(size+2047u)/2048u;
+        if (!start || uint64_t(lba)+count+150>450000) return 0;
+        size_t existing=s.derived_disc_patches.size();
+        for (size_t i=0;i<s.derived_disc_patches.size();++i) {
+            const auto& p=s.derived_disc_patches[i];
+            if (record+2 < p.offset+p.bytes.size() && p.offset < record+18) {
+                if(p.offset!=record+2 || p.bytes.size()!=16)return 0;
+                existing=i;
+            }
+        }
+        std::vector<uint8_t> sectors(size_t(count)*2336,0);
+        for (uint32_t i=0;i<count;++i) {
+            auto* sector=sectors.data()+size_t(i)*2336;
+            sector[2]=sector[6]=8;
+            const uint32_t n=std::min(2048u,size-i*2048u);
+            std::memcpy(sector+8,static_cast<const uint8_t*>(bytes)+size_t(i)*2048,n);
+            uint32_t edc=0;
+            for (unsigned j=0;j<2056;++j) {
+                edc^=sector[j];
+                for(unsigned bit=0;bit<8;++bit) edc=(edc>>1)^((edc&1)?0xd8018001u:0);
+            }
+            for(unsigned j=0;j<4;++j) sector[2056+j]=uint8_t(edc>>(j*8));
+        }
+        RuntimeMods::DerivedDiscPatch patch{record+2,std::vector<uint8_t>(16)};
+        for(unsigned j=0;j<4;++j) {
+            patch.bytes[j]=uint8_t(lba>>(j*8)); patch.bytes[7-j]=uint8_t(lba>>(j*8));
+            patch.bytes[8+j]=uint8_t(size>>(j*8)); patch.bytes[15-j]=uint8_t(size>>(j*8));
+        }
+        s.derived_disc_storage.reserve(s.derived_disc_storage.size()+1);
+        s.disc_extents.reserve(s.disc_extents.size()+1);
+        s.derived_disc_patches.reserve(s.derived_disc_patches.size()+1);
+        s.derived_disc_storage.push_back(std::move(sectors));
+        s.disc_extents.push_back({lba,count,s.derived_disc_storage.back().data()});
+        if(existing<s.derived_disc_patches.size())s.derived_disc_patches[existing]=std::move(patch);
+        else s.derived_disc_patches.push_back(std::move(patch));
+        s.extent_start=start; *first_lba=lba;
+        return 1;
+    } catch(...) { return 0; }
+}
+
 extern "C" int psx_mod_read_disc_file(const char* path, void* buffer,
                                       uint32_t capacity, uint32_t* size) {
     using namespace PSXRecompV4;
@@ -2080,23 +3310,30 @@ extern "C" int psx_mod_read_disc_file(const char* path, void* buffer,
     if (!path || !*path || !size || (!buffer && capacity)) return 0;
     try {
         const auto& s = state();
-        const auto& mount = s.effective_disc_path.empty() ? s.disc_path : s.effective_disc_path;
+        const auto mount = mounted_disc_path(s);
         if (mount.empty()) return 0;
-        PS1::ISOReader reader;
+        PS1::ISOReader fresh;
+        PS1::ISOReader* shared = mod_disc_read_reader(mount.string(), fresh);
+        if (!shared) return 0;
+        PS1::ISOReader& reader = *shared;
         uint32_t lba = 0, bytes = 0;
         bool directory = false;
-        if (!reader.Open(mount.string()) ||
-            !find_effective_file(reader, path, lba, bytes, directory) ||
+        if (!find_effective_file(reader, path, lba, bytes, directory) ||
             directory || !bytes || bytes > kMaxDiscFileBytes)
             return 0;
         if (!buffer) { *size = bytes; return 1; }
         if (capacity < bytes) return 0;
         uint8_t sector[2048];
         for (uint32_t offset = 0; offset < bytes; offset += 2048u) {
+            /* Plugin callbacks may read a large archive during gameplay.
+             * Account for host I/O just as the resident-sector reader does;
+             * otherwise its first guest instruction can trip the watchdog. */
+            if (g_progress_hook && !(offset & ((2048u * 1024u) - 1u))) g_progress_hook();
             if (!read_effective_user_sector(reader, lba + offset / 2048u, sector)) return 0;
             const uint32_t count = std::min(2048u, bytes - offset);
             std::memcpy(static_cast<uint8_t*>(buffer) + offset, sector, count);
         }
+        if (g_progress_hook) g_progress_hook();
         *size = bytes;
         return 1;
     } catch (...) { return 0; }
@@ -2110,13 +3347,15 @@ extern "C" int psx_mod_disc_file_extent(const char* path, uint32_t* lba,
     if (!path || !*path || !lba || !size) return 0;
     try {
         const auto& s = state();
-        const auto& mount = s.effective_disc_path.empty() ? s.disc_path : s.effective_disc_path;
+        const auto mount = mounted_disc_path(s);
         if (mount.empty()) return 0;
-        PS1::ISOReader reader;
+        PS1::ISOReader fresh;
+        PS1::ISOReader* shared = mod_disc_read_reader(mount.string(), fresh);
+        if (!shared) return 0;
+        PS1::ISOReader& reader = *shared;
         uint32_t first = 0, bytes = 0;
         bool directory = false;
-        if (!reader.Open(mount.string()) ||
-            !find_effective_file(reader, path, first, bytes, directory) ||
+        if (!find_effective_file(reader, path, first, bytes, directory) ||
             directory || !bytes || bytes > kMaxDiscFileBytes)
             return 0;
         *lba = first;
@@ -2140,11 +3379,13 @@ bool mod_runtime_read_disc_file_sectors(const std::string& path, uint32_t max_by
     };
     try {
         const auto& s = state();
-        const auto& mount = s.effective_disc_path.empty() ? s.disc_path : s.effective_disc_path;
+        const auto mount = mounted_disc_path(s);
         if (mount.empty()) return fail("no disc mounted");
-        PS1::ISOReader reader;
+        PS1::ISOReader fresh;
+        PS1::ISOReader* shared = mod_disc_read_reader(mount.string(), fresh);
+        if (!shared) return fail("cannot open disc");
+        PS1::ISOReader& reader = *shared;
         bool directory = false;
-        if (!reader.Open(mount.string())) return fail("cannot open disc");
         if (!find_effective_file(reader, path, lba, size, directory) || directory)
             return fail("not found on the disc");
         if (!size || size > kMaxDiscFileBytes || (max_bytes && size > max_bytes))
@@ -2161,39 +3402,249 @@ bool mod_runtime_read_disc_file_sectors(const std::string& path, uint32_t max_by
 }
 } // namespace PSXRecompV4
 
+static std::string s_override_activation_error;
+extern "C" const char* mod_runtime_activation_error(void) {
+    return s_override_activation_error.empty() ? nullptr : s_override_activation_error.c_str();
+}
+
+static int invoke_package_override(CPUState* cpu, FuncOverrideFn fn, const void* context) {
+    using namespace PSXRecompV4;
+    return invoke_plugin_callback(state(),static_cast<const ModResolution::Plugin*>(context),
+                                  cpu,false,[&]() { return fn(cpu) != 0; });
+}
+
 extern "C" void mod_runtime_activate_plugins(void) {
     using namespace PSXRecompV4;
+    HostLaunchTimingScope timing(HOST_LAUNCH_PLUGIN_ACTIVATION);
+    /* Drain session-owned presentation callbacks before their contexts reset. */
+    psx_host_set_hud_draw_cb(nullptr, nullptr);
+    mod_reset_plugin_sessions();
     RuntimeMods& s = state();
+    s_override_activation_error.clear();
+    func_override_reset_package_armed();
+    for (auto& pending : function_override_plugins()) pending.armed = false;
+    s.ticket_ready = false;
+    psx_mod_set_disc_request_provider(nullptr);
     psx_projection_reset_session();
     gpu_ws_set_native_scene_predicate(nullptr);
     psx_ram_reset_size_request();
+    psx_mod_clear_function_replacements();
     gpu_hd_textures_shutdown();
-    if (!s.initialized || !s.plan.ok) return;
+    if (!s.initialized || !s.plan.ok) { timing.success(); return; }
     s.disc_extents.clear();
+    s.derived_disc_patches.clear();
+    s.derived_disc_storage.clear();
     s.audio_tracks.clear();
     s.extent_start = 0;
-    s.activating = true;
-    for (const ModResolution::Plugin& plugin : s.plan.plugins) {
-        PluginCallbackScope scope(s, &plugin);
-        mod_invoke_activation_plugin(plugin.id);
+    /* Arm the entire tier before activation callbacks change host state. */
+    for (auto& pending : function_override_plugins()) {
+        const auto owner = std::find_if(s.plan.plugins.begin(),s.plan.plugins.end(),
+            [&](const ModResolution::Plugin& p) { return p.id == pending.plugin; });
+        if (owner == s.plan.plugins.end()) continue;
+        const int rc = s.netplay_view_plan ? FO_ERR_ARGS : func_override_add_package_scoped(
+            pending.id.c_str(),pending.address,pending.fn,
+            pending.n_guard ? pending.guard : nullptr,pending.n_guard,pending.credit,
+            invoke_package_override,&*owner);
+        if (rc != FO_OK) {
+            s_override_activation_error = "Cannot arm function override " + pending.id +
+                " (registration error " + std::to_string(rc) + ")";
+            s.error = s_override_activation_error;
+            s.plan.ok = false;
+            func_override_reset_package_armed();
+            for (auto& item : function_override_plugins()) item.armed = false;
+            clear_function_entry_hooks();
+            return;
+        }
+        pending.armed = true;
     }
+    func_override_install();
+    s.activating = true;
+    psx_mod_immediate_begin_activation();
+    for (const ModResolution::Plugin& plugin : s.plan.plugins) {
+        HostLaunchTimingScope plugin_timing(HOST_LAUNCH_PLUGIN_CALLBACK,
+            plugin.package_id.c_str(), plugin.feature_id.c_str());
+        invoke_plugin_callback(s, &plugin, nullptr, false, [&]() {
+            mod_invoke_activation_plugin(plugin.id);
+            return false;
+        });
+        plugin_timing.success();
+    }
+    psx_mod_immediate_end_activation();
     s.activating = false;
     build_function_entry_hooks(s);
+    timing.success();
+}
+
+extern "C" void psx_mod_set_disc_request_provider(PSXModDiscRequestProvider provider) {
+    using namespace PSXRecompV4;
+    if (!provider) {
+        g_disc_request_provider = nullptr;
+        g_disc_request_owner = nullptr;
+        return;
+    }
+    RuntimeMods& s = state();
+    if (!s.initialized || !s.plan.ok || !s.activating || !s.current_plugin ||
+        s.netplay_view_plan || psx_netplay_active()) return;
+    g_disc_request_provider = provider;
+    g_disc_request_owner = s.current_plugin;
+}
+
+extern "C" int mod_runtime_disc_request(int *ready) {
+    using namespace PSXRecompV4;
+    if (!ready) return 0;
+    *ready = 0;
+    RuntimeMods& s = state();
+    if (!g_disc_request_provider || !s.initialized || !s.plan.ok ||
+        s.netplay_view_plan || psx_netplay_active() || !psx_mod_game_started()) return 0;
+    int result = 0;
+    invoke_plugin_callback(s,g_disc_request_owner,nullptr,false,[&]() {
+        result = g_disc_request_provider(ready);
+        return false;
+    });
+    return result;
 }
 
 extern "C" void mod_runtime_on_vblank(void) {
     using namespace PSXRecompV4;
     ++g_mod_vblanks;
     RuntimeMods& s = state();
-    if (!s.initialized || !s.plan.ok) return;
+    /* An own-view plan never touches the shared simulation. */
+    if (!s.initialized || !s.plan.ok || s.netplay_view_plan) return;
     for (const ModResolution::Plugin& plugin : s.plan.plugins) {
-        PluginCallbackScope scope(s, &plugin);
-        mod_invoke_vblank_plugin(plugin.id);
+        invoke_plugin_callback(s, &plugin, nullptr, false, [&]() {
+            mod_invoke_vblank_plugin(plugin.id);
+            return false;
+        });
     }
 }
 
 extern "C" int psx_mod_game_started(void) {
     return fntrace_is_game_started();
+}
+
+/* ---- Live option overrides (in-game overlay P5) ------------------------- */
+namespace {
+std::map<std::string, std::string>& live_option_values() {
+    static std::map<std::string, std::string> m;
+    return m;
+}
+std::map<std::string, PSXModOptionChangedCallback>& option_changed_plugins() {
+    static std::map<std::string, PSXModOptionChangedCallback> m;
+    return m;
+}
+std::string live_option_key(const char* p, const char* f, const char* o) {
+    return std::string(p) + '\x1f' + f + '\x1f' + o;
+}
+}  // namespace
+
+extern "C" int psx_mod_register_option_changed_plugin(const char* id,
+                                                      PSXModOptionChangedCallback cb) {
+    if (!id || !*id || !cb) return 0;
+    option_changed_plugins()[id] = cb;
+    return 1;
+}
+
+extern "C" void mod_runtime_note_vsync_forced_off(void) {
+    using namespace PSXRecompV4;
+    RuntimeMods& s = state();
+    const ModResolution::Plugin* plugin = s.current_plugin;
+    if (!plugin || plugin->package_id.empty() || plugin->feature_id.empty()) return;
+    const std::string key = plugin->package_id + "/" + plugin->feature_id;
+    auto& seen = vsync_forced_features();
+    if (seen.count(key)) return;
+    seen[key] = true;
+    bool declared = false;
+    if (const ModPackage* package = s.manager.selected_package(plugin->package_id))
+        for (const ModFeature& feature : package->features)
+            if (feature.id == plugin->feature_id) declared = feature.vsync_off;
+    if (!declared)
+        std::fprintf(stdout,
+            "psxrecomp: mod %s forces vsync off but its manifest does not declare "
+            "[[feature]] vsync = \"off\"; the launcher can show that only from "
+            "now on, not before the first session\n", key.c_str());
+}
+
+extern "C" int psx_mod_option_live_capable(const char* package_id, const char* feature_id) {
+    using namespace PSXRecompV4;
+    if (!package_id || !feature_id) return 0;
+    RuntimeMods& s = state();
+    if (!s.initialized || !s.plan.ok) return 0;
+    for (const ModResolution::Plugin& plugin : s.plan.plugins)
+        if (plugin.package_id == package_id && plugin.feature_id == feature_id &&
+            option_changed_plugins().count(plugin.id))
+            return 1;
+    return 0;
+}
+
+extern "C" int psx_mod_option_live_host_only(const char* package_id, const char* feature_id) {
+    using namespace PSXRecompV4;
+    if (!package_id || !feature_id) return 0;
+    RuntimeMods& s = state();
+    if (!s.initialized || !s.plan.ok) return 0;
+    bool any = false;
+    for (const ModResolution::Plugin& plugin : s.plan.plugins) {
+        if (plugin.package_id != package_id || plugin.feature_id != feature_id) continue;
+        if (!plugin.netplay_host_only) return 0;
+        any = true;
+    }
+    return any ? 1 : 0;
+}
+
+extern "C" int psx_mod_save_selection(void) {
+    using namespace PSXRecompV4;
+    RuntimeMods& s = state();
+    if (!s.initialized) return 0;
+    std::string error;
+    if (!s.manager.save_state(&error)) {
+        std::fprintf(stderr, "psxrecomp: mods: could not save state.toml: %s\n", error.c_str());
+        return 0;
+    }
+    if (!record_selection_file(s, s.loaded_catalog)) s.catalog_stamped = false;
+    return 1;
+}
+
+namespace PSXRecompV4 {
+void reset_live_option_overrides() { live_option_values().clear(); }
+}  // namespace PSXRecompV4
+
+extern "C" int psx_mod_set_option_live(const char* package_id, const char* feature_id,
+                                       const char* option_id, const char* value) {
+    using namespace PSXRecompV4;
+    if (!package_id || !feature_id || !option_id || !value) return 0;
+    /* A host-only feature is the player's own in a match (nothing to
+     * negotiate); every other feature's plan is fixed with the peers. */
+    if (psx_netplay_active() && !mod_runtime_feature_host_only(package_id, feature_id))
+        return -1;
+    RuntimeMods& s = state();
+    if (!s.initialized || !s.plan.ok) return 0;
+    bool in_plan = false;
+    for (const ModResolution::Plugin& plugin : s.plan.plugins)
+        if (plugin.package_id == package_id && plugin.feature_id == feature_id) in_plan = true;
+    if (!in_plan || !psx_mod_option_live_capable(package_id, feature_id)) return 0;
+    /* The value is visible to the callbacks while they run (a plugin may
+     * re-read it through psx_mod_current_option_value), but it is kept only
+     * if one of them accepts. Refused by all = nothing changes this session:
+     * the previous value (live or committed) is restored. */
+    auto& values = live_option_values();
+    const std::string key = live_option_key(package_id, feature_id, option_id);
+    auto prev_it = values.find(key);
+    const bool had_prev = prev_it != values.end();
+    const std::string prev = had_prev ? prev_it->second : std::string();
+    values[key] = value;
+    int live = 0;
+    for (const ModResolution::Plugin& plugin : s.plan.plugins) {
+        if (plugin.package_id != package_id || plugin.feature_id != feature_id) continue;
+        auto it = option_changed_plugins().find(plugin.id);
+        if (it == option_changed_plugins().end()) continue;
+        if (invoke_plugin_callback(s,&plugin,nullptr,false,[&]() {
+                return it->second(option_id,value) != 0;
+            })) live = 1;
+    }
+    if (!live) {
+        if (had_prev) values[key] = prev;
+        else values.erase(key);
+    }
+    return live;
 }
 
 extern "C" int psx_mod_option_value(const char* package_id,
@@ -2211,9 +3662,11 @@ extern "C" int psx_mod_option_value(const char* package_id,
      * treat an empty string as a value. */
     if (!s.initialized || !s.plan.ok) return 0;
     /* Read the committed plan's selection, which includes features its
-     * [[requirement]]s activated, not live launcher state. */
-    const std::string value = s.manager.feature_option_value(
-        s.plan, package_id, feature_id, option_id);
+     * [[requirement]]s activated, not live launcher state -- unless the
+     * in-game menu changed it this session (psx_mod_set_option_live). */
+    auto live = live_option_values().find(live_option_key(package_id, feature_id, option_id));
+    const std::string value = live != live_option_values().end() ? live->second :
+        s.manager.feature_option_value(s.plan, package_id, feature_id, option_id);
     if (value.empty()) return 0;
     if (value.size() + 1 > (size_t)out_size) return 0;
     std::memcpy(out, value.c_str(), value.size() + 1);
@@ -2284,7 +3737,27 @@ extern "C" int psx_mod_reload_hd_texture_pack(void) {
     return ok;
 }
 
+/* Host-output observation reads: side-effect-free peeks of RAM, scratchpad
+ * and BIOS ROM (psx_peek_word); MMIO and anything else reads 0, because a bus
+ * read of a device register can change the device (SIO data pops the RX FIFO,
+ * SIO_STAT ages the ACK). */
+extern "C" int psx_mod_host_output_scope(void);
+static uint32_t ho_peek_word(uint32_t address) {
+    uint32_t v = 0;
+    return psx_peek_word(address & ~3u, &v) ? v : 0u;
+}
+static uint8_t ho_peek_byte(uint32_t address) {
+    return (uint8_t)(ho_peek_word(address) >> ((address & 3u) * 8u));
+}
+static uint16_t ho_peek_half(uint32_t address) {
+    return (uint16_t)(ho_peek_word(address) >> ((address & 2u) * 8u));
+}
+static void ho_drop_word(uint32_t, uint32_t) {}
+static void ho_drop_half(uint32_t, uint16_t) {}
+static void ho_drop_byte(uint32_t, uint8_t) {}
+
 extern "C" uint8_t psx_mod_read_byte(uint32_t address) {
+    if (psx_mod_host_output_scope()) return ho_peek_byte(address);
     return psx_read_byte(address);
 }
 
@@ -2309,38 +3782,50 @@ extern "C" int psx_mod_current_resource_bytes(const char* resource_id,
     return 0;
 }
 
+static bool mod_host_output_write_blocked(void);
 extern "C" void psx_mod_write_byte(uint32_t address, uint8_t value) {
+    if (mod_host_output_write_blocked()) return;
     psx_host_write_byte(address, value);
 }
 
 extern "C" uint16_t psx_mod_read_half(uint32_t address) {
+    if (psx_mod_host_output_scope()) return ho_peek_half(address);
     return psx_read_half(address);
 }
 
+static bool mod_host_output_write_blocked(void);
 extern "C" void psx_mod_write_half(uint32_t address, uint16_t value) {
+    if (mod_host_output_write_blocked()) return;
     psx_host_write_half(address, value);
 }
 
 extern "C" uint32_t psx_mod_read_word(uint32_t address) {
+    if (psx_mod_host_output_scope()) return ho_peek_word(address);
     return psx_read_word(address);
 }
 
+static bool mod_host_output_write_blocked(void);
 extern "C" void psx_mod_write_word(uint32_t address, uint32_t value) {
+    if (mod_host_output_write_blocked()) return;
     psx_host_write_word(address, value);
 }
 
 extern "C" void psx_mod_write_code_word(uint32_t address, uint32_t value) {
+    if (mod_host_output_write_blocked()) return;
     psx_host_write_word(address, value);
     dirty_ram_mark_executable_range(address & 0x1FFFFFFFu, 4u);
 }
 
+extern "C" int psx_mod_host_output_scope(void);
 extern "C" uint32_t psx_mod_alloc_guest_memory(uint32_t size,
                                                 uint32_t alignment) {
+    if (psx_mod_host_output_scope()) return 0;
     return psx_mod_memory_alloc(size, alignment);
 }
 
 extern "C" uint32_t psx_mod_alloc_gpu_dma_memory(uint32_t size,
                                                   uint32_t alignment) {
+    if (psx_mod_host_output_scope()) return 0;
     return psx_mod_gpu_dma_memory_alloc(size, alignment);
 }
 
@@ -2355,6 +3840,40 @@ ModCounter g_mod_counters[kModCounterCap];
 size_t g_mod_counter_count = 0;
 uint64_t g_mod_counter_overflow = 0;
 }  // namespace
+
+namespace {
+struct ModCommand { char name[64]; PSXModCommandFn fn; };
+std::mutex g_mod_commands_lock;
+ModCommand g_mod_commands[16];
+int g_mod_command_count = 0;
+}  // namespace
+
+extern "C" int psx_mod_register_command(const char* name, PSXModCommandFn fn) {
+    if (!name || !name[0] || std::strlen(name) >= sizeof(g_mod_commands[0].name) || !fn) return 0;
+    std::lock_guard<std::mutex> lock(g_mod_commands_lock);
+    for (int i = 0; i < g_mod_command_count; ++i)
+        if (std::strcmp(g_mod_commands[i].name, name) == 0) { g_mod_commands[i].fn = fn; return 1; }
+    if (g_mod_command_count >= 16) return 0;
+    auto& entry = g_mod_commands[g_mod_command_count++];
+    std::memcpy(entry.name, name, std::strlen(name) + 1);
+    entry.fn = fn;
+    return 1;
+}
+
+extern "C" int psx_mod_run_command(const char* name, const char* args, char* reply, int cap) {
+    if (!reply || cap <= 0) return -1;
+    PSXModCommandFn fn = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_mod_commands_lock);
+        for (int i = 0; i < g_mod_command_count; ++i)
+            if (name && std::strcmp(g_mod_commands[i].name, name) == 0) fn = g_mod_commands[i].fn;
+    }
+    if (cap > 0) reply[0] = '\0';
+    if (!fn) return -1;
+    const int result = fn(args ? args : "", reply, cap);
+    reply[cap - 1] = '\0';
+    return result;
+}
 
 extern "C" void psx_mod_counter_add(const char* name, uint32_t delta) {
     if (!name || !name[0]) return;
@@ -2397,12 +3916,24 @@ extern "C" int32_t psx_mod_widescreen_x_margin(void) {
 extern "C" int32_t psx_mod_widescreen_view_x_margin(void) {
     return (int32_t)gpu_ws_configured_x_reveal();
 }
+extern "C" void psx_mod_set_widescreen_view_anchor(int enabled, int32_t shift) {
+    gpu_ws_set_manual_view_anchor(enabled, shift);
+}
 
 extern "C" void psx_mod_tag_hud_primitive(uint32_t primitive, int edge) {
     gpu_ws_tag_hud_primitive(primitive, edge);
 }
 extern "C" void psx_mod_anchor_hud_primitive(uint32_t primitive, int edge) {
     gpu_ws_tag_hud_prim(primitive, edge);
+}
+extern "C" void psx_mod_set_gte_sxy_tracking(int enabled) {
+    gpu_ws_set_gte_sxy_tracking(enabled);
+}
+extern "C" int psx_mod_gte_sxy_recent(int32_t x, int32_t y) {
+    return gpu_ws_gte_sxy_recent(x, y);
+}
+extern "C" void psx_mod_anchor_hud_primitive_projected(uint32_t primitive, int edge) {
+    gpu_ws_tag_hud_prim_projected(primitive, edge);
 }
 extern "C" void psx_mod_tag_screen_mask_quad(uint32_t primitive) {
     gpu_ws_tag_screen_mask_quad(primitive);
@@ -2413,6 +3944,9 @@ extern "C" void psx_mod_tag_radial_screen_mask_quad(uint32_t primitive, float sc
 
 extern "C" void psx_mod_tag_world_primitive(uint32_t primitive, int is_world) {
     gpu_ws_tag_world_primitive(primitive, is_world);
+}
+extern "C" void psx_mod_tag_feedback_rect(uint32_t primitive) {
+    gpu_ws_tag_feedback_rect(primitive);
 }
 
 extern "C" void psx_mod_set_adaptive_backdrop_preload(int enabled) {
@@ -2457,6 +3991,7 @@ extern "C" int psx_mod_register_function_filter_plugin(
 extern "C" int psx_mod_finish_function(CPUState* cpu) {
     using namespace PSXRecompV4;
     RuntimeMods& s = state();
+    if (psx_mod_host_output_scope()) return 0;
     if (!cpu || s.current_function_cpu != cpu || !s.current_plugin) return 0;
     s.current_function_finished = true;
     return 1;
@@ -2467,16 +4002,65 @@ extern "C" int psx_mod_register_guest_function_plugin(
     return id && PSXRecompV4::mod_register_guest_function_plugin(id, address, callback);
 }
 
+extern "C" int psx_mod_local_view_scope(void);
+/* A netplay own-view plan's hooks wait for the sandboxed own-view render; the
+ * shared simulation never runs them. */
+static int mod_plan_hooks_parked(void) {
+    return PSXRecompV4::state().netplay_view_plan && !psx_mod_local_view_scope();
+}
+
+extern "C" int psx_mod_register_function_override(
+    const char* id, uint32_t address, PSXModFunctionOverrideFn fn,
+    const uint32_t* expected_words, int n_words, int32_t credit) {
+    using namespace PSXRecompV4;
+    if (!id || !*id || !(address & 0x1fffffffu) || (address & 3u) || !fn) return 0;
+    if (n_words < 0 || n_words > FO_MAX_GUARD_WORDS) return 0;
+    if (n_words > 0 && !expected_words) return 0;
+    if (credit < FO_CREDIT_SELF) return 0;
+    /* An optional ":label" suffix names this override in diagnostics (the
+     * `func_override` TCP command) without multiplying manifest plugin ids —
+     * gating and resolver availability use only the part before the ':'.
+     * "pkg.feature:aim" and "pkg.feature:fire" are two overrides under the
+     * one manifest plugin "pkg.feature". */
+    const char* colon = strchr(id, ':');
+    const std::string plugin_id = colon ? std::string(id, colon - id)
+                                        : std::string(id);
+    if (plugin_id.empty() || (colon && !colon[1])) return 0;
+    auto& plugins = function_override_plugins();
+    const auto duplicate = std::find_if(
+        plugins.begin(), plugins.end(),
+        [&](const FunctionOverridePlugin& item) {
+            return item.id == id && item.address == address;
+        });
+    if (duplicate != plugins.end()) return 0;
+    FunctionOverridePlugin plugin;
+    plugin.id = id;
+    plugin.plugin = plugin_id;
+    plugin.address = address;
+    plugin.fn = fn;
+    for (int i = 0; i < n_words; ++i) plugin.guard[i] = expected_words[i];
+    plugin.n_guard = n_words;
+    plugin.credit = credit;
+    plugins.push_back(plugin);
+    /* Mark the plugin id available to the package resolver so a manifest can
+     * gate an override-only plugin (multiple overrides may share one). */
+    mod_register_function_override_marker(plugin_id);
+    return 1;
+}
+
 extern "C" int psx_mod_dispatch_guest_function(CPUState* cpu, uint32_t address) {
     using namespace PSXRecompV4;
     if (!g_psx_mod_guest_functions || !cpu || address >= 0xC0000000u) return 0;
+    if (mod_plan_hooks_parked()) return 0;
     const auto& functions = active_guest_functions();
     const uint32_t key = function_entry_key(address);
     auto it = std::lower_bound(functions.begin(), functions.end(), key,
         [](const auto& function, uint32_t k) { return function.key < k; });
     if (it == functions.end() || it->key != key) return 0;
-    PluginCallbackScope scope(state(), it->plugin, cpu);
-    it->callback(cpu, address);
+    invoke_plugin_callback(state(), it->plugin, cpu, false, [&]() {
+        it->callback(cpu, address);
+        return false;
+    });
     cpu->pc = cpu->gpr[31];
     return 1;
 }
@@ -2489,23 +4073,73 @@ extern "C" int psx_mod_register_instruction_plugin(const char* id, uint32_t addr
 extern "C" void psx_mod_instruction(CPUState* cpu, uint32_t address, uint32_t instruction) {
     using namespace PSXRecompV4;
     if (!g_psx_mod_instruction_hooks || !cpu || address >= 0xC0000000u) return;
+    if (mod_plan_hooks_parked()) return;
     const auto& hooks = active_instruction_hooks();
     const auto key = function_entry_key(address);
     auto it = std::lower_bound(hooks.begin(), hooks.end(), key,
                               [](const auto& h, uint32_t k) { return h.key < k; });
     for (; it != hooks.end() && it->key == key; ++it) {
-        if (it->expected != instruction || psx_mod_read_word(address) != instruction) continue;
-        PluginCallbackScope scope(state(), it->plugin, nullptr);
+        if (!it->callback || it->expected != instruction || psx_mod_read_word(address) != instruction) continue;
         const uint32_t pc = cpu->pc;
-        it->callback(cpu, address);
+        invoke_plugin_callback(state(), it->plugin, nullptr, false, [&]() {
+            it->callback(cpu, address);
+            return false;
+        });
         if (cpu->pc != pc) std::abort();
         cpu->gpr[0] = 0;
     }
 }
 
-extern "C" int psx_mod_function_entry(CPUState* cpu, uint32_t address) {
+extern "C" int psx_mod_register_memory_address_plugin(const char* id, uint32_t pc,
+    uint32_t expected, PSXModMemoryAddressCallback callback) {
+    return id && PSXRecompV4::mod_register_memory_address_plugin(id, pc, expected, callback);
+}
+
+extern "C" uint32_t psx_mod_memory_address(const CPUState* cpu, uint32_t pc,
+    uint32_t instruction, uint32_t address) {
     using namespace PSXRecompV4;
-    if (!g_psx_mod_function_entry_hooks || !cpu) return 0;
+    if (!g_psx_mod_instruction_hooks || !cpu || pc >= 0xC0000000u || mod_plan_hooks_parked())
+        return address;
+    const auto& hooks = active_instruction_hooks();
+    const uint32_t key = function_entry_key(pc);
+    auto it = std::lower_bound(hooks.begin(), hooks.end(), key,
+                              [](const auto& h, uint32_t k) { return h.key < k; });
+    for (; it != hooks.end() && it->key == key; ++it) {
+        if (!it->memory_address || it->expected != instruction || psx_mod_read_word(pc) != instruction) continue;
+        uint32_t next = address;
+        invoke_plugin_callback(state(),it->plugin,nullptr,false,[&]() {
+            next = it->memory_address(cpu,pc,instruction,address);
+            return false;
+        });
+        if ((next ^ address) & 3u) {
+            psx_mod_counter_add("mod.memory_address.bad_alignment", 1);
+            continue;
+        }
+        address = next;
+    }
+    return address;
+}
+
+static int game_netplay_function_entry(CPUState* cpu, uint32_t address);
+
+/* Netplay host-output plugins ([[plugin]] netplay = "host_output") run their
+ * entry hooks in the shared simulation while the rest of the own-view plan is
+ * parked. They observe only: each callback gets a private copy of the CPU
+ * state (register changes to it are discarded; its bus pointers peek RAM /
+ * ROM and drop writes), psx_mod_read_* peek too (no MMIO side effects), a
+ * completion request is
+ * ignored, and every guest-mutating mod service refuses while one runs
+ * (psx_mod_host_output_scope), so the shared simulation is bit-identical
+ * with or without them. */
+static int s_host_output_depth;
+
+extern "C" int psx_mod_host_output_scope(void) {
+    return s_host_output_depth > 0 &&
+           PSXRecompV4::state().netplay_view_plan ? 1 : 0;
+}
+
+static void run_host_output_hooks(CPUState* cpu, uint32_t address) {
+    using namespace PSXRecompV4;
     RuntimeMods& s = state();
     const auto& table = active_function_entry_hooks();
     const uint32_t key = function_entry_key(address);
@@ -2513,15 +4147,114 @@ extern "C" int psx_mod_function_entry(CPUState* cpu, uint32_t address) {
         table.begin(), table.end(), key,
         [](const ActiveFunctionEntryHook& hook, uint32_t k) { return hook.key < k; });
     for (; it != table.end() && it->key == key; ++it) {
-        PluginCallbackScope scope(s, it->plugin, cpu);
-        ++function_entry_depth;
-        if (it->callback) it->callback(cpu, address);
-        /* Either completion form skips the body: an entry callback that
-         * called psx_mod_finish_function(), or a filter returning nonzero. */
-        const bool handled = s.current_function_finished ||
-            (it->filter && it->filter(cpu, address));
-        --function_entry_depth;
+        if (!it->plugin || !it->plugin->netplay_host_output || !it->callback)
+            continue;
+        CPUState view = *cpu;   /* observation copy: peek reads, dropped writes */
+        view.read_word = ho_peek_word;   view.write_word = ho_drop_word;
+        view.read_half = ho_peek_half;   view.write_half = ho_drop_half;
+        view.read_byte = ho_peek_byte;   view.write_byte = ho_drop_byte;
+        const int previous_depth = s_host_output_depth;
+        s_host_output_depth = previous_depth + 1;
+        try {
+            invoke_plugin_callback(s,it->plugin,&view,false,[&]() {
+                it->callback(&view,address);
+                s.current_function_finished = false;
+                return false;
+            });
+        } catch (...) {
+            s_host_output_depth = previous_depth;
+            throw;
+        }
+        s_host_output_depth = previous_depth;
+    }
+}
+
+/* Memory writes from a host-output plugin while a netplay plan is live would
+ * exist on one peer only. */
+static bool mod_host_output_write_blocked(void) {
+    const auto& s = PSXRecompV4::state();
+    return psx_mod_host_output_scope() ||
+           (s.netplay_view_plan && s.current_plugin &&
+            s.current_plugin->netplay_host_output);
+}
+
+extern "C" int psx_mod_function_entry(CPUState* cpu, uint32_t address) {
+    using namespace PSXRecompV4;
+    if (!g_psx_mod_function_entry_hooks || !cpu) return 0;
+    RuntimeMods& s = state();
+    if (mod_plan_hooks_parked()) {
+        run_host_output_hooks(cpu, address);
+        return game_netplay_function_entry(cpu, address);
+    }
+    const auto& table = active_function_entry_hooks();
+    const uint32_t key = function_entry_key(address);
+    auto it = std::lower_bound(
+        table.begin(), table.end(), key,
+        [](const ActiveFunctionEntryHook& hook, uint32_t k) { return hook.key < k; });
+    for (; it != table.end() && it->key == key; ++it) {
+        const bool handled = invoke_plugin_callback(s, it->plugin, cpu, true, [&]() {
+            if (it->callback) it->callback(cpu, address);
+            /* Either completion form skips the body: an entry callback that
+             * called psx_mod_finish_function(), or a filter returning nonzero. */
+            return s.current_function_finished || (it->filter && it->filter(cpu, address));
+        });
         if (handled) {
+            cpu->pc = cpu->gpr[31];
+            return 1;
+        }
+    }
+    return game_netplay_function_entry(cpu, address);
+}
+
+static int register_game_netplay_hook(uint32_t address,
+                                      PSXModFunctionEntryCallback callback,
+                                      PSXModFunctionFilterCallback filter) {
+    using namespace PSXRecompV4;
+    if (!address || (!callback && !filter)) return 0;
+    auto& table = game_netplay_entry_hooks();
+    const uint32_t key = function_entry_key(address);
+    for (const auto& hook : table)
+        if (hook.key == key && hook.callback == callback && hook.filter == filter) return 1;
+    table.push_back({key, callback, filter, nullptr});
+    std::stable_sort(table.begin(), table.end(),
+                     [](const ActiveFunctionEntryHook& a,
+                        const ActiveFunctionEntryHook& b) { return a.key < b.key; });
+    update_function_entry_count();
+    return 1;
+}
+
+extern "C" int psx_game_register_netplay_function_entry(
+    uint32_t address, PSXModFunctionEntryCallback callback) {
+    return callback ? register_game_netplay_hook(address, callback, nullptr) : 0;
+}
+
+extern "C" int psx_game_register_netplay_function_filter(
+    uint32_t address, PSXModFunctionFilterCallback filter) {
+    return filter ? register_game_netplay_hook(address, nullptr, filter) : 0;
+}
+
+/* Game netplay hooks run only in a netplay session, after the mod plan's
+ * hooks (which a match clears). PSX_GAME_FILTER_OFFLINE_PROBE=1 runs them
+ * offline too, to test a title's netplay path without opening a session. */
+static int game_netplay_function_entry(CPUState* cpu, uint32_t address) {
+    using namespace PSXRecompV4;
+    const auto& table = game_netplay_entry_hooks();
+    if (table.empty()) return 0;
+    if (!psx_netplay_active()) {
+        static int offline_probe = -1;
+        if (offline_probe < 0) {
+            const char* e = std::getenv("PSX_GAME_FILTER_OFFLINE_PROBE");
+            offline_probe = (e && std::strcmp(e, "1") == 0) ? 1 : 0;
+        }
+        if (!offline_probe) return 0;
+    }
+    const uint32_t key = function_entry_key(address);
+    auto it = std::lower_bound(
+        table.begin(), table.end(), key,
+        [](const ActiveFunctionEntryHook& hook, uint32_t k) { return hook.key < k; });
+    for (; it != table.end() && it->key == key; ++it) {
+        if (it->callback) it->callback(cpu, address);
+        if (it->filter && it->filter(cpu, address)) {
             cpu->pc = cpu->gpr[31];
             return 1;
         }
@@ -2530,18 +4263,25 @@ extern "C" int psx_mod_function_entry(CPUState* cpu, uint32_t address) {
 }
 
 extern "C" int psx_mod_function_entry_active(void) {
-    return PSXRecompV4::function_entry_depth != 0;
+    return PSXRecompV4::function_entry_depth != 0 || func_override_active() ||
+        psx_mod_function_replacement_depth() != 0;
 }
 
 extern "C" void mod_runtime_function_entry_context_save(ModFunctionEntryContext *out) {
     out->depth = PSXRecompV4::function_entry_depth;
+    out->replacement_depth = psx_mod_function_replacement_depth();
     out->plugin = PSXRecompV4::state().current_plugin;
+    out->cpu = PSXRecompV4::state().current_function_cpu;
+    out->finished = PSXRecompV4::state().current_function_finished;
 }
 
 extern "C" void mod_runtime_function_entry_context_restore(const ModFunctionEntryContext *in) {
     PSXRecompV4::function_entry_depth = in->depth;
+    psx_mod_function_replacement_restore_depth(in->replacement_depth);
     PSXRecompV4::state().current_plugin =
         static_cast<const PSXRecompV4::ModResolution::Plugin *>(in->plugin);
+    PSXRecompV4::state().current_function_cpu = in->cpu;
+    PSXRecompV4::state().current_function_finished = in->finished != 0;
 }
 
 /* Apply the committed plan's disc writes and overlays to one sector. The
@@ -2554,6 +4294,13 @@ static void patch_committed_disc_sector(uint32_t lba, int raw_sector,
     using namespace PSXRecompV4;
     RuntimeMods& s = state();
     if (!s.initialized || s.disc_guard_failed || !bytes || size == 0) return;
+    if (!raw_sector) for (const auto& patch:s.derived_disc_patches) {
+        const uint64_t base=uint64_t(lba)*2048;
+        const uint64_t begin=std::max(base,patch.offset);
+        const uint64_t end=std::min(base+size,patch.offset+patch.bytes.size());
+        if(begin<end) std::memcpy(bytes+size_t(begin-base),
+            patch.bytes.data()+size_t(begin-patch.offset),size_t(end-begin));
+    }
     /* Raw Mode2 Form1 reads are also the source of the 2048-byte logical
      * stream consumed by the emulated CD controller. Apply raw claims to the
      * complete sector, then user-data claims to its payload window. Form2/XA
@@ -2634,4 +4381,14 @@ extern "C" void mod_runtime_patch_disc_sector(uint32_t lba, int raw_sector,
                                                uint8_t* bytes, uint32_t size) {
     if (!PSXRecompV4::state().disc_enabled) return;
     patch_committed_disc_sector(lba, raw_sector, bytes, size);
+}
+
+/* In-game menu host (psx_menu_host.h): the same feature edits as the launcher
+ * ABI provider, without its types. Main thread. */
+extern "C" int psx_mod_feature_enable(const char* package_id, const char* feature_id, int enabled) {
+    return PSXRecompV4::feature_enable_impl(package_id, feature_id, enabled);
+}
+extern "C" int psx_mod_feature_set_option(const char* package_id, const char* feature_id,
+                                          const char* option_id, const char* value) {
+    return PSXRecompV4::feature_set_option_impl(package_id, feature_id, option_id, value);
 }

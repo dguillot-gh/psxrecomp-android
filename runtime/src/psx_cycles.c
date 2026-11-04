@@ -1,6 +1,7 @@
 /* psx_cycles.c — PSX guest CPU cycle clock. */
 
 #include "psx_cycles.h"
+#include "psx_native_idle_wait.h"
 #include "psx_cycle_freeze.h"
 #include "cpu_state.h"
 #include <stdio.h>
@@ -23,6 +24,111 @@
 #endif
 
 uint64_t psx_cycle_count = 0;
+uint32_t g_psx_gcs_recip_q16 = 65536u;
+uint32_t g_psx_gcs_frac = 0u;
+int g_psx_gcs_batch = 0;   /* [timing] guest_cycle_scale_batch */
+static uint32_t s_psx_gcs_cfg = 1u;     /* [timing] guest_cycle_scale */
+static uint32_t s_psx_gcs_live = 1u;
+static int      s_psx_gcs_gated = 0;    /* guest_cycle_scale_gated (mod gate) */
+static int      s_psx_gcs_open = 0;     /* mod gate state */
+/* [timing] guest_cycle_scale_gate: RAM predicates, all must hold. */
+typedef struct { uint32_t phys, size, mask, value; } PsxGcsRamPred;
+static PsxGcsRamPred s_psx_gcs_ram[PSX_GCS_RAM_GATE_MAX];
+static uint32_t s_psx_gcs_ram_n = 0;
+static int      s_psx_gcs_ram_open = 0; /* last VBlank's verdict */
+static uint32_t (*s_psx_gcs_ram_read)(uint32_t phys, uint32_t size) = NULL;
+
+static void psx_guest_cycle_scale_apply(void) {
+    const int open = (!s_psx_gcs_gated || s_psx_gcs_open) &&
+                     (s_psx_gcs_ram_n == 0u || s_psx_gcs_ram_open);
+    uint32_t n = open ? s_psx_gcs_cfg : 1u;
+    if (n == s_psx_gcs_live) return;
+    s_psx_gcs_live = n;
+    g_psx_gcs_recip_q16 = psx_gcs_recip_for(n);
+    g_psx_gcs_frac = 0u;
+}
+
+void psx_guest_cycle_scale_set(uint32_t scale) {
+    if (scale < 1u) scale = 1u;
+    if (scale > 64u) scale = 64u;
+    s_psx_gcs_cfg = scale;
+    psx_guest_cycle_scale_apply();
+}
+
+void psx_guest_cycle_scale_set_gated(int gated) {
+    s_psx_gcs_gated = gated ? 1 : 0;
+    psx_guest_cycle_scale_apply();
+}
+
+void psx_guest_cycle_scale_gate_open(int open) {
+    s_psx_gcs_open = open ? 1 : 0;
+    psx_guest_cycle_scale_apply();
+}
+
+void psx_guest_cycle_scale_set_ram_reader(uint32_t (*read)(uint32_t phys, uint32_t size)) {
+    s_psx_gcs_ram_read = read;
+}
+
+int psx_guest_cycle_scale_ram_gate_add(uint32_t addr, uint32_t size,
+                                       uint32_t mask, uint32_t value) {
+    const uint32_t phys = addr & 0x1FFFFFFFu;
+    if (s_psx_gcs_ram_n >= (uint32_t)PSX_GCS_RAM_GATE_MAX) return 0;
+    if (size != 1u && size != 2u && size != 4u) return 0;
+    if ((phys & (size - 1u)) != 0u || phys >= 0x00800000u) return 0;  /* main RAM */
+    if (size < 4u) mask &= (1u << (8u * size)) - 1u;
+    s_psx_gcs_ram[s_psx_gcs_ram_n].phys = phys;
+    s_psx_gcs_ram[s_psx_gcs_ram_n].size = size;
+    s_psx_gcs_ram[s_psx_gcs_ram_n].mask = mask;
+    s_psx_gcs_ram[s_psx_gcs_ram_n].value = value & mask;
+    s_psx_gcs_ram_n++;
+    s_psx_gcs_ram_open = 0;                 /* shut until the first VBlank */
+    psx_guest_cycle_scale_apply();
+    return 1;
+}
+
+void psx_guest_cycle_scale_ram_gate_clear(void) {
+    s_psx_gcs_ram_n = 0u;
+    s_psx_gcs_ram_open = 0;
+    psx_guest_cycle_scale_apply();
+}
+
+/* VBlank edge (interrupts.c fire_vblank_edge): a guest-time point, so every
+ * peer and every rollback re-simulation sees the same verdict. */
+void psx_guest_cycle_scale_vblank(void) {
+    if (s_psx_gcs_ram_n == 0u || !s_psx_gcs_ram_read) return;
+    int open = 1;
+    for (uint32_t i = 0; open && i < s_psx_gcs_ram_n; i++) {
+        const PsxGcsRamPred *p = &s_psx_gcs_ram[i];
+        open = (s_psx_gcs_ram_read(p->phys, p->size) & p->mask) == p->value;
+    }
+    if (open == s_psx_gcs_ram_open) return;
+    s_psx_gcs_ram_open = open;
+    psx_guest_cycle_scale_apply();
+}
+
+/* Public mod API (mod_plugins.h): the mod gate. */
+int psx_mod_host_output_scope(void);
+void psx_mod_set_guest_cycle_scale_gate(int open) {
+    if (psx_mod_host_output_scope()) return;
+    psx_guest_cycle_scale_gate_open(open);
+}
+uint32_t psx_mod_guest_cycle_scale(void) { return s_psx_gcs_live; }
+
+void psx_guest_cycle_scale_snapshot(uint32_t out[3]) {
+    out[0] = g_psx_gcs_frac;
+    out[1] = (uint32_t)s_psx_gcs_open;
+    out[2] = (uint32_t)s_psx_gcs_ram_open;
+}
+
+void psx_guest_cycle_scale_restore(const uint32_t in[3]) {
+    s_psx_gcs_open = in[1] ? 1 : 0;
+    s_psx_gcs_ram_open = in[2] ? 1 : 0;
+    psx_guest_cycle_scale_apply();
+    g_psx_gcs_frac = PSX_GCS_ACTIVE() ? (in[0] & 0xFFFFu) : 0u;
+}
+
+uint32_t psx_guest_cycle_scale(void) { return s_psx_gcs_live; }
+uint32_t psx_guest_cycle_scale_config(void) { return s_psx_gcs_cfg; }
 uint32_t g_psx_cyc_batch = 0;
 uint32_t g_psx_cyc_batch_limit = 0;
 int      g_psx_cyc_bb_defer = 0;
@@ -159,6 +265,33 @@ uint64_t g_plp_svc_calls        = 0;
 static uint64_t s_next_watchdog        = 0;
 static uint64_t s_next_pc_sample       = 0;
 
+/* Guest-cycle profile sampler (guest_cycle_profile.c). Every `period` guest
+ * cycles the installed hook records where the guest is. The next sample point
+ * is folded into the service deadline, so a sample lands on the first charge
+ * that crosses it -- not on whatever MMIO access or device event happened to
+ * trigger servicing -- which keeps the attribution unbiased. A charge that
+ * jumps several periods at once (idle skip, a long stall) reports the number
+ * of periods crossed so those cycles stay credited to the code that spent
+ * them. Period 0 or no hook = off; the unit tests that link this file
+ * without the ring see NULL. */
+uint32_t psx_cycle_sample_period = 0;
+void   (*psx_cycle_sample_hook)(uint64_t cycle, uint32_t periods) = NULL;
+static uint64_t s_next_cycle_sample    = 0;
+
+static void psx_cycle_sample_check(uint64_t target) {
+    const uint32_t period = psx_cycle_sample_period;
+    if (!period || !psx_cycle_sample_hook) return;
+    /* First use, or the clock was rewound (savestate / boot reset). */
+    if (s_next_cycle_sample == 0u || s_next_cycle_sample > target + period) {
+        s_next_cycle_sample = target + period;
+        return;
+    }
+    if (target < s_next_cycle_sample) return;
+    uint64_t n = (target - s_next_cycle_sample) / period + 1u;
+    s_next_cycle_sample += n * (uint64_t)period;
+    psx_cycle_sample_hook(target, n > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)n);
+}
+
 /* Absolute inclusive limit for dirty_ram_interp.c's exact one-cycle path.
  * Zero means that the next charge must visit psx_advance_cycles(). */
 uint64_t g_psx_cycle_fast_limit = 0;
@@ -219,6 +352,10 @@ uint32_t psx_idle_cycles_to_next_observable_event(void) {
 static void psx_devices_recompute_deadline(void) {
     uint32_t next = devices_cycles_to_next_internal_event();
     if (next > PSX_DEADLINE_HARD_CAP) next = PSX_DEADLINE_HARD_CAP;
+    if (psx_cycle_sample_period && s_next_cycle_sample > psx_cycle_count) {
+        uint64_t d = s_next_cycle_sample - psx_cycle_count;
+        if (d < next) next = (uint32_t)d;
+    }
     psx_next_service_cycle = psx_cycle_count + (uint64_t)next;
 }
 
@@ -261,6 +398,7 @@ void psx_devices_service_to_now(void) {
         }
         s_devices_synced_cycle = target;
     }
+    psx_cycle_sample_check(target);
     psx_devices_recompute_deadline();
     psx_in_device_service = 0;
 
@@ -470,35 +608,13 @@ static int32_t  s_idle_progress_delta = 0;
 static uint64_t s_idle_last_cycle = 0;
 static uint64_t s_idle_last_stores = 0;
 static uint64_t s_idle_last_mmio = 0;
-/* Countdown-store gate: besides store-free loops, accept exactly one word store
- * per turn to the same main-RAM word, each one 1 less than the last: a timeout
- * counter kept in memory (PsyQ VSync(): `while (vsync_count < target) if
- * (--timeout == -1) ...`, the timeout on the stack; FF7 spends 27-37% of its
- * game thread there on the LG V30). Skipped turns apply the same decrements and
- * stop before the counter would hit -1, so the real exit branch still runs. */
-static uint32_t s_idle_mem_addr = 1, s_idle_mem_val = 0;
-static int      s_idle_mem_mode = -2;   /* -1 no store, 1 countdown store */
-/* A loop turn can pass several interrupt-check boundaries (FF7's VSync loop:
- * 0x8003D04C and 0x8003D098 every turn), which used to reset the detector at
- * every check. The detector now keeps its first PC as the anchor and ignores up
- * to IDLE_OFF_ANCHOR_MAX other checks between anchor hits; quantum, stores and
- * registers are then per whole turn. A skip then lands on the last anchor hit
- * BEFORE the next event, and the real turns deliver the event at the exact
- * check boundary. */
-enum { IDLE_OFF_ANCHOR_MAX = 4 };
-static uint32_t s_idle_off_anchor = 0;
-static int      s_idle_multi_pc = 0;    /* this anchor had other checks in its turns */
-/* Why the detector did not skip, per reason, since the last psx_idle_diag_line(). */
-enum { IDLE_D_CHECKS, IDLE_D_OFFANCHOR, IDLE_D_NEWPC, IDLE_D_STORE, IDLE_D_MMIO,
-       IDLE_D_REGS, IDLE_D_QUANT, IDLE_D_STREAK, IDLE_D_NEAR, IDLE_D_BOUND, IDLE_D_CAP,
-       IDLE_D_SKIP, IDLE_D_N };
+/* [IDLE] diagnostics (psx_idle_diag_line): checks, skips, cap rejections since
+ * the last line, and the most frequent check PCs (a small count table; this is
+ * how the store-counter sites for idle_skip_store_counter_sites are found). */
+enum { IDLE_D_CHECKS, IDLE_D_CAP, IDLE_D_SKIP, IDLE_D_N };
 static uint32_t s_idle_diag[IDLE_D_N];
-static uint32_t s_idle_diag_pc = 0;     /* the anchor at the last full streak */
-/* Detail for the diagnostics: the most frequent check PCs (anchor and others,
- * a small count table) and the last turn rejected for its stores. */
 enum { IDLE_DIAG_PCS = 6 };
 static uint32_t s_idle_diag_pcs[IDLE_DIAG_PCS], s_idle_diag_pcn[IDLE_DIAG_PCS];
-static uint32_t s_idle_diag_store_n = 0, s_idle_diag_store_addr = 0;
 
 static void idle_diag_note_pc(uint32_t pc) {
     int free_i = -1, min_i = 0;
@@ -510,25 +626,6 @@ static void idle_diag_note_pc(uint32_t pc) {
     int i = free_i >= 0 ? free_i : min_i;   /* replace the rarest (approximate top-N) */
     s_idle_diag_pcs[i] = pc;
     s_idle_diag_pcn[i] = 1;
-}
-
-/* Stores since the last check: -1 none; 1 one countdown store (see above);
- * 0 one main-RAM word store not yet comparable; -2 anything else. Records the
- * store for the next comparison. */
-static int idle_store_kind(void) {
-    extern uint64_t g_guest_store_count;
-    extern uint32_t g_guest_last_store_addr, g_guest_last_store_val;
-    const uint64_t n = g_guest_store_count - s_idle_last_stores;
-    if (n == 0) return -1;
-    const uint32_t a = g_guest_last_store_addr, v = g_guest_last_store_val;
-    if (n != 1 || (a & 3u) != 0 || (a & 0x1FFFFFFFu) >= 0x00200000u) {
-        s_idle_mem_addr = 1;
-        return -2;
-    }
-    const int kind = (a == s_idle_mem_addr && v == s_idle_mem_val - 1u) ? 1 : 0;
-    s_idle_mem_addr = a;
-    s_idle_mem_val = v;
-    return kind;
 }
 
 static void idle_snapshot_regs(const CPUState *cpu) {
@@ -557,6 +654,109 @@ static int idle_skip_on(void) {
 
 int psx_idle_skip_is_enabled(void) { return idle_skip_on(); }
 
+/* Store-counter loops (opt-in on top of idle_skip: [runtime]
+ * idle_skip_store_counters, PSX_IDLE_SKIP_EXT=1). PsyQ libetc's v_wait --
+ * the VSync(0)/VSync(n) spin every PsyQ title runs each frame -- is
+ *
+ *     do { if (--timeout == -1) { timeout path } } while (VSync_count < target);
+ *
+ * with `timeout` a stack word: one guest store per iteration, and two block
+ * edges (interrupt-check boundaries) per iteration. The base detector needs
+ * zero stores and one edge, so it never fires there. The extension accepts
+ *   - several edges per iteration: the first edge seen is the anchor and up
+ *     to IDLE_EDGES_MAX other edges between two anchor visits are one
+ *     iteration (their count must be stable too);
+ *   - exactly one word store per iteration, to the same RAM/scratchpad
+ *     address, whose value drops by exactly 1 each iteration (a register
+ *     holding the same value may drop with it).
+ * Skips stay bit-exact: k whole iterations, landing on the anchor strictly
+ * BEFORE the next device event when the loop has more than one edge (an IRQ
+ * may be taken at any of them, so the last iteration runs for real), the
+ * counter (and its register) lowered by k and never to 1 or below, so the
+ * real timeout test still runs. */
+int g_idle_skip_ext = -1;            /* -1 = read PSX_IDLE_SKIP_EXT once */
+/* Last-store tracking (memory.c writes it only while this is set) and the
+ * host writer used to lower a skipped counter. Both live here so every
+ * target that links the cycle model links them too. */
+static int            s_track_dummy;
+static const uint32_t s_no_store = 0xFFFFFFFFu;
+static int            *s_track = &s_track_dummy;
+static const uint32_t *s_last_addr = &s_no_store, *s_last_val = &s_no_store;
+static void (*s_idle_host_write)(uint32_t addr, uint32_t val) = NULL;
+void psx_idle_skip_set_host_writer(void (*w)(uint32_t, uint32_t)) { s_idle_host_write = w; }
+void psx_idle_skip_set_store_tracker(int *gate, const uint32_t *addr, const uint32_t *val) {
+    s_track = gate ? gate : &s_track_dummy;
+    s_last_addr = addr ? addr : &s_no_store;
+    s_last_val = val ? val : &s_no_store;
+}
+enum { IDLE_EDGES_MAX = 8, IDLE_SITES_MAX = 16 };
+/* Audited sites. The detector proves the loop's shape over the passes it
+ * sees; it cannot prove that no later counter-dependent exit exists (an exit
+ * at counter == 500 would be skipped over). Only sites a developer audited
+ * and declared are eligible. */
+static uint32_t s_idle_sites[IDLE_SITES_MAX];
+static int      s_idle_site_count = 0;
+static int      s_idle_audited_only = 0;
+void psx_idle_skip_set_store_counter_sites(const uint32_t *pcs, int n) {
+    if (n < 0 || !pcs) n = 0;
+    if (n > IDLE_SITES_MAX) n = IDLE_SITES_MAX;
+    for (int i = 0; i < n; i++) s_idle_sites[i] = pcs[i];
+    s_idle_site_count = n;
+}
+static int idle_site_listed(uint32_t pc) {
+    for (int i = 0; i < s_idle_site_count; i++)
+        if (s_idle_sites[i] == pc) return 1;
+    return 0;
+}
+static uint32_t s_idle_edges = 0;          /* non-anchor edges since the anchor */
+static uint32_t s_idle_iter_edges = 0;     /* edges in the last whole iteration */
+static uint32_t s_idle_store_addr = 0xFFFFFFFFu;
+static uint32_t s_idle_store_val = 0;
+static int      s_idle_mem_progress = 0;
+
+static int idle_skip_ext_on(void) {
+    if (g_idle_skip_ext < 0) {
+        const char *e = getenv("PSX_IDLE_SKIP_EXT");
+        g_idle_skip_ext = e ? (e[0] == '1') : 0;
+    }
+    /* Without a host writer the counter cannot be lowered: no extension. */
+    *s_track = g_idle_skip_ext > 0 && s_idle_host_write != NULL && s_track != &s_track_dummy;
+    return *s_track;
+}
+
+/* Stores since the last edge: 0, or (extension) one word store to RAM or
+ * the scratchpad. *addr/*val name it; addr 0xFFFFFFFF when none. */
+static int idle_stores_ok(uint64_t stores_now, int ext, uint32_t *addr, uint32_t *val) {
+    *addr = 0xFFFFFFFFu;
+    *val = 0;
+    const uint64_t d = stores_now - s_idle_last_stores;
+    if (d == 0) return 1;
+    if (!ext || d != 1 || *s_last_addr == 0xFFFFFFFFu) return 0;
+    const uint32_t phys = *s_last_addr & 0x1FFFFFFFu;
+    if ((phys & 3u) != 0u) return 0;
+    if (!(phys < 0x00800000u || (phys >= 0x1F800000u && phys < 0x1F800400u))) return 0;
+    *addr = *s_last_addr;
+    *val = *s_last_val;
+    return 1;
+}
+
+static void idle_reset_progress(void) {
+    s_idle_streak = 0;
+    s_idle_quantum = 0;
+    s_idle_progress_reg = -2;
+    s_idle_progress_delta = 0;
+    s_idle_mem_progress = 0;
+}
+
+void psx_idle_skip_set_audited_only(int enabled) {
+    s_idle_audited_only = enabled != 0;
+    s_idle_pc = 0;
+    s_idle_have_snap = 0;
+    s_idle_edges = 0;
+    idle_reset_progress();
+    if (s_idle_audited_only) *s_track = 0;
+}
+
 void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
 #ifdef PSX_COSIM
     (void)cpu; (void)check_pc;
@@ -569,28 +769,52 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
     /* A speculative replay must not clear or train the authoritative live idle
      * detector. Its clock/device view is transactional and cannot be skipped. */
     if (g_ls_replay_active) return;
-    if (!idle_skip_on() || g_idle_note_suppress) return;
+    if (g_idle_note_suppress) return;
+    if (!idle_skip_on()) {
+        if (s_idle_audited_only && *s_track) *s_track = 0;
+        return;
+    }
+    /* Build-declared waits do not train ordinary loops or track every store
+     * through active gameplay. Leave a wait once, then keep this path cheap. */
+    if (s_idle_audited_only && !idle_site_listed(check_pc)) {
+        if (s_idle_pc || s_idle_have_snap || s_idle_edges) {
+            s_idle_pc = 0;
+            s_idle_have_snap = 0;
+            s_idle_edges = 0;
+            idle_reset_progress();
+        }
+        if (*s_track) *s_track = 0;
+        return;
+    }
     if (check_pc == 0 || psx_get_in_exception() || g_psx_call_bail ||
         g_precise_mode || g_ls_mode != 0) {
         s_idle_pc = 0;
         s_idle_streak = 0;
         s_idle_have_snap = 0;
+        s_idle_edges = 0;
+        if (s_idle_audited_only && *s_track) *s_track = 0;
+        return;
+    }
+    /* The extension applies only at an audited site: the anchor while
+     * counting its inner edges, else the PC being checked. */
+    const uint32_t site = (s_idle_pc != 0 && check_pc != s_idle_pc) ? s_idle_pc : check_pc;
+    const int ext = idle_skip_ext_on() && idle_site_listed(site);
+
+    /* Extension: an edge inside the anchor's iteration. Only MMIO is checked
+     * here; stores are counted over the whole iteration at the anchor. */
+    if (ext && s_idle_pc != 0 && check_pc != s_idle_pc && s_idle_edges < IDLE_EDGES_MAX &&
+        g_mmio_access_count == s_idle_last_mmio) {
+        s_idle_edges++;
         return;
     }
 
     s_idle_diag[IDLE_D_CHECKS]++;
     idle_diag_note_pc(check_pc);
-    if (s_idle_pc != 0 && check_pc != s_idle_pc && s_idle_off_anchor < IDLE_OFF_ANCHOR_MAX) {
-        s_idle_off_anchor++;           /* another check boundary inside the same turn */
-        s_idle_diag[IDLE_D_OFFANCHOR]++;
-        return;
-    }
-    if (check_pc == s_idle_pc && s_idle_off_anchor) s_idle_multi_pc = 1;
-    s_idle_off_anchor = 0;
 
     uint64_t cyc = psx_cycle_count;
-    const int store_kind = idle_store_kind();
-    if (check_pc == s_idle_pc && s_idle_have_snap && (store_kind == -1 || store_kind == 1) &&
+    uint32_t st_addr, st_val;
+    const int stores_ok = idle_stores_ok(g_guest_store_count, ext, &st_addr, &st_val);
+    if (check_pc == s_idle_pc && s_idle_have_snap && stores_ok &&
         g_mmio_access_count == s_idle_last_mmio) {
         int changed = -1, changed_count = 0;
         for (int i = 1; i < 32; i++) {
@@ -609,30 +833,42 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
          * executes. No stores/MMIO are allowed, so there is no hidden work. */
         int progress_reg = changed_count == 0 ? -1
                          : (changed_count == 1 && progress_delta == -1 ? changed : -2);
+        /* Extension: the one store must be the same counter word, one lower
+         * than last iteration, positive; a progressing register must hold it. */
+        int mem_progress = 0;
+        if (st_addr != 0xFFFFFFFFu) {
+            if (st_addr == s_idle_store_addr && st_val == s_idle_store_val - 1u &&
+                (int32_t)st_val > 1 &&
+                (progress_reg <= 0 || cpu->gpr[progress_reg] == st_val))
+                mem_progress = 1;
+            else
+                progress_reg = -2;
+        } else if (s_idle_store_addr != 0xFFFFFFFFu) {
+            progress_reg = -2;              /* the store pattern changed */
+        }
         uint32_t quantum = (uint32_t)(cyc - s_idle_last_cycle);
         if (progress_reg != -2 && quantum > 0 && quantum <= IDLE_QUANTUM_MAX) {
             if (quantum == s_idle_quantum &&
                 progress_reg == s_idle_progress_reg &&
                 progress_delta == s_idle_progress_delta &&
-                store_kind == s_idle_mem_mode) {
+                mem_progress == s_idle_mem_progress &&
+                s_idle_edges == s_idle_iter_edges) {
                 if (s_idle_streak < 1000000u) s_idle_streak++;
             } else {
                 s_idle_quantum = quantum;
                 s_idle_progress_reg = progress_reg;
                 s_idle_progress_delta = progress_delta;
-                s_idle_mem_mode = store_kind;
+                s_idle_mem_progress = mem_progress;
                 s_idle_streak = 1;
             }
         } else {
-            s_idle_diag[progress_reg == -2 ? IDLE_D_REGS : IDLE_D_QUANT]++;
-            s_idle_streak = 0;
-            s_idle_quantum = 0;
-            s_idle_progress_reg = -2;
-            s_idle_progress_delta = 0;
-            s_idle_mem_mode = -2;
+            idle_reset_progress();
         }
+        s_idle_store_addr = st_addr;
+        s_idle_store_val = st_val;
+        s_idle_iter_edges = s_idle_edges;
         idle_snapshot_regs(cpu);
-    } else if (check_pc == s_idle_pc && store_kind != -2 &&
+    } else if (check_pc == s_idle_pc && stores_ok &&
                g_mmio_access_count == s_idle_last_mmio) {
         /* Second consecutive observation of this PC with no stores/MMIO —
          * take the baseline snapshot; the next hit can compare. Defers the
@@ -640,61 +876,56 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
          * PC every check (pure host cost, never skipped). */
         idle_snapshot_regs(cpu);
         s_idle_have_snap = 1;
-        s_idle_streak = 0;
-        s_idle_quantum = 0;
-        s_idle_progress_reg = -2;
-        s_idle_progress_delta = 0;
+        s_idle_store_addr = st_addr;
+        s_idle_store_val = st_val;
+        s_idle_iter_edges = s_idle_edges;
+        idle_reset_progress();
     } else {
-        if (check_pc != s_idle_pc) {
-            s_idle_diag[IDLE_D_NEWPC]++;
-            s_idle_multi_pc = 0;
-        } else if (store_kind == -2) {
-            extern uint64_t g_guest_store_count;
-            extern uint32_t g_guest_last_store_addr;
-            s_idle_diag[IDLE_D_STORE]++;
-            s_idle_diag_store_n = (uint32_t)(g_guest_store_count - s_idle_last_stores);
-            s_idle_diag_store_addr = g_guest_last_store_addr;
-        } else {
-            s_idle_diag[IDLE_D_MMIO]++;
-        }
         s_idle_pc = check_pc;
-        s_idle_streak = 0;
-        s_idle_quantum = 0;
-        s_idle_progress_reg = -2;
-        s_idle_progress_delta = 0;
+        idle_reset_progress();
         s_idle_have_snap = 0;
+        s_idle_store_addr = 0xFFFFFFFFu;
     }
+    s_idle_edges = 0;
     s_idle_last_cycle  = cyc;
     s_idle_last_stores = g_guest_store_count;
     s_idle_last_mmio   = g_mmio_access_count;
 
-    if (s_idle_streak < IDLE_STREAK_MIN) {
-        s_idle_diag[IDLE_D_STREAK]++;
-        return;
-    }
-    s_idle_diag_pc = check_pc;
+    if (s_idle_streak < IDLE_STREAK_MIN) return;
+    /* Several edges per pass are accepted only for the store-counter shape
+     * (v_wait). Multi-edge loops with no counter store -- OpenBIOS's
+     * 0xBFC057C0 poll, kernel 0x16BC -- moved R4's boot timing when skipped
+     * (frame 192, cyc +3857), so they keep running for real. */
+    if (s_idle_iter_edges && !s_idle_mem_progress) return;
     uint32_t q = s_idle_quantum;
     uint32_t dist = devices_cycles_to_next_idle_event();
-    if (dist <= q) {                     /* one real iteration reaches it */
-        s_idle_diag[IDLE_D_NEAR]++;
-        return;
+    /* The devices report distances from where they were last serviced
+     * (s_devices_synced_cycle), which can trail psx_cycle_count by a few
+     * hundred cycles. For the store-counter shape, measure from now: an
+     * overstated distance lands the skip after the event and delivers the
+     * IRQ late (R4 boot, frame 961: +402 cycles). */
+    if (s_idle_iter_edges || s_idle_mem_progress) {
+        const uint64_t lag = psx_cycle_count > s_devices_synced_cycle
+            ? psx_cycle_count - s_devices_synced_cycle : 0;
+        if ((uint64_t)dist <= lag) return;
+        dist -= (uint32_t)lag;
     }
-    /* The first check boundary >= event; with checks inside the turn, the last
-     * anchor hit before it (the remaining turn delivers the event exactly). */
-    uint32_t k = s_idle_multi_pc ? (dist - 1u) / q : (dist + q - 1u) / q;
+    if (dist <= q) return;               /* one real iteration reaches it */
+    uint32_t k;
+    if (s_idle_iter_edges == 0)
+        k = (dist + q - 1u) / q;         /* first check boundary >= event */
+    else
+        k = (dist - 1u) / q;             /* land on the anchor before it */
     if (s_idle_progress_reg > 0) {
         uint32_t value = cpu->gpr[s_idle_progress_reg];
         uint32_t max_k = value > 1u ? value - 1u : 0u;
         if (k > max_k) k = max_k;
     }
-    if (s_idle_mem_mode == 1) {
-        uint32_t max_k = s_idle_mem_val > 1u ? s_idle_mem_val - 1u : 0u;
+    if (s_idle_mem_progress) {
+        uint32_t max_k = (int32_t)s_idle_store_val > 1 ? s_idle_store_val - 1u : 0u;
         if (k > max_k) k = max_k;
     }
-    if (k == 0) {
-        s_idle_diag[IDLE_D_BOUND]++;
-        return;
-    }
+    if (k == 0) return;
     uint64_t skip = (uint64_t)k * q;
     if (skip > IDLE_SKIP_MAX_CYCLES) {
         s_idle_diag[IDLE_D_CAP]++;
@@ -703,11 +934,8 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
     s_idle_diag[IDLE_D_SKIP]++;
     if (s_idle_progress_reg > 0)
         cpu->gpr[s_idle_progress_reg] -= k;
-    if (s_idle_mem_mode == 1) {
-        s_idle_mem_val -= k;
-        extern void psx_host_write_word(uint32_t addr, uint32_t val);
-        psx_host_write_word(s_idle_mem_addr, s_idle_mem_val);
-    }
+    if (s_idle_mem_progress)
+        s_idle_host_write(s_idle_store_addr, s_idle_store_val - k);
 
     g_idle_skip_count++;
     g_idle_skip_cycles += skip;
@@ -721,6 +949,8 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
     s_idle_streak = 0;
     idle_snapshot_regs(cpu);
     s_idle_have_snap = 1;
+    s_idle_store_addr = s_idle_mem_progress ? s_idle_store_addr : 0xFFFFFFFFu;
+    s_idle_store_val = s_idle_store_val - (s_idle_mem_progress ? k : 0u);
     s_idle_last_cycle  = psx_cycle_count;
     s_idle_last_stores = g_guest_store_count;
     s_idle_last_mmio   = g_mmio_access_count;
@@ -732,12 +962,9 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
 void psx_idle_diag_line(char *out, size_t n) {
     static uint64_t last_cycles = 0;
     const uint32_t *d = s_idle_diag;
-    snprintf(out, n, "[IDLE] skips %u cyc %llu | checks %u offanchor %u newpc %u store %u mmio %u "
-             "regs %u quant %u streak %u near %u bound %u cap %u | anchor %08X multi %d",
+    snprintf(out, n, "[IDLE] skips %u cyc %llu | checks %u cap %u",
              d[IDLE_D_SKIP], (unsigned long long)(g_idle_skip_cycles - last_cycles),
-             d[IDLE_D_CHECKS], d[IDLE_D_OFFANCHOR], d[IDLE_D_NEWPC], d[IDLE_D_STORE],
-             d[IDLE_D_MMIO], d[IDLE_D_REGS], d[IDLE_D_QUANT], d[IDLE_D_STREAK], d[IDLE_D_NEAR],
-             d[IDLE_D_BOUND], d[IDLE_D_CAP], (unsigned)s_idle_diag_pc, s_idle_multi_pc);
+             d[IDLE_D_CHECKS], d[IDLE_D_CAP]);
     last_cycles = g_idle_skip_cycles;
     memset(s_idle_diag, 0, sizeof s_idle_diag);
     size_t used = strlen(out);
@@ -750,8 +977,7 @@ void psx_idle_diag_line(char *out, size_t n) {
         last_spu_q = g_spu_sample_enabled_queries;
         s_svc_count = s_svc_chunks = 0;
     }
-    used += (size_t)snprintf(out + used, used < n ? n - used : 0, " | store_n %u @%08X | pcs",
-                             s_idle_diag_store_n, (unsigned)s_idle_diag_store_addr);
+    used += (size_t)snprintf(out + used, used < n ? n - used : 0, " | pcs");
     for (int i = 0; i < IDLE_DIAG_PCS && used < n; i++)
         if (s_idle_diag_pcn[i])
             used += (size_t)snprintf(out + used, n - used, " %08X:%u",
@@ -778,6 +1004,9 @@ void psx_cycles_resync_after_restore(CPUState *cpu) {
     s_idle_streak = 0;
     s_idle_have_snap = 0;
     s_idle_progress_reg = -2;
+    s_idle_edges = 0;
+    idle_reset_progress();
+    if (s_idle_audited_only) *s_track = 0;
     s_idle_last_cycle = psx_cycle_count;
     /* GTE/muldiv completion deadlines and load-absorb give-back are host-only
      * absolute cycle stamps (not in BS_SEC_CPU). After a warm load they still
@@ -785,14 +1014,20 @@ void psx_cycles_resync_after_restore(CPUState *cpu) {
      * would then advance (live_ts - restored_cycle) in one shot — tens of
      * millions of cycles / N nested presents with zero IRQ checks (MotK
      * transform CTC2 path). Anchor them at the restored clock. */
-    if (cpu) {
-        cpu->gte_ts_done = psx_cycle_count;
-        cpu->muldiv_ts_done = psx_cycle_count;
-        memset(cpu->read_absorb, 0, sizeof(cpu->read_absorb));
-        cpu->read_absorb_which = 0;
-        cpu->read_fudge = 0x20u; /* no committed predecessor load */
-        cpu->ld_which_t = 0x20u; /* no pending load dest */
-        cpu->ld_absorb = 0;
+    {
+        /* A snap with BS_SEC_CPUTIM carried them relative to its clock --
+         * keep those; older snaps anchor at the restored clock as before. */
+        extern int g_boot_state_cpu_timing_restored;
+        if (cpu && !g_boot_state_cpu_timing_restored) {
+            cpu->gte_ts_done = psx_cycle_count;
+            cpu->muldiv_ts_done = psx_cycle_count;
+            memset(cpu->read_absorb, 0, sizeof(cpu->read_absorb));
+            cpu->read_absorb_which = 0;
+            cpu->read_fudge = 0x20u; /* no committed predecessor load */
+            cpu->ld_which_t = 0x20u; /* no pending load dest */
+            cpu->ld_absorb = 0;
+        }
+        g_boot_state_cpu_timing_restored = 0;
     }
     /* Dirty-RAM interpreter load-delay writebacks live in host statics, not
      * BS_SEC_CPU. Discard (do not flush): snap GPRs are already architectural.
@@ -823,6 +1058,7 @@ void psx_cycles_reset_for_boot(void) {
     g_psx_cycle_fast_limit = 0;
     s_next_watchdog        = 0;
     s_next_pc_sample       = 0;
+    s_next_cycle_sample    = 0;
 }
 
 /* ---- Mult/div completion-stall timing (faithful R3000A; Beetle muldiv_ts_done) ----
@@ -872,6 +1108,7 @@ void psx_muldiv_set(CPUState* cpu, uint32_t latency) {
     /* The deadline belongs to this instruction, including unpublished CPU
      * work from generated blocks and local charge accumulators. */
     psx_cyc_batch_flush();
+    latency = psx_cpu_cycles(latency);   /* [timing] guest_cycle_scale */
     cpu->muldiv_ts_done = psx_cycle_count + (uint64_t)latency;
 }
 
@@ -973,6 +1210,7 @@ void psx_gte_set(CPUState* cpu, uint32_t latency) {
     if (cpu->gte_ts_done > psx_cycle_count) {
         psx_advance_cycles((uint32_t)(cpu->gte_ts_done - psx_cycle_count));
     }
+    latency = psx_cpu_cycles(latency);   /* [timing] guest_cycle_scale */
     cpu->gte_ts_done = psx_cycle_count + (uint64_t)latency;
 }
 
@@ -997,6 +1235,7 @@ static void freeze_save(PsxCycleFreeze *save) {
     save->local_acc_value = g_psx_cyc_local_acc ? *g_psx_cyc_local_acc : 0u;
     save->in_device_service = psx_in_device_service;
     save->bb_defer = g_psx_cyc_bb_defer;
+    psx_guest_cycle_scale_snapshot(save->guest_cycle_scale);
     /* Pending deferred charges stay pending: they belong to the interrupted
      * guest code and are republished, unchanged, after the freeze. */
     g_psx_cyc_batch = 0;
@@ -1044,6 +1283,7 @@ void psx_cycle_freeze_end(const PsxCycleFreeze *save) {
     if (!save) return;
     freeze_restore_clock(save);
     freeze_restore_deferred(save);
+    psx_guest_cycle_scale_restore(save->guest_cycle_scale);
 }
 
 int psx_cycle_uncharged_begin(PsxCycleFreeze *save, uint64_t budget_cycles) {
@@ -1056,6 +1296,11 @@ int psx_cycle_uncharged_begin(PsxCycleFreeze *save, uint64_t budget_cycles) {
     g_psx_guest_time_frozen = 1;
     psx_cycle_freeze_tick();
     return 1;
+}
+
+uint64_t psx_cycle_uncharged_counted(void) {
+    if (!s_uncharged_active) return 0;
+    return psx_cycle_count - s_freeze_start + g_psx_cyc_batch;
 }
 
 int psx_cycle_uncharged_end(const PsxCycleFreeze *save) {

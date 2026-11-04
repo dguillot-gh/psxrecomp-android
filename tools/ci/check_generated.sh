@@ -14,12 +14,13 @@
 #   2. Those files are tracked by git. An untracked generated/ builds fine on
 #      the developer's machine and is absent from every CI checkout, which is
 #      the exact gap between "works for me" and a red release.
-#   3. The framework's BIOS backends are present and tracked in the submodule
-#      (psxrecomp/generated/{OpenBIOS,SCPH1001}_{full,dispatch}.c with their
-#      .emitter.sha stamps). Decision 2026-09-30: the recompiled BIOS is
-#      committed and linked like the recompiled game; the player still
-#      supplies the retail image at run time. runtime.cmake's fingerprint
-#      check (PSXRECOMP_BIOS_STALE_FATAL in CI) refuses a stale stamp.
+#   3. The framework's tracked BIOS backend is present and tracked in the
+#      submodule (psxrecomp/generated/OpenBIOS_{full,dispatch}.c with its
+#      .emitter.sha stamp). runtime.cmake's fingerprint check
+#      (PSXRECOMP_BIOS_STALE_FATAL in CI) refuses a stale stamp.
+#      SCPH1001 is local-only since #575 (generated from the developer's own
+#      dump, untracked): if present it must be complete; if absent it is
+#      skipped with a note.
 #   4. No BIOS dump is tracked (SCPH*.BIN / *.bin under bios/) in the title or
 #      the submodule.
 #
@@ -106,20 +107,31 @@ fi
 # 3. The framework's committed BIOS backends.
 fw="${ROOT}/psxrecomp"
 if [[ -d "${fw}" ]]; then
-  for stem in OpenBIOS SCPH1001; do
-    for f in "generated/${stem}_full.c" "generated/${stem}_dispatch.c" "generated/${stem}.emitter.sha"; do
-      if [[ ! -f "${fw}/${f}" ]]; then
-        echo "error: psxrecomp/${f} is missing -- the framework commits its BIOS backends;" >&2
-        echo "  this submodule pin predates that, or the checkout is not --recurse-submodules." >&2
-        exit 1
-      fi
-      if git -C "${fw}" rev-parse --is-inside-work-tree >/dev/null 2>&1 &&
-         ! git -C "${fw}" ls-files --error-unmatch -- "${f}" >/dev/null 2>&1; then
-        echo "error: psxrecomp/${f} exists but is not tracked in the framework submodule." >&2
-        exit 1
-      fi
-    done
+  for f in generated/OpenBIOS_full.c generated/OpenBIOS_dispatch.c generated/OpenBIOS.emitter.sha; do
+    if [[ ! -f "${fw}/${f}" ]]; then
+      echo "error: psxrecomp/${f} is missing -- the framework commits its OpenBIOS backend;" >&2
+      echo "  this submodule pin predates that, or the checkout is not --recurse-submodules." >&2
+      exit 1
+    fi
+    if git -C "${fw}" rev-parse --is-inside-work-tree >/dev/null 2>&1 &&
+       ! git -C "${fw}" ls-files --error-unmatch -- "${f}" >/dev/null 2>&1; then
+      echo "error: psxrecomp/${f} exists but is not tracked in the framework submodule." >&2
+      exit 1
+    fi
   done
+  # SCPH1001: optional, local-only (psxrecomp #575). Partial output is an error.
+  scph_have=0
+  for f in generated/SCPH1001_full.c generated/SCPH1001_dispatch.c generated/SCPH1001.emitter.sha; do
+    [[ -f "${fw}/${f}" ]] && scph_have=$((scph_have + 1))
+  done
+  if [[ "${scph_have}" -eq 3 ]]; then
+    scph_note="SCPH1001 backend present (local)"
+  elif [[ "${scph_have}" -eq 0 ]]; then
+    scph_note="SCPH1001 backend absent (local-only, skipped)"
+    echo "note: psxrecomp/generated/SCPH1001_* absent -- local-only since #575; skipped." >&2
+  else
+    fail "psxrecomp/generated/SCPH1001_* is incomplete (${scph_have}/3 files) -- regenerate with tools/regen_bios.sh --config bios/SCPH1001.toml or remove them"
+  fi
 fi
 
 # 4. No BIOS dump tracked, in the title or the submodule.
@@ -136,4 +148,4 @@ for repo in "${ROOT}" "${fw}"; do
   fi
 done
 
-echo "generated C ok: generated/${boot}_dispatch.c + ${shards} full shard(s) tracked; framework BIOS backends present; no BIOS dump tracked"
+echo "generated C ok: generated/${boot}_dispatch.c + ${shards} full shard(s) tracked; OpenBIOS backend tracked; ${scph_note:-no framework submodule}; no BIOS dump tracked"

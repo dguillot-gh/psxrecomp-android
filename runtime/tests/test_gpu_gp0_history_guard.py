@@ -258,6 +258,12 @@ void crash_trace_note_gpu_fatal(uint32_t opcode, uint32_t word) { (void)opcode; 
 void event_ring_note_gpu_irq(uint32_t stat) { (void)stat; }
 int g_psx_vram_dirty_tracking = 0;
 int g_exec_phase = 0;
+int g_psx_render_pass_active = 0;
+int pgxp_enabled(void) { return 0; }
+int pgxp_cpu_mode(void) { return 0; }
+void pgxp_set_cpu_mode(int enabled) { if (enabled) abort(); }
+void psx_mod_counter_add(const char *name, uint32_t delta)
+{ (void)name; (void)delta; abort(); }
 void gpu_vram_dirty_mark_all(void) {}
 void gpu_vram_dirty_mark_row_impl(uint32_t row) { (void)row; }
 void gpu_vram_dirty_mark_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
@@ -268,25 +274,47 @@ void text_xlate_vram_upload(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
 int ws_cull_should_keep(uint32_t addr) { (void)addr; return 1; }
 int ws_ui_group_should_keep(uint32_t addr) { (void)addr; return 1; }
 uint32_t psx_mod_gpu_dma_resolve_address(uint32_t address) { return address; }
+int psx_mod_gpu_dma_memory_contains(uint32_t addr, uint32_t len) { (void)addr; (void)len; return 0; }
+uint32_t psx_gpu_packet_key(uint32_t address) { return address & 0x001FFFFCu; }
 void ws_ui_group_assign(WsUiGroupItem *items, size_t count,
                         int32_t display_width, int dense_menu, int in_place)
 { (void)items; (void)count; (void)display_width; (void)dense_menu; (void)in_place; }
 int32_t ws_ui_anchor_for_bounds(int32_t x, int32_t width, int32_t display_width)
 { (void)x; (void)width; return display_width / 2; }
 int gte_geometry_correction_enabled(void) { return 0; }
-int gte_nclip_native_wide_sign(int32_t value,int* sign) { (void)value; (void)sign; return 0; }
-int gte_nclip_native_wide_previous_sign(int32_t value,int* sign) { (void)value; (void)sign; return 0; }
-void pgxp_set_projection_tracking(int enabled) { (void)enabled; }
+/* The fixture is software-only, with native-wide/PGXP disabled. Unexpected
+ * geometry/projective paths remain fatal rather than becoming silent stubs. */
+int gte_nclip_native_wide_sign(int32_t mac0, int *sign)
+{ (void)mac0; (void)sign; abort(); }
+int gte_nclip_native_wide_previous_sign(int32_t mac0, int *sign)
+{ (void)mac0; (void)sign; abort(); }
 int pgxp_projection_tracking(void) { return 0; }
-int pgxp_load_projection(uint32_t address,uint32_t word,PGXPProjection* projection) {
-    (void)address; (void)word; (void)projection; return 0;
-}
-void gl_renderer_note_wide_triangle_recovery(int enabled) { (void)enabled; }
-int gl_renderer_projective_supported(void) { return 0; }
-void gl_renderer_draw_projected_triangle(const PSXProjectedVertex vertices[3],uint16_t page,
-    uint16_t cx,uint16_t cy,int raw,int semi,int perspective) {
-    (void)vertices; (void)page; (void)cx; (void)cy; (void)raw; (void)semi; (void)perspective;
-}
+void pgxp_set_projection_tracking(int enabled)
+{ if (enabled) abort(); }
+int pgxp_projective_scope_begin(PGXPProjectiveScope *scope)
+{ (void)scope; abort(); }
+void pgxp_projective_scope_end(PGXPProjectiveScope *scope)
+{ (void)scope; abort(); }
+int pgxp_load_projection(uint32_t addr, uint32_t packed, PGXPProjection *out)
+{ (void)addr; (void)packed; (void)out; abort(); }
+float pgxp_get_unclamped_depth(uint32_t addr, uint32_t packed)
+{ (void)addr; (void)packed; abort(); }
+int gl_renderer_projective_supported(void) { abort(); }
+void gl_renderer_draw_projected_triangle(const PSXProjectedVertex vertices[3],
+    uint16_t texpage, uint16_t cx, uint16_t cy, int raw, int semi, int perspective)
+{ (void)vertices; (void)texpage; (void)cx; (void)cy; (void)raw; (void)semi; (void)perspective; abort(); }
+void gl_renderer_note_wide_triangle_recovery(int enabled)
+{ if (enabled) abort(); }
+/* Smooth motion vertex sources are an OpenGL path: never reached here. */
+int gl_renderer_frame_generation(void) { return 0; }
+int gl_renderer_pgxp_render_wanted(void) { return 0; }
+void gl_renderer_fg_source(const uint32_t id[3], const int32_t pc[9], const int32_t h[3],
+    const int32_t x[3], const int32_t y[3])
+{ (void)id; (void)pc; (void)h; (void)x; (void)y; abort(); }
+void gte_fg_source_set(int enabled) { if (enabled) abort(); }
+int gte_fg_source_enabled(void) { return 0; }
+int gte_fg_source_lookup(uint32_t packed, GteFgSrc out[2])
+{ (void)packed; (void)out; abort(); }
 void pgxp_set_enabled(int enabled) { (void)enabled; }
 int pgxp_get_gte_sxy_checked(uint32_t slot, uint32_t packed, int require_valid,
                              int32_t *x16, int32_t *y16)
@@ -358,6 +386,8 @@ void gr_vram_transfer_in(int x, int y, int w, int h, const uint16_t *pixels)
         for (int xx = 0; xx < w; xx++)
             g_vram[((y + yy) & 511) * 1024 + ((x + xx) & 1023)] = pixels[yy * w + xx];
 }
+void gr_vram_upload_commit(int x,int y,int w,int h,const uint16_t *d) { gr_vram_transfer_in(x,y,w,h,d); }
+void gr_vram_upload_set_open(int open) { (void)open; }
 void gr_fill_rect(int x, int y, int w, int h, uint16_t color)
 {
     for (int yy = 0; yy < h; yy++)
@@ -373,14 +403,21 @@ void gr_wide_set_view(int active, int shift, int pad_left, int pad_right)
 { (void)active; (void)shift; (void)pad_left; (void)pad_right; }
 void gr_wide_clear_margins(int base, int y, int h, uint16_t color, int mode)
 { (void)base; (void)y; (void)h; (void)color; (void)mode; }
+void gr_wide_feedback_rect(int sb, int sx, int sy, int dx, int dy, int w, int h,
+                           int r, int g, int b, int raw, int semi)
+{ (void)sb; (void)sx; (void)sy; (void)dx; (void)dy; (void)w; (void)h;
+  (void)r; (void)g; (void)b; (void)raw; (void)semi; }
 void gr_set_draw_area(int l, int t, int r, int b) { (void)l; (void)t; (void)r; (void)b; }
 void gr_set_draw_offset(int x, int y) { (void)x; (void)y; }
 void gr_set_mask_bits(int set, int check) { (void)set; (void)check; }
 void gr_set_texture_window(uint32_t value) { (void)value; }
 void gr_set_semi_transparency(int enabled, int mode) { (void)enabled; (void)mode; }
+void gr_set_dither(int enabled) { (void)enabled; }
 void gr_set_color_modulation(int r, int g, int b, int raw)
 { (void)r; (void)g; (void)b; (void)raw; }
 void gr_set_perspective_triangle(int enabled, float a, float b, float c)
+{ (void)enabled; (void)a; (void)b; (void)c; }
+void gr_set_depth_triangle(int enabled, float a, float b, float c)
 { (void)enabled; (void)a; (void)b; (void)c; }
 void gr_set_precise_triangle(int enabled, int32_t ax, int32_t ay, int32_t bx,
                              int32_t by, int32_t cx, int32_t cy)

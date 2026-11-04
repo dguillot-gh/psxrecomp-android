@@ -14,6 +14,8 @@ struct CPUState;
 void psx_snapshot_host_call_begin(void);
 void psx_snapshot_host_call_end(void);
 void psx_snapshot_host_call_reset(void);
+unsigned psx_snapshot_host_call_depth(void);
+void psx_snapshot_host_call_restore(unsigned depth);
 
 /* IRQ bit positions in I_STAT/I_MASK */
 #define IRQ_VBLANK  0

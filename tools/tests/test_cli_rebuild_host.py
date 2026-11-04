@@ -114,5 +114,109 @@ class RebuildConfigureFlagsTest(unittest.TestCase):
                          [('generate', 'ON'), ('use', 'OFF')])
 
 
+class EmitterHostToolsTest(unittest.TestCase):
+    """A successful native-tools check must reach the emitter build on POSIX."""
+
+    def build(self, platform, *, download=True, ensured=True):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cmake = root / 'cmake'
+            ninja = root / 'ninja'
+            cmake.touch()
+            ninja.touch()
+            tools = {'cmake': cmake, 'ninja': ninja}
+            with mock.patch.object(cli.sys, 'platform', platform), \
+                 mock.patch.object(cli, 'activate_embedded_toolchain', return_value=False) as activate, \
+                 mock.patch.object(cli, 'ensure_toolchain_for_rebuild', return_value=ensured) as ensure, \
+                 mock.patch.object(cli, 'resolve_embedded_toolchain_bin', return_value=None), \
+                 mock.patch.object(cli, 'recompiler_source_dir', return_value=ROOT / 'recompiler'), \
+                 mock.patch.object(cli, 'find_psxrecomp_game', side_effect=FileNotFoundError), \
+                 mock.patch.object(cli, '_which_tool', side_effect=tools.get), \
+                 mock.patch.object(cli.subprocess, 'run', return_value=mock.Mock(
+                     returncode=0, stdout='', stderr='')) as run:
+                built = cli._build_recompiler_targets(
+                    root, mock.Mock(), ('psxrecomp-game', 'psxrecomp-bios'),
+                    download_toolchain=download, build_dir_override=root / 'build')
+                self.assertEqual(built, root / 'build')
+                self.assertEqual(run.call_count, 2)
+                configure, compile = [call.args[0] for call in run.call_args_list]
+                self.assertEqual(configure[0], str(cmake))
+                self.assertIn(str(ROOT / 'recompiler'), configure)
+                self.assertEqual(compile[0], str(cmake))
+                for target in ('psxrecomp-game', 'psxrecomp-bios'):
+                    self.assertIn(target, compile)
+                if download:
+                    ensure.assert_called_once_with(root, mock.ANY, download=True)
+                else:
+                    ensure.assert_not_called()
+                return activate.call_count
+
+    def test_successful_native_ensure_builds_emitters(self):
+        for platform in ('linux', 'darwin'):
+            with self.subTest(platform=platform):
+                self.assertEqual(self.build(platform), 1)
+
+    def test_explicit_no_download_keeps_system_tool_fallback(self):
+        for platform in ('linux', 'darwin', 'win32'):
+            with self.subTest(platform=platform):
+                self.build(platform, download=False)
+
+    def test_windows_successful_ensure_still_requires_usable_pack(self):
+        with self.assertRaisesRegex(RuntimeError, 'bin/ is not usable'):
+            self.build('win32')
+
+
+class CmakeBuildToolTest(unittest.TestCase):
+    """Build must run the cmake that configured the tree, never a PATH cmake.
+
+    On Windows a PATH ``cmake`` is often MSYS2's, which rewrites the Windows
+    build directory as ``/f/.../F:/...`` and fails.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.build = Path(self.tmp.name) / 'build-release'
+        self.build.mkdir()
+        self.configured = Path(self.tmp.name) / 'toolchain' / 'bin' / 'cmake.exe'
+        self.configured.parent.mkdir(parents=True)
+        self.configured.write_text('')
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def build_cmd(self):
+        calls = []
+
+        def run(cmd, **_):
+            calls.append(cmd)
+            return mock.Mock(returncode=0, stdout='', stderr='')
+
+        with mock.patch.object(cli.subprocess, 'run', side_effect=run):
+            cli._cmake_build(self.build, 'psx-runtime', mock.Mock())
+        return calls[0]
+
+    def test_uses_cmake_command_from_cache(self):
+        (self.build / 'CMakeCache.txt').write_text(
+            'CMAKE_GENERATOR:INTERNAL=Ninja\n'
+            f'CMAKE_COMMAND:INTERNAL={self.configured}\n')
+        with mock.patch.object(cli, '_which_tool', return_value=Path('/msys/usr/bin/cmake')):
+            self.assertEqual(self.build_cmd()[0], str(self.configured))
+
+    def test_falls_back_to_path_without_cache(self):
+        with mock.patch.object(cli, '_which_tool', return_value=Path('/usr/bin/cmake')):
+            self.assertEqual(self.build_cmd()[0], str(Path('/usr/bin/cmake')))
+
+    def test_stale_cache_entry_falls_back_to_path(self):
+        (self.build / 'CMakeCache.txt').write_text(
+            f'CMAKE_COMMAND:INTERNAL={self.configured.parent / "gone.exe"}\n')
+        with mock.patch.object(cli, '_which_tool', return_value=Path('/usr/bin/cmake')):
+            self.assertEqual(self.build_cmd()[0], str(Path('/usr/bin/cmake')))
+
+    def test_no_cmake_anywhere_is_an_error(self):
+        with mock.patch.object(cli, '_which_tool', return_value=None):
+            with self.assertRaises(RuntimeError):
+                cli._cmake_build(self.build, 'psx-runtime', mock.Mock())
+
+
 if __name__ == '__main__':
     unittest.main()

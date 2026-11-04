@@ -55,7 +55,11 @@ static const char *kReportPath = "psx_last_run_report.json";
 #ifndef PSX_BUILD_REV
 #define PSX_BUILD_REV "unknown"
 #endif
+#ifdef PSX_BUILD_IMPLEMENTATIONS
+static const char *kBuildId = PSX_BUILD_REV " (" __DATE__ " " __TIME__ ") implementations=" PSX_BUILD_IMPLEMENTATIONS;
+#else
 static const char *kBuildId = PSX_BUILD_REV " (" __DATE__ " " __TIME__ ")";
+#endif
 
 /* CPU state pointer (set by debug server at init). */
 extern CPUState *debug_cpu_ptr;
